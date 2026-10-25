@@ -40,8 +40,9 @@ export function serializeVector(vec: Float32Array): Uint8Array {
 }
 
 export function deserializeVector(blob: Uint8Array): Float32Array {
-  const copy = new Uint8Array(blob.byteLength)
-  copy.set(blob)
+  const usableLength = blob.byteLength - (blob.byteLength % 4)
+  const copy = new Uint8Array(usableLength)
+  copy.set(blob.subarray(0, usableLength))
   return new Float32Array(copy.buffer)
 }
 

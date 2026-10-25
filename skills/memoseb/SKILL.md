@@ -26,7 +26,7 @@ Usa `memoseb` para dotar a los agentes de memoria persistente entre sesiones, ai
      --title "Motor de persistencia híbrido" \
      --category architecture \
      --tags "sqlite,fts5,vectors" \
-     --importance 4
+     --importance 0.9
    ```
 
 ## 2. Categorías Válidas
