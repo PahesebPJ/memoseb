@@ -2,7 +2,7 @@
 
 Una bóveda de **memoria híbrida multi-proyecto** (vectorial `Float32Array` + léxica `SQLite FTS5` con **Reciprocal Rank Fusion** y **presupuesto estricto de tokens**) para agentes de IA (**Antigravity CLI (`agy`)**, **Claude Code**, **Codex** y **OpenCode**).
 
-Se conecta y registra automáticamente en [**hubseb**](../hubseb) y potencia la memoria persistente de [**crewseb**](../crewseb) mediante la capacidad `provides: ['memory.vault']`.
+Se conecta y registra automáticamente en [**hubseb**](https://github.com/PahesebPJ/hubseb) y potencia la memoria persistente de [**crewseb**](https://github.com/PahesebPJ/crewseb) mediante la capacidad `provides: ['memory.vault']`.
 
 ## Cómo funciona
 
@@ -23,13 +23,24 @@ flowchart LR
 
 ## Instalación (Para Humanos o Agentes de IA)
 
+### Vía npm (Recomendado)
+
 ```sh
+npm install -g memoseb
+memoseb setup
+```
+
+### Desde código fuente (Desarrollo local)
+
+```sh
+git clone https://github.com/PahesebPJ/memoseb.git
+cd memoseb
 npm install
 npm run build
 memoseb setup
 ```
 
-`memoseb setup` registra el nodo `memoseb` en la topología de `hubseb` (`~/.config/seb/topology.json`), despliega la skill `/memoseb` e inyecta las directivas globales (`rules/RULES.md`) verificadas con SHA-256 en los agentes detectados (`--agents claude,antigravity` elige cuáles, `--agents all` fuerza los 4).
+`memoseb setup` registra el nodo `memoseb` en la topología de `hubseb` (`~/.config/hubseb/topology.json`), despliega la skill `/memoseb` e inyecta las directivas globales (`rules/RULES.md`) verificadas con SHA-256 en los agentes detectados (`--agents claude,antigravity` elige cuáles, `--agents all` fuerza los 4).
 
 ## Comandos CLI
 
