@@ -1,0 +1,55 @@
+name: publish
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish-npm:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Validate release tag matches package.json version
+        if: github.event_name == 'release'
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          PKG_VERSION="$(node -p "require('./package.json').version")"
+          if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
+            echo "Error: Git tag ($TAG_VERSION) does not match package.json version ($PKG_VERSION)" >&2
+            exit 1
+          fi
+
+      - name: Typecheck, Build & Test
+        run: |
+          npm run typecheck
+          npm run build
+          npm test
+
+      - name: Smoke test packed tarball
+        run: |
+          TARBALL="$(npm pack --pack-destination "$RUNNER_TEMP" --silent | tail -1)"
+          npm install -g --prefix "$RUNNER_TEMP/global" "$RUNNER_TEMP/$TARBALL"
+          "$RUNNER_TEMP/global/bin/memoseb" capabilities --json
+          "$RUNNER_TEMP/global/bin/memoseb" stats --json
+
+      - name: Publish to npm
+        run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
