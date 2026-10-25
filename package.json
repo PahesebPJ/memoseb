@@ -1,0 +1,52 @@
+{
+  "name": "memoseb",
+  "version": "0.1.0",
+  "description": "Multi-project agentic vector and FTS5 hybrid memory vault on SQLite with MCP server and hubseb integration.",
+  "license": "MIT",
+  "author": "PahesebPJ",
+  "homepage": "https://github.com/PahesebPJ/memoseb#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/PahesebPJ/memoseb.git"
+  },
+  "bugs": {
+    "url": "https://github.com/PahesebPJ/memoseb/issues"
+  },
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "bin": {
+    "memoseb": "./dist/bin/memoseb.js"
+  },
+  "files": [
+    "dist",
+    "rules",
+    "skills",
+    "README.md",
+    "AGENT_INSTALL.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json && node -e \"fs.chmodSync('dist/bin/memoseb.js', 0o755)\"",
+    "prepack": "npm run build",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test \"test/**/*.spec.ts\"",
+    "memoseb": "node src/bin/memoseb.ts"
+  },
+  "dependencies": {
+    "hubseb": "^0.2.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.8.2"
+  }
+}

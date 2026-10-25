@@ -1,0 +1,9 @@
+node_modules/
+dist/
+.worktrees/
+*.backup
+*.legacy-backup
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+.DS_Store
