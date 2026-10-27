@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+import fs from 'node:fs'
+import path from 'node:path'
 import {
   type HostId,
   serializeWire,
@@ -8,6 +10,7 @@ import {
   wireFailure,
   wireSuccess,
 } from 'hubseb'
+import { analyzeAndStoreProject } from '../core/analyzer.ts'
 import { MEMORY_CATEGORIES, type MemoryCategory } from '../core/schema.ts'
 import { MemoryVault } from '../core/vault.ts'
 import { startMcpServer } from '../mcp/server.ts'
@@ -63,15 +66,21 @@ function extractFlags(argv: readonly string[]): {
   positional: string[]
   flags: Record<string, string>
   jsonMode: boolean
+  dryRun: boolean
 } {
   const positional: string[] = []
   const flags: Record<string, string> = {}
   let jsonMode = false
+  let dryRun = false
 
   for (let i = 0; i < argv.length; i++) {
     const token = argv[i]!
     if (token === '--json') {
       jsonMode = true
+      continue
+    }
+    if (token === '--dry-run') {
+      dryRun = true
       continue
     }
     if (VALUE_FLAGS.has(token)) {
@@ -92,7 +101,7 @@ function extractFlags(argv: readonly string[]): {
     positional.push(token)
   }
 
-  return { positional, flags, jsonMode }
+  return { positional, flags, jsonMode, dryRun }
 }
 
 export async function executeMemoCli(
@@ -102,7 +111,7 @@ export async function executeMemoCli(
   const runtime = options.runtime ?? new SystemRuntime()
   const cwd = options.cwd ?? process.cwd()
   const selectedHosts = parseHostsOption(argv)
-  const { positional, flags, jsonMode } = extractFlags(argv)
+  const { positional, flags, jsonMode, dryRun } = extractFlags(argv)
   const dbPath = options.dbPath ?? flags.db
 
   const command = positional[0] ?? 'help'
@@ -461,11 +470,80 @@ export async function executeMemoCli(
     }
   }
 
+  if (command === 'analyze' || command === 'index' || command === 'scan') {
+    const targetDir = positional[1] ? path.resolve(cwd, positional[1]) : cwd
+    if (!fs.existsSync(targetDir) || !fs.statSync(targetDir).isDirectory()) {
+      if (jsonMode) {
+        return {
+          exitCode: 2,
+          stdout: serializeWire(
+            wireFailure(
+              'analyze',
+              'INVALID_PATH',
+              `Target directory does not exist: ${targetDir}`,
+            ),
+          ),
+          stderr: '',
+        }
+      }
+      return {
+        exitCode: 2,
+        stdout: '',
+        stderr: `Target directory does not exist: ${targetDir}\n`,
+      }
+    }
+
+    const vault = new MemoryVault({ dbPath, runtime })
+    try {
+      const report = analyzeAndStoreProject(vault, {
+        targetDir,
+        projectId: flags.project,
+        sourceAgent: flags.agent,
+        dryRun,
+      })
+
+      if (!dryRun) {
+        try {
+          const topology = new TopologyStore(runtime)
+          for (const item of report.stored) {
+            await topology.broadcastSignal(BUNDLE_ID, 'memory.stored', {
+              id: item.memory.id,
+              projectId: item.memory.projectId,
+              category: item.memory.category,
+              created: item.created,
+            })
+          }
+        } catch {
+          // Ignore topology broadcast errors if hubseb state is read-only
+        }
+      }
+
+      if (jsonMode) {
+        return {
+          exitCode: 0,
+          stdout: serializeWire(wireSuccess('analyze', report)),
+          stderr: '',
+        }
+      }
+
+      const lines = [
+        `${dryRun ? '[DRY RUN] Synthesized' : 'Analyzed & stored'} ${report.drafts.length} memories for project ${report.project.name} (${report.project.id}) [~${report.totalTokens} tokens]:`,
+      ]
+      for (const draft of report.drafts) {
+        lines.push(`  • [${draft.category}] (importance=${draft.importance}) ${draft.title}`)
+      }
+      return { exitCode: 0, stdout: `${lines.join('\n')}\n`, stderr: '' }
+    } finally {
+      vault.close()
+    }
+  }
+
   if (command === 'help' || command === '--help' || command === '-h') {
     const commands = [
       'setup',
       'check',
       'uninstall',
+      'analyze',
       'remember',
       'recall',
       'context',
@@ -482,6 +560,7 @@ export async function executeMemoCli(
       '  memoseb setup [--agents a,b|all]             Attach to hubseb topology & deploy directives/skills',
       '  memoseb check [--json]                       Verify SHA-256 integrity of directives across hosts',
       '  memoseb uninstall [--json]                   Purge lock-tracked files & detach from hubseb',
+      '  memoseb analyze [path] [--dry-run] [--json]  Analyze repository and store architecture, convention & domain memories',
       '  memoseb remember "<text>" [options]          Store a memory (--category, --title, --tags, --importance)',
       '  memoseb recall "<query>" [options]           Hybrid search (--limit, --max-tokens, --category)',
       '  memoseb context [--max-tokens N]             Project briefing within token budget',

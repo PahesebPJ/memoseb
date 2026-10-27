@@ -1,4 +1,7 @@
+import fs from 'node:fs'
+import path from 'node:path'
 import readline from 'node:readline'
+import { analyzeAndStoreProject } from '../core/analyzer.ts'
 import { MEMORY_CATEGORIES, type MemoryCategory } from '../core/schema.ts'
 import type { MemoryVault } from '../core/vault.ts'
 import { BUNDLE_ID, VERSION } from '../version.ts'
@@ -112,6 +115,28 @@ export const MCP_TOOLS = [
         },
       },
       required: ['id'],
+    },
+  },
+  {
+    name: 'memory_analyze',
+    description:
+      'Analyze a project repository (manifests, directory topology, scripts, CI workflows, and README) and synthesize high-signal architecture, convention, and domain memories into the vault.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: {
+          type: 'string',
+          description: 'Optional directory path to analyze (defaults to current working directory).',
+        },
+        projectId: {
+          type: 'string',
+          description: 'Optional project identifier override.',
+        },
+        dryRun: {
+          type: 'boolean',
+          description: 'If true, synthesizes memory drafts without storing them in the database.',
+        },
+      },
     },
   },
 ] as const
@@ -272,6 +297,34 @@ export async function handleMcpRequest(
           id,
           result: {
             content: [{ type: 'text', text: JSON.stringify({ id: targetId, deleted }, null, 2) }],
+          },
+        }
+      }
+
+      if (toolName === 'memory_analyze') {
+        const rawPath = typeof args.path === 'string' && args.path.trim() ? args.path.trim() : undefined
+        const resolvedPath = rawPath ? path.resolve(rawPath) : undefined
+        if (resolvedPath && (!fs.existsSync(resolvedPath) || !fs.statSync(resolvedPath).isDirectory())) {
+          return {
+            jsonrpc: JSONRPC_VERSION,
+            id,
+            result: {
+              isError: true,
+              content: [{ type: 'text', text: `Target directory does not exist: ${resolvedPath}` }],
+            },
+          }
+        }
+        const report = analyzeAndStoreProject(vault, {
+          targetDir: resolvedPath,
+          projectId: typeof args.projectId === 'string' ? args.projectId : undefined,
+          dryRun: Boolean(args.dryRun),
+          sourceAgent: 'mcp-analyzer',
+        })
+        return {
+          jsonrpc: JSONRPC_VERSION,
+          id,
+          result: {
+            content: [{ type: 'text', text: JSON.stringify(report, null, 2) }],
           },
         }
       }

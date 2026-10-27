@@ -4,6 +4,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { afterEach, beforeEach, describe, it } from 'node:test'
+import { analyzeAndStoreProject } from '../src/core/analyzer.ts'
 import {
   cosineSimilarity,
   deserializeVector,
@@ -262,5 +263,31 @@ describe('MemoryVault & Hybrid Search Engine', () => {
     } finally {
       verifyDb.close()
     }
+  })
+
+  it('synthesizes and deduplicates 3 high-signal project pillars via analyzeAndStoreProject', () => {
+    const firstReport = analyzeAndStoreProject(vault, {
+      targetDir: process.cwd(),
+      projectId: 'memoseb-self'
+    })
+    assert.equal(firstReport.dryRun, false)
+    assert.equal(firstReport.drafts.length, 3)
+    assert.equal(firstReport.stored.length, 3)
+    assert.equal(
+      firstReport.stored.every((s) => s.created === true),
+      true
+    )
+
+    // Re-running on identical repository deduplicates via SHA-256 content_hash
+    const secondReport = analyzeAndStoreProject(vault, {
+      targetDir: process.cwd(),
+      projectId: 'memoseb-self'
+    })
+    assert.equal(secondReport.stored.length, 3)
+    assert.equal(
+      secondReport.stored.every((s) => s.created === false),
+      true
+    )
+    assert.equal(vault.getStats().memoryCount, 3)
   })
 })

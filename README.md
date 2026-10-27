@@ -7,6 +7,7 @@ Se conecta y registra automáticamente en [**hubseb**](https://github.com/Pahese
 ## Cómo funciona
 
 - **Aislamiento Multi-Proyecto + Memoria Global**: Detecta automáticamente el proyecto activo inspeccionando la raíz de `package.json` o `.git` (o recibe `--project <id>`). Permite aislar el conocimiento de cada repositorio mientras comparte convenciones transversales en el proyecto `global`.
+- **Análisis e Indexación Automática de Repositorios (`memoseb analyze`)**: Inspecciona manifiestos (`package.json`, `tsconfig.json`, `Cargo.toml`, `pyproject.toml`, `go.mod`, `Dockerfile`), estructura de directorios (`src/`), scripts, workflows CI y `README.md` para sintetizar y persistir automáticamente los 3 pilares base del proyecto (`architecture`, `convention` y `domain`).
 - **Tokenización y Vectorización Local Zero-Dependency**: Construido íntegramente sobre `node:sqlite` (Node.js `>=22`) en modo WAL. Incluye `LocalFeatureHashEmbedder` (`local-feature-hash-v1`), un motor determinista de *feature hashing* con `FNV-1a` que proyecta palabras, prefijos, bigramas y trigramas de caracteres en vectores `Float32Array` normalizados (384 dimensiones) sin depender de APIs externas ni binarios nativos adicionales.
 - **Búsqueda Híbrida RRF + Presupuesto de Tokens**: Combina similitud coseno densa (`memory_vectors`) y ranking léxico `BM25` (`SQLite FTS5`) mediante **Reciprocal Rank Fusion (RRF)** ponderada por importancia (`0.0` a `1.0`). Trunca automáticamente los resultados para respetar `--max-tokens` (por defecto `1200` tokens) sin saturar la ventana de contexto del agente.
 - **Servidor MCP `stdio` + CLI `hubseb/v1`**: Expone un servidor JSON-RPC 2.0 sobre `stdio` (`memoseb mcp`) y una interfaz CLI compatible con el contrato `hubseb/v1` (`--json`), emitiendo señales en tiempo real (`memory.stored`, `memory.forgotten`, `memoseb.deployed`) a la topología de `hubseb`.
@@ -48,6 +49,7 @@ Todos los comandos aceptan `--json` para responder bajo el sobre estándar `hubs
 
 ```sh
 memoseb setup [--agents a,b|all]             # Registra en hubseb e instala directivas/skills en los agentes
+memoseb analyze [path] [--dry-run] [--json]  # Analiza un repositorio y guarda memorias de arquitectura, convenciones y dominio (alias: index, scan)
 memoseb remember "<texto>" [opciones]        # Guarda o actualiza una memoria (alias: store)
 memoseb recall "<consulta>" [opciones]       # Búsqueda híbrida BM25 + Vector + RRF (alias: search)
 memoseb context [--max-tokens N]             # Briefing del proyecto activo dentro del presupuesto (alias: briefing)
@@ -60,16 +62,17 @@ memoseb uninstall [--json]                   # Purga archivos desplegados y desc
 memoseb capabilities [--json]                # Muestra capacidades (provides/consumes/signals) para hubseb
 ```
 
-### Opciones de `remember` y `recall`
+### Opciones de `analyze`, `remember` y `recall`
 
 | Flag | Comandos | Descripción |
 |---|---|---|
+| `--dry-run` | `analyze` | Sintetiza los borradores de memoria del repositorio sin persistirlos en SQLite |
 | `--category <cat>` | `remember`, `recall` | Categoría: `architecture`, `convention`, `bugfix`, `decision`, `domain` (por defecto `domain`) |
 | `--title "<título>"` | `remember` | Título resumen (si se omite, se deriva de la primera línea) |
 | `--tags <a,b,c>` | `remember`, `recall` | Etiquetas separadas por comas para filtrado y indexación FTS5 |
 | `--importance <0..1>` | `remember` | Peso de relevancia entre `0.0` y `1.0` (por defecto `0.5`) |
-| `--project <id>` | `remember`, `recall`, `context` | Sobrescribe el identificador del proyecto (usa `global` para memorias compartidas) |
-| `--agent <id>` | `remember` | Identificador del agente o especialista de `crewseb` que origina el recuerdo |
+| `--project <id>` | `analyze`, `remember`, `recall`, `context` | Sobrescribe el identificador del proyecto (usa `global` para memorias compartidas) |
+| `--agent <id>` | `analyze`, `remember` | Identificador del agente o especialista de `crewseb` que origina el recuerdo |
 | `--limit <N>` | `recall` | Número máximo de memorias a retornar (por defecto `5`) |
 | `--max-tokens <N>` | `recall`, `context` | Presupuesto estricto de tokens para la respuesta (por defecto `1200`) |
 
@@ -96,3 +99,4 @@ memoseb capabilities [--json]                # Muestra capacidades (provides/con
 | `memory_recall` | `query` (req), `projectId`, `category`, `limit`, `maxTokens` | Ejecuta búsqueda híbrida FTS5 + coseno vectorial con fusión RRF y presupuesto de tokens |
 | `memory_briefing` | `projectId`, `maxTokens` | Recupera el briefing prioritario del proyecto (`architecture`, `convention`, `decision`, `bugfix`) al iniciar sesión |
 | `memory_forget` | `id` (req) | Elimina un registro de memoria obsoleto junto con su índice FTS5 y su vector |
+| `memory_analyze` | `path`, `projectId`, `dryRun` | Analiza un repositorio y sintetiza memorias de `architecture`, `convention` y `domain` en la bóveda |

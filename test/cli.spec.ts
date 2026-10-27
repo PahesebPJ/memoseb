@@ -11,6 +11,7 @@ import {
   type WireSuccess
 } from 'hubseb'
 import { executeMemoCli } from '../src/bin/memoseb.ts'
+import type { ProjectAnalysisReport } from '../src/core/analyzer.ts'
 import type {
   ProjectSummary,
   RecallResult,
@@ -176,8 +177,111 @@ describe('CLI hubseb/v1 Wire Contract, MCP JSON-RPC Server, and Topology Integra
     assert.equal(helpPacket.protocol, 'hubseb/v1')
     assert.equal(helpPacket.status, 'success')
     assert.equal(helpPacket.action, 'help')
+    assert.ok(helpPacket.payload.commands.includes('analyze'))
     assert.ok(helpPacket.payload.commands.includes('remember'))
     assert.ok(helpPacket.payload.commands.includes('recall'))
+  })
+
+  it('analyzes a repository with memoseb analyze (--dry-run and persisted) and populates project briefing', async () => {
+    const sampleRepo = path.join(tmpDir, 'sample-service')
+    fs.mkdirSync(path.join(sampleRepo, 'src', 'core'), { recursive: true })
+    fs.mkdirSync(path.join(sampleRepo, '.github', 'workflows'), { recursive: true })
+
+    fs.writeFileSync(
+      path.join(sampleRepo, 'package.json'),
+      JSON.stringify(
+        {
+          name: '@acme/sample-service',
+          version: '1.0.0',
+          description: 'Event-driven billing reconciler and invoice ledger.',
+          type: 'module',
+          bin: { 'sample-service': './dist/cli.js' },
+          scripts: {
+            build: 'tsc -p tsconfig.json',
+            test: 'node --test',
+            typecheck: 'tsc --noEmit'
+          },
+          dependencies: {
+            hubseb: '^0.2.0'
+          },
+          keywords: ['billing', 'ledger']
+        },
+        null,
+        2
+      )
+    )
+    fs.writeFileSync(
+      path.join(sampleRepo, 'tsconfig.json'),
+      JSON.stringify({ compilerOptions: { strict: true, target: 'ES2023', module: 'NodeNext' } })
+    )
+    fs.writeFileSync(
+      path.join(sampleRepo, '.github', 'workflows', 'ci.yml'),
+      'name: CI Pipeline\non: [push]\n'
+    )
+    fs.writeFileSync(
+      path.join(sampleRepo, 'README.md'),
+      '# Sample Service\n\nHigh-throughput ledger reconciliation microservice.\n\n## Architecture\n\nUses hexagonal ports.\n\n## CLI Commands\n\nRun reconciler.\n'
+    )
+
+    // 1. Dry-run should synthesize 3 drafts without storing in vault
+    const dryRes = await executeMemoCli(['analyze', sampleRepo, '--dry-run', '--json'], {
+      runtime,
+      dbPath
+    })
+    assert.equal(dryRes.exitCode, 0)
+    const dryPacket = decodeWire<ProjectAnalysisReport>(
+      dryRes.stdout
+    ) as WireSuccess<ProjectAnalysisReport>
+    assert.equal(dryPacket.action, 'analyze')
+    assert.equal(dryPacket.payload.dryRun, true)
+    assert.equal(dryPacket.payload.project.id, 'sample-service')
+    assert.equal(dryPacket.payload.drafts.length, 3)
+    assert.equal(dryPacket.payload.stored.length, 0)
+    assert.ok(dryPacket.payload.totalTokens > 0)
+
+    const emptyCtxRes = await executeMemoCli(
+      ['context', '--project', 'sample-service', '--json'],
+      { runtime, dbPath }
+    )
+    const emptyCtx = decodeWire<RecallResult>(emptyCtxRes.stdout) as WireSuccess<RecallResult>
+    assert.equal(emptyCtx.payload.memories.length, 0)
+
+    // 2. Full analyze should persist the 3 memories (architecture, convention, domain)
+    const analyzeRes = await executeMemoCli(['analyze', sampleRepo, '--json'], {
+      runtime,
+      dbPath
+    })
+    assert.equal(analyzeRes.exitCode, 0)
+    const analyzePacket = decodeWire<ProjectAnalysisReport>(
+      analyzeRes.stdout
+    ) as WireSuccess<ProjectAnalysisReport>
+    assert.equal(analyzePacket.action, 'analyze')
+    assert.equal(analyzePacket.payload.dryRun, false)
+    assert.equal(analyzePacket.payload.stored.length, 3)
+    assert.deepEqual(
+      analyzePacket.payload.stored.map((s) => s.memory.category),
+      ['architecture', 'convention', 'domain']
+    )
+
+    // 3. Context briefing now returns all 3 synthesized memories ordered by importance
+    const ctxRes = await executeMemoCli(
+      ['context', '--project', 'sample-service', '--max-tokens', '1200', '--json'],
+      { runtime, dbPath }
+    )
+    assert.equal(ctxRes.exitCode, 0)
+    const ctxPacket = decodeWire<RecallResult>(ctxRes.stdout) as WireSuccess<RecallResult>
+    assert.equal(ctxPacket.payload.memories.length, 3)
+    assert.equal(ctxPacket.payload.memories[0]?.category, 'architecture')
+    assert.equal(ctxPacket.payload.memories[1]?.category, 'convention')
+    assert.equal(ctxPacket.payload.memories[2]?.category, 'domain')
+
+    // 4. Invalid path returns INVALID_PATH error with exitCode 2
+    const invalidRes = await executeMemoCli(
+      ['analyze', path.join(tmpDir, 'non-existent-dir'), '--json'],
+      { runtime, dbPath }
+    )
+    assert.equal(invalidRes.exitCode, 2)
+    assert.match(invalidRes.stdout, /INVALID_PATH/)
   })
 
   it('handles MCP JSON-RPC requests for initialize, tools/list, and tools/call lifecycle', async () => {
@@ -211,7 +315,8 @@ describe('CLI hubseb/v1 Wire Contract, MCP JSON-RPC Server, and Topology Integra
         'memory_store',
         'memory_recall',
         'memory_briefing',
-        'memory_forget'
+        'memory_forget',
+        'memory_analyze'
       ])
 
       // tools/call -> memory_store
@@ -297,6 +402,29 @@ describe('CLI hubseb/v1 Wire Contract, MCP JSON-RPC Server, and Topology Integra
       }
       assert.equal(forgetPayload.id, storedPayload.memory.id)
       assert.equal(forgetPayload.deleted, true)
+
+      // tools/call -> memory_analyze
+      const analyzeMcpRes = (await handleMcpRequest(vault, {
+        jsonrpc: '2.0',
+        id: 7,
+        method: 'tools/call',
+        params: {
+          name: 'memory_analyze',
+          arguments: {
+            path: process.cwd(),
+            projectId: 'mcp-analyzed-proj',
+            dryRun: false
+          }
+        }
+      })) as {
+        result: { content: Array<{ type: string; text: string }> }
+      }
+      const analyzePayload = JSON.parse(
+        analyzeMcpRes.result.content[0]!.text
+      ) as ProjectAnalysisReport
+      assert.equal(analyzePayload.project.id, 'mcp-analyzed-proj')
+      assert.equal(analyzePayload.drafts.length, 3)
+      assert.equal(analyzePayload.stored.length, 3)
     } finally {
       vault.close()
     }

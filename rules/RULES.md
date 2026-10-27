@@ -1,7 +1,8 @@
 # Directivas Globales de Memoria (`memoseb`)
 
-## 1. Briefing de Contexto al Iniciar
+## 1. Briefing de Contexto e Inicialización al Iniciar
 - Al iniciar cualquier sesión o tarea en un repositorio, consulta primero la bóveda de memoria del proyecto ejecutando `memoseb context` (o invocando la herramienta MCP `memory_briefing` / `memory_recall`).
+- Si el proyecto aún no tiene memorias registradas al consultar `memoseb context` (o cuando el usuario pida analizar/indexar el proyecto), inicializa su contexto base ejecutando `memoseb analyze` (o la herramienta MCP `memory_analyze`), y complementa con hallazgos profundos mediante `memoseb remember` / `memory_store`.
 - Revisa las decisiones de arquitectura, convenciones y bugs previos registrados antes de proponer cambios o escribir código.
 
 ## 2. Aprendizaje Continuo y Persistencia
