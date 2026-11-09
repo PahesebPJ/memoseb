@@ -1,6 +1,6 @@
 ---
 name: memoseb
-description: Gestiona la bóveda de memoria híbrida (vectorial + FTS5) multi-proyecto con presupuesto de tokens mediante memoseb (analyze, context, recall, remember, projects, stats, forget) o su servidor MCP.
+description: Gestiona la bóveda de memoria híbrida (vectorial + FTS5) multi-proyecto con presupuesto de tokens mediante memoseb (analyze, context, recall, remember, export, import, node, sync, projects, stats, forget) o su servidor MCP.
 ---
 
 # Bóveda de Memoria `/memoseb`
@@ -29,6 +29,21 @@ Usa `memoseb` para dotar a los agentes de memoria persistente entre sesiones, ai
      --tags "sqlite,fts5,vectors" \
      --importance 0.9
    ```
+4. **Portabilidad y Sincronización (`export`, `import`, `sync`):**
+   - **Snapshots Portables:** Respalda o transfiere memorias con verificación SHA-256 e importación Last-Write-Wins:
+     ```bash
+     memoseb export ./snapshots/memoseb-backup.json --project mi-proyecto
+     memoseb import ./snapshots/memoseb-backup.json
+     ```
+   - **Red Padre ↔ Hijos:** Sincroniza conocimiento acumulado entre agentes o estaciones de trabajo:
+     ```bash
+     # En Padre:
+     memoseb node enable --role parent --port 7432 --token <secreto> && memoseb node serve
+     # En Hijo (auto-descubrimiento LAN o conexión directa):
+     memoseb node enable --role child --discover --token <secreto>
+     # Sincronización bidireccional:
+     memoseb sync
+     ```
 
 ## 2. Análisis e Indexación de Proyectos (Flujo Dual)
 
@@ -59,5 +74,9 @@ Cuando necesites indexar un repositorio nuevo o el usuario pida analizar un proy
 - `memoseb analyze [path] [--dry-run]`: Analiza el repositorio y sintetiza memorias base de arquitectura, convenciones y dominio (alias: `index`, `scan`).
 - `memoseb projects`: Lista todos los proyectos registrados en la bóveda y su conteo de recuerdos / tokens.
 - `memoseb stats`: Muestra métricas globales de la bóveda (memorias totales, tokens, vectores).
-- `memoseb forget <id>`: Elimina un recuerdo obsoleto o incorrecto por su ID.
-- `memoseb mcp`: Inicia el servidor MCP sobre `stdio` (JSON-RPC 2.0) exponiendo `memory_store`, `memory_recall`, `memory_briefing`, `memory_forget` y `memory_analyze`.
+- `memoseb forget <id>`: Elimina un recuerdo obsoleto o incorrecto por su ID (MCP: `memory_forget`).
+- `memoseb export [file] [--project <id>]`: Exporta un snapshot portable JSON con checksum SHA-256 (MCP: `memory_export`).
+- `memoseb import <file> [--replace] [--project <id>]`: Importa un snapshot JSON con resolución Last-Write-Wins o `--replace`, regenerando FTS5 y vectores (MCP: `memory_import`).
+- `memoseb node (status|enable|disable|discover|set-parent|add-child|remove|serve)`: Gestiona el ciclo de vida del nodo de red (servidor HTTP, descubrimiento LAN UDP y administración de peers).
+- `memoseb sync [--url <peer>] [--project <id>] [--full]`: Sincronización bidireccional de deltas y tombstones con nodos configurados (MCP: `memory_sync`).
+- `memoseb mcp`: Inicia el servidor MCP sobre `stdio` (JSON-RPC 2.0) exponiendo `memory_store`, `memory_recall`, `memory_briefing`, `memory_forget`, `memory_analyze`, `memory_export`, `memory_import` y `memory_sync`.
