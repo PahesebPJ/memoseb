@@ -160,3 +160,50 @@ export function readSnapshotFile(filePath: string): VaultSnapshotV1 {
   }
   return verifySnapshot(parsed)
 }
+
+export function filterSnapshotByPermissions(
+  snapshot: VaultSnapshotV1,
+  predicate: (projectId: string, category?: string) => boolean
+): {
+  filtered: VaultSnapshotV1
+  droppedMemories: number
+  droppedTombstones: number
+} {
+  const allowedMemories = snapshot.memories.filter((m) =>
+    predicate(m.projectId, m.category)
+  )
+  const allowedTombstones = snapshot.tombstones.filter((t) =>
+    predicate(t.projectId)
+  )
+  const referencedProjectIds = new Set<string>()
+  for (const m of allowedMemories) {
+    referencedProjectIds.add(m.projectId)
+  }
+  for (const t of allowedTombstones) {
+    referencedProjectIds.add(t.projectId)
+  }
+  const allowedProjects = snapshot.projects.filter(
+    (p) => referencedProjectIds.has(p.id) || predicate(p.id)
+  )
+
+  const basePayload: Omit<VaultSnapshotV1, 'checksum'> = {
+    format: 'memoseb-snapshot',
+    version: 1,
+    exportedAt: snapshot.exportedAt,
+    originNodeId: snapshot.originNodeId,
+    projectFilter: snapshot.projectFilter ?? null,
+    projects: allowedProjects,
+    memories: allowedMemories,
+    tombstones: allowedTombstones
+  }
+  const checksum = computeSnapshotChecksum(basePayload)
+
+  return {
+    filtered: {
+      ...basePayload,
+      checksum
+    },
+    droppedMemories: snapshot.memories.length - allowedMemories.length,
+    droppedTombstones: snapshot.tombstones.length - allowedTombstones.length
+  }
+}

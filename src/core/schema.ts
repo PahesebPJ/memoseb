@@ -11,6 +11,8 @@ export type MemoryCategory =
 
 export type NodeRole = 'standalone' | 'parent' | 'child'
 export type PeerRole = 'parent' | 'child'
+export type GroupPermissionMode = 'readwrite' | 'readonly' | 'writeonly'
+export type UnassignedGroupPolicy = 'none' | 'all'
 
 export interface NodeConfiguration {
   nodeId: string
@@ -22,6 +24,7 @@ export interface NodeConfiguration {
   authToken: string | null
   autoSync: boolean
   lanDiscovery: boolean
+  unassignedGroupPolicy?: UnassignedGroupPolicy
 }
 
 export interface SyncPeerRecord {
@@ -36,6 +39,26 @@ export interface SyncPeerRecord {
   updatedAt: string
 }
 
+export interface SyncGroupRecord {
+  id: string
+  name: string
+  description: string
+  projects: string[]
+  categories: string[]
+  permissions: GroupPermissionMode
+  groupToken: string | null
+  memberNodeIds: string[]
+  createdAt: string
+  updatedAt: string
+}
+
+export interface EffectivePeerPermissions {
+  unrestricted: boolean
+  groups: string[]
+  canPush: (projectId: string, category?: MemoryCategory | string) => boolean
+  canPull: (projectId: string, category?: MemoryCategory | string) => boolean
+}
+
 export const MEMORY_CATEGORIES: readonly MemoryCategory[] = [
   'architecture',
   'convention',
@@ -44,12 +67,30 @@ export const MEMORY_CATEGORIES: readonly MemoryCategory[] = [
   'domain'
 ] as const
 
+export const GROUP_PERMISSION_MODES: readonly GroupPermissionMode[] = [
+  'readwrite',
+  'readonly',
+  'writeonly'
+] as const
+
 export function isMemoryCategory(value: string): value is MemoryCategory {
   return (MEMORY_CATEGORIES as readonly string[]).includes(value)
 }
 
 export function isNodeRole(value: string): value is NodeRole {
   return value === 'standalone' || value === 'parent' || value === 'child'
+}
+
+export function isGroupPermissionMode(
+  value: string
+): value is GroupPermissionMode {
+  return (GROUP_PERMISSION_MODES as readonly string[]).includes(value)
+}
+
+export function isUnassignedGroupPolicy(
+  value: string
+): value is UnassignedGroupPolicy {
+  return value === 'none' || value === 'all'
 }
 
 export const SCHEMA_SQL = `
@@ -128,6 +169,28 @@ CREATE TABLE IF NOT EXISTS sync_peers (
 );
 
 CREATE INDEX IF NOT EXISTS idx_sync_peers_role ON sync_peers(role);
+
+CREATE TABLE IF NOT EXISTS sync_groups (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL UNIQUE,
+  description TEXT NOT NULL DEFAULT '',
+  projects TEXT NOT NULL DEFAULT '["*"]',
+  categories TEXT NOT NULL DEFAULT '["*"]',
+  permissions TEXT NOT NULL DEFAULT 'readwrite',
+  group_token TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS sync_group_members (
+  group_id TEXT NOT NULL,
+  peer_identifier TEXT NOT NULL,
+  added_at TEXT NOT NULL,
+  PRIMARY KEY (group_id, peer_identifier),
+  FOREIGN KEY (group_id) REFERENCES sync_groups(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_sync_group_members_peer ON sync_group_members(peer_identifier);
 `
 
 export function openVaultDatabase(dbPath: string): DatabaseSync {
