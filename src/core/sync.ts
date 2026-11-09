@@ -656,13 +656,17 @@ export async function startSyncServer(
           }
 
           const policy: EffectivePeerPermissions = vault.evaluatePeerPermissions
-            ? vault.evaluatePeerPermissions({
-                peerId: existingPeerId,
-                peerNodeId: nodeId,
-                peerName: nodeName || null,
-                peerUrl: safeCallbackUrl || null,
-                matchedGroupByToken: matchedGroup?.id ?? null
-              })
+            ? vault.evaluatePeerPermissions(
+                !isGlobalTokenValid && matchedGroup
+                  ? { matchedGroupByToken: matchedGroup.id }
+                  : {
+                      peerId: existingPeerId,
+                      peerNodeId: nodeId,
+                      peerName: nodeName || null,
+                      peerUrl: safeCallbackUrl || null,
+                      matchedGroupByToken: matchedGroup?.id ?? null
+                    }
+              )
             : {
                 unrestricted: true,
                 groups: [],
@@ -731,13 +735,17 @@ export async function startSyncServer(
           }
 
           const policy: EffectivePeerPermissions = vault.evaluatePeerPermissions
-            ? vault.evaluatePeerPermissions({
-                peerId: existingPeerId,
-                peerNodeId: clientNodeId ?? null,
-                peerName: clientName ?? null,
-                peerUrl: safeCallbackUrl ?? null,
-                matchedGroupByToken: matchedGroup?.id ?? null
-              })
+            ? vault.evaluatePeerPermissions(
+                !isGlobalTokenValid && matchedGroup
+                  ? { matchedGroupByToken: matchedGroup.id }
+                  : {
+                      peerId: existingPeerId,
+                      peerNodeId: clientNodeId ?? null,
+                      peerName: clientName ?? null,
+                      peerUrl: safeCallbackUrl ?? null,
+                      matchedGroupByToken: matchedGroup?.id ?? null
+                    }
+              )
             : {
                 unrestricted: true,
                 groups: [],

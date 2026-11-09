@@ -780,5 +780,84 @@ describe('Sync Groups & ACL Permissions: Vault CRUD and Network Enforcement', ()
         fs.rmSync(tmpDir, { recursive: true, force: true })
       }
     })
+
+    it('prevents privilege escalation when a groupToken holder spoofs an admin clientNodeId', async () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'memoseb-acl-anti-spoof-'))
+      const guestDir = fs.mkdtempSync(path.join(os.tmpdir(), 'memoseb-acl-guest-spoof-'))
+      const parentVault = new MemoryVault({ dbPath: path.join(tmpDir, 'parent.sqlite') })
+      const guestVault = new MemoryVault({ dbPath: path.join(guestDir, 'guest.sqlite') })
+
+      parentVault.enableNodeMode({
+        role: 'parent',
+        nodeName: 'Parent',
+        authToken: 'master-admin-secret',
+        autoSync: false,
+        lanDiscovery: false
+      })
+      parentVault.storeMemory({
+        projectId: 'classified-project',
+        category: 'architecture',
+        title: 'Classified Blueprint',
+        content: 'Top secret architecture details.'
+      })
+      parentVault.storeMemory({
+        projectId: 'public-docs',
+        category: 'domain',
+        title: 'Public FAQ',
+        content: 'Publicly visible documentation.'
+      })
+
+      parentVault.upsertGroup({
+        name: 'admin-group',
+        projects: ['classified-project', 'public-docs'],
+        permissions: 'readwrite'
+      })
+      parentVault.addNodeToGroup('admin-group', 'trusted-admin-node-id')
+
+      parentVault.upsertGroup({
+        name: 'guest-group',
+        projects: ['public-docs'],
+        permissions: 'readonly',
+        groupToken: 'guest-only-token'
+      })
+
+      // Spoof guest node ID to match 'trusted-admin-node-id'
+      guestVault.enableNodeMode({
+        role: 'child',
+        nodeName: 'Spoofing-Guest',
+        authToken: 'guest-only-token',
+        autoSync: false,
+        lanDiscovery: false
+      })
+      ;(guestVault as unknown as { db: { prepare: (sql: string) => { run: (...args: string[]) => void } } }).db
+        .prepare(`UPDATE node_meta SET value = ? WHERE key = 'node.id'`)
+        .run('trusted-admin-node-id')
+
+      const parentServer = await startSyncServer(parentVault, {
+        host: '127.0.0.1',
+        port: 0,
+        enableUdpDiscovery: false
+      })
+      const parentUrl = `http://127.0.0.1:${parentServer.port}`
+
+      try {
+        const res = await syncWithPeer(guestVault, {
+          peerUrl: parentUrl,
+          peerRole: 'parent',
+          token: 'guest-only-token'
+        })
+        assert.equal(res.pulled.memoriesCreated, 1)
+        const guestClassified = guestVault.exportSnapshot({
+          projectId: 'classified-project'
+        }).memories
+        assert.equal(guestClassified.length, 0)
+      } finally {
+        await parentServer.close()
+        parentVault.close()
+        guestVault.close()
+        fs.rmSync(tmpDir, { recursive: true, force: true })
+        fs.rmSync(guestDir, { recursive: true, force: true })
+      }
+    })
   })
 })
