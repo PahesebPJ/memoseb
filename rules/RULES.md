@@ -14,3 +14,9 @@
 ## 3. Higiene de Presupuesto de Tokens
 - Utiliza `--max-tokens` en `memoseb recall` y `memoseb context` (o `maxTokens` en MCP) para mantener el contexto inyectado dentro de un presupuesto estricto y evitar saturar la ventana del agente.
 - Cuando una convención o decisión quede obsoleta, elimínala con `memoseb forget <id>` (o `memory_forget`).
+
+## 4. Portabilidad y Sincronización entre Agentes
+- Para respaldar o compartir el conocimiento acumulado entre máquinas o entornos, utiliza snapshots portables JSON:
+  - Por CLI: `memoseb export [file] [--project <id>]` y `memoseb import <file> [--replace] [--project <id>]`
+  - Por MCP: herramientas `memory_export` y `memory_import`.
+- Para sincronización distribuida en red Padre ↔ Hijos (desactivada por defecto en modo `standalone`), gestiona la conectividad con `memoseb node (enable|disable|discover|serve)` y sincroniza deltas bidireccionales con `memoseb sync` (o la herramienta MCP `memory_sync`).
