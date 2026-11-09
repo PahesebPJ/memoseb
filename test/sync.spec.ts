@@ -192,13 +192,15 @@ class MockSyncVault implements SyncCapableVault {
       return true
     })
     return {
+      format: 'memoseb-snapshot',
       version: 1,
-      generator: 'mock-sync-vault',
       exportedAt: new Date().toISOString(),
-      nodeId: this.nodeConfig.nodeId,
+      originNodeId: this.nodeConfig.nodeId,
+      projectFilter: options?.projectId ?? null,
+      checksum: 'mock-checksum',
       projects,
       memories,
-      tombstones: options?.includeTombstones ? this.tombstones : []
+      tombstones: options?.includeTombstones !== false ? this.tombstones : []
     }
   }
 

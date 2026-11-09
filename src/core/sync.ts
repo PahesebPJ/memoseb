@@ -11,62 +11,23 @@ import type {
   PeerRole,
   SyncPeerRecord
 } from './schema.ts'
-import type { VaultStats } from './vault.ts'
+import type {
+  ExportedProject,
+  ExportedTombstone,
+  ImportResult,
+  VaultSnapshotV1
+} from './snapshot.ts'
+import type { MemoryRecord, VaultStats } from './vault.ts'
 
 export const DISCOVERY_MAGIC_REQUEST = 'MEMOSEB_DISCOVER_V1' as const
 export const DISCOVERY_MAGIC_RESPONSE = 'MEMOSEB_ANNOUNCE_V1' as const
 export const MAX_SYNC_BODY_BYTES = 25 * 1024 * 1024 // 25 MB
 
-export interface SnapshotProjectEntry {
-  id: string
-  name: string
-  rootPath: string
-  updatedAt: string
-}
-
-export interface SnapshotMemoryEntry {
-  id: string
-  projectId: string
-  category: MemoryCategory
-  title: string
-  content: string
-  tags: string[]
-  sourceAgent: string | null
-  contentHash: string
-  tokenCount: number
-  importance: number
-  accessCount: number
-  createdAt: string
-  updatedAt: string
-  vector?: number[]
-}
-
-export interface SnapshotTombstoneEntry {
-  memoryId: string
-  projectId: string
-  contentHash: string
-  deletedAt: string
-  originNodeId?: string | null
-}
-
-export interface VaultSnapshotV1 {
-  version: 1
-  generator: string
-  exportedAt: string
-  nodeId?: string
-  projects: SnapshotProjectEntry[]
-  memories: SnapshotMemoryEntry[]
-  tombstones?: SnapshotTombstoneEntry[]
-}
-
-export interface SnapshotImportResult {
-  strategy: 'merge' | 'replace'
-  projectsImported: number
-  memoriesCreated: number
-  memoriesUpdated: number
-  memoriesSkipped: number
-  tombstonesApplied: number
-}
+export type SnapshotProjectEntry = ExportedProject
+export type SnapshotMemoryEntry = MemoryRecord & { vector?: number[] }
+export type SnapshotTombstoneEntry = ExportedTombstone
+export type SnapshotImportResult = ImportResult
+export type { VaultSnapshotV1 }
 
 export interface SyncCapableVault {
   getNodeId(): string
@@ -423,7 +384,7 @@ export async function discoverLanParents(options?: {
             .createHmac('sha256', token)
             .update(nonce)
             .digest('hex')
-          if (!raw.authTag || raw.authTag !== expectedTag) {
+          if (!verifyAuthToken(expectedTag, typeof raw.authTag === 'string' ? raw.authTag : null)) {
             return
           }
         }
@@ -599,13 +560,15 @@ export async function startSyncServer(
           }
 
           if (
-            callbackUrl &&
+            typeof callbackUrl === 'string' &&
+            callbackUrl.trim().length > 0 &&
             ((currentConfig.role === 'parent' && clientRole === 'child') ||
               (currentConfig.role === 'child' && clientRole === 'parent'))
           ) {
+            const safeCallbackUrl = normalizePeerUrl(callbackUrl)
             vault.upsertPeer({
               role: clientRole,
-              url: callbackUrl,
+              url: safeCallbackUrl,
               name: nodeName || 'Peer',
               peerNodeId: nodeId,
               lastStatus: 'paired'
@@ -656,10 +619,11 @@ export async function startSyncServer(
 
           const serverTimestamp = new Date().toISOString()
 
-          if (callbackUrl) {
+          if (typeof callbackUrl === 'string' && callbackUrl.trim().length > 0) {
+            const safeCallbackUrl = normalizePeerUrl(callbackUrl)
             vault.upsertPeer({
               role: clientRole ?? 'child',
-              url: callbackUrl,
+              url: safeCallbackUrl,
               name: clientName || 'Peer',
               peerNodeId: clientNodeId ?? null,
               lastSyncAt: serverTimestamp,
@@ -732,7 +696,7 @@ export async function startSyncServer(
             .createHmac('sha256', cfg.authToken!)
             .update(nonce)
             .digest('hex')
-          if (data.authTag !== expected) {
+          if (!verifyAuthToken(expected, typeof data.authTag === 'string' ? data.authTag : null)) {
             return
           }
         }
