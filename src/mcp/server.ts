@@ -2,7 +2,15 @@ import fs from 'node:fs'
 import path from 'node:path'
 import readline from 'node:readline'
 import { analyzeAndStoreProject } from '../core/analyzer.ts'
-import { MEMORY_CATEGORIES, type MemoryCategory } from '../core/schema.ts'
+import {
+  GROUP_PERMISSION_MODES,
+  MEMORY_CATEGORIES,
+  isGroupPermissionMode,
+  isMemoryCategory,
+  isUnassignedGroupPolicy,
+  type GroupPermissionMode,
+  type MemoryCategory,
+} from '../core/schema.ts'
 import { readSnapshotFile, writeSnapshotFile } from '../core/snapshot.ts'
 import {
   syncAllPeers,
@@ -210,7 +218,72 @@ export const MCP_TOOLS = [
       },
     },
   },
+  {
+    name: 'memory_group',
+    description:
+      'Manage synchronization permission groups and node ACLs (list, create/update group permissions by project/category/mode, add/remove nodes, delete group, or set default unassigned policy).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['list', 'create', 'add_node', 'remove_node', 'delete', 'default_policy'],
+          description: 'Group management action to execute.',
+        },
+        name: {
+          type: 'string',
+          description: 'Group name for create, add_node, remove_node, or delete actions.',
+        },
+        projects: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'List of allowed project IDs, or ["*"] for all projects.',
+        },
+        categories: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'List of allowed categories, or ["*"] for all categories.',
+        },
+        permissions: {
+          type: 'string',
+          enum: ['readwrite', 'readonly', 'writeonly'],
+          description: 'Group permission access mode.',
+        },
+        groupToken: {
+          type: 'string',
+          description: 'Optional authentication token dedicated to this group.',
+        },
+        description: {
+          type: 'string',
+          description: 'Optional human-readable description for the group.',
+        },
+        node: {
+          type: 'string',
+          description: 'Node identifier, URL, or node ID for add_node and remove_node.',
+        },
+        policy: {
+          type: 'string',
+          enum: ['none', 'all'],
+          description: 'Default policy for nodes without an assigned group (none or all).',
+        },
+      },
+      required: ['action'],
+    },
+  },
 ] as const
+
+function parseStringList(raw: unknown): string[] | undefined {
+  if (Array.isArray(raw)) {
+    return raw.map((t) => String(t).trim()).filter(Boolean)
+  }
+  if (typeof raw === 'string') {
+    return raw
+      .split(',')
+      .map((t) => t.trim())
+      .filter(Boolean)
+  }
+  return undefined
+}
 
 function parseTags(raw: unknown): string[] | undefined {
   if (Array.isArray(raw)) {
@@ -537,6 +610,237 @@ export async function handleMcpRequest(
           id,
           result: {
             content: [{ type: 'text', text: JSON.stringify(syncResult, null, 2) }],
+          },
+        }
+      }
+
+      if (toolName === 'memory_group') {
+        const action = typeof args.action === 'string' ? args.action.trim() : ''
+        if (!action) {
+          return {
+            jsonrpc: JSONRPC_VERSION,
+            id,
+            result: {
+              isError: true,
+              content: [{ type: 'text', text: 'Missing required argument: action' }],
+            },
+          }
+        }
+
+        if (action === 'list') {
+          const groups = vault.listGroups()
+          const unassignedGroupPolicy = vault.getNodeConfig().unassignedGroupPolicy ?? 'none'
+          return {
+            jsonrpc: JSONRPC_VERSION,
+            id,
+            result: {
+              content: [
+                {
+                  type: 'text',
+                  text: JSON.stringify({ groups, unassignedGroupPolicy }, null, 2),
+                },
+              ],
+            },
+          }
+        }
+
+        if (action === 'create') {
+          const name = typeof args.name === 'string' ? args.name.trim() : ''
+          if (!name) {
+            return {
+              jsonrpc: JSONRPC_VERSION,
+              id,
+              result: {
+                isError: true,
+                content: [{ type: 'text', text: 'Missing required argument: name' }],
+              },
+            }
+          }
+          const projects = parseStringList(args.projects)
+          const rawCategories = parseStringList(args.categories)
+          if (rawCategories) {
+            for (const cat of rawCategories) {
+              if (cat !== '*' && !isMemoryCategory(cat)) {
+                return {
+                  jsonrpc: JSONRPC_VERSION,
+                  id,
+                  result: {
+                    isError: true,
+                    content: [
+                      {
+                        type: 'text',
+                        text: `Invalid category "${cat}". Must be one of: ${MEMORY_CATEGORIES.join(', ')}, *`,
+                      },
+                    ],
+                  },
+                }
+              }
+            }
+          }
+          const rawPermissions =
+            typeof args.permissions === 'string' ? args.permissions.trim() : undefined
+          if (rawPermissions && !isGroupPermissionMode(rawPermissions)) {
+            return {
+              jsonrpc: JSONRPC_VERSION,
+              id,
+              result: {
+                isError: true,
+                content: [
+                  {
+                    type: 'text',
+                    text: `Invalid permissions "${rawPermissions}". Must be readwrite, readonly, or writeonly`,
+                  },
+                ],
+              },
+            }
+          }
+          const group = vault.upsertGroup({
+            name,
+            description: typeof args.description === 'string' ? args.description : undefined,
+            projects,
+            categories: rawCategories,
+            permissions: rawPermissions as GroupPermissionMode | undefined,
+            groupToken: typeof args.groupToken === 'string' ? args.groupToken : undefined,
+          })
+          return {
+            jsonrpc: JSONRPC_VERSION,
+            id,
+            result: {
+              content: [{ type: 'text', text: JSON.stringify({ group }, null, 2) }],
+            },
+          }
+        }
+
+        if (action === 'add_node') {
+          const name = typeof args.name === 'string' ? args.name.trim() : ''
+          const node = typeof args.node === 'string' ? args.node.trim() : ''
+          if (!name || !node) {
+            return {
+              jsonrpc: JSONRPC_VERSION,
+              id,
+              result: {
+                isError: true,
+                content: [
+                  {
+                    type: 'text',
+                    text: 'Missing required arguments: name and node are required for add_node',
+                  },
+                ],
+              },
+            }
+          }
+          const group = vault.addNodeToGroup(name, node)
+          return {
+            jsonrpc: JSONRPC_VERSION,
+            id,
+            result: {
+              content: [
+                {
+                  type: 'text',
+                  text: JSON.stringify({ group, addedNode: node }, null, 2),
+                },
+              ],
+            },
+          }
+        }
+
+        if (action === 'remove_node') {
+          const name = typeof args.name === 'string' ? args.name.trim() : ''
+          const node = typeof args.node === 'string' ? args.node.trim() : ''
+          if (!name || !node) {
+            return {
+              jsonrpc: JSONRPC_VERSION,
+              id,
+              result: {
+                isError: true,
+                content: [
+                  {
+                    type: 'text',
+                    text: 'Missing required arguments: name and node are required for remove_node',
+                  },
+                ],
+              },
+            }
+          }
+          const group = vault.removeNodeFromGroup(name, node)
+          return {
+            jsonrpc: JSONRPC_VERSION,
+            id,
+            result: {
+              content: [
+                {
+                  type: 'text',
+                  text: JSON.stringify({ group, removedNode: node }, null, 2),
+                },
+              ],
+            },
+          }
+        }
+
+        if (action === 'delete') {
+          const name = typeof args.name === 'string' ? args.name.trim() : ''
+          if (!name) {
+            return {
+              jsonrpc: JSONRPC_VERSION,
+              id,
+              result: {
+                isError: true,
+                content: [{ type: 'text', text: 'Missing required argument: name' }],
+              },
+            }
+          }
+          const deleted = vault.deleteGroup(name)
+          return {
+            jsonrpc: JSONRPC_VERSION,
+            id,
+            result: {
+              content: [{ type: 'text', text: JSON.stringify({ name, deleted }, null, 2) }],
+            },
+          }
+        }
+
+        if (action === 'default_policy') {
+          const policy = typeof args.policy === 'string' ? args.policy.trim() : ''
+          if (!isUnassignedGroupPolicy(policy)) {
+            return {
+              jsonrpc: JSONRPC_VERSION,
+              id,
+              result: {
+                isError: true,
+                content: [
+                  {
+                    type: 'text',
+                    text: 'Invalid policy. Must be "none" or "all"',
+                  },
+                ],
+              },
+            }
+          }
+          const config = vault.setUnassignedGroupPolicy(policy)
+          return {
+            jsonrpc: JSONRPC_VERSION,
+            id,
+            result: {
+              content: [
+                {
+                  type: 'text',
+                  text: JSON.stringify(
+                    { unassignedGroupPolicy: config.unassignedGroupPolicy, config },
+                    null,
+                    2,
+                  ),
+                },
+              ],
+            },
+          }
+        }
+
+        return {
+          jsonrpc: JSONRPC_VERSION,
+          id,
+          result: {
+            isError: true,
+            content: [{ type: 'text', text: `Unknown action: ${action}` }],
           },
         }
       }

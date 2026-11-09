@@ -23,6 +23,7 @@ export const SIGNALS = [
   'memory.exported',
   'memory.imported',
   'memory.synced',
+  'memory.group.updated',
   'memoseb.deployed',
 ]
 

@@ -11,7 +11,17 @@ import {
   wireSuccess,
 } from 'hubseb'
 import { analyzeAndStoreProject } from '../core/analyzer.ts'
-import { MEMORY_CATEGORIES, type MemoryCategory } from '../core/schema.ts'
+import {
+  GROUP_PERMISSION_MODES,
+  MEMORY_CATEGORIES,
+  isGroupPermissionMode,
+  isMemoryCategory,
+  isUnassignedGroupPolicy,
+  type GroupPermissionMode,
+  type MemoryCategory,
+  type SyncGroupRecord,
+  type UnassignedGroupPolicy,
+} from '../core/schema.ts'
 import { readSnapshotFile, writeSnapshotFile } from '../core/snapshot.ts'
 import {
   discoverLanParents,
@@ -85,6 +95,13 @@ const VALUE_FLAGS = new Set([
   '--host',
   '--port',
   '--timeout',
+  '--projects',
+  '--categories',
+  '--permissions',
+  '--description',
+  '--group',
+  '--groups',
+  '--policy',
 ])
 
 function extractFlags(argv: readonly string[]): {
@@ -793,11 +810,12 @@ export async function executeMemoCli(
       if (subcommand === 'status') {
         const config = vault.getNodeConfig()
         const peers = vault.listPeers()
+        const groups = vault.listGroups()
         const lanUrls = getLocalLanUrls(config.listenPort)
         if (jsonMode) {
           return {
             exitCode: 0,
-            stdout: serializeWire(wireSuccess('node', { config, peers, lanUrls })),
+            stdout: serializeWire(wireSuccess('node', { config, peers, lanUrls, groups })),
             stderr: '',
           }
         }
@@ -810,6 +828,7 @@ export async function executeMemoCli(
           `  Auto-sync:   ${config.autoSync ? 'enabled' : 'disabled'}`,
           `  LAN discov.: ${config.lanDiscovery ? 'enabled' : 'disabled'}`,
           `  Auth token:  ${config.authToken ? 'configured' : 'none'}`,
+          `  Default ACL: ${config.unassignedGroupPolicy ?? 'none'}`,
           `  LAN URLs:    ${lanUrls.join(', ') || 'none'}`,
           `  Registered peers (${peers.length}):`,
         ]
@@ -819,6 +838,14 @@ export async function executeMemoCli(
           for (const p of peers) {
             lines.push(
               `    • [${p.role}] ${p.name ?? 'unnamed'} (${p.url}) [status: ${p.lastStatus ?? 'unknown'}, lastSync: ${p.lastSyncAt ?? 'never'}]`,
+            )
+          }
+        }
+        if (groups.length > 0) {
+          lines.push(`  Configured groups (${groups.length}):`)
+          for (const g of groups) {
+            lines.push(
+              `    • [${g.name}] permissions=${g.permissions}, projects=[${g.projects.join(', ')}], categories=[${g.categories.join(', ')}], members=${g.memberNodeIds.length}`,
             )
           }
         }
@@ -885,6 +912,14 @@ export async function executeMemoCli(
         })
 
         if (role === 'child') {
+          const groupArg = flags.group ?? flags.groups
+          const requestedGroups = groupArg
+            ? groupArg
+                .split(',')
+                .map((s) => s.trim())
+                .filter(Boolean)
+            : undefined
+
           if (discoverMode && !flags.parent) {
             const parents = await discoverLanParents({
               port: Number(flags.port) || undefined,
@@ -927,6 +962,7 @@ export async function executeMemoCli(
                 peerUrl: normalized,
                 peerRole: 'parent',
                 token: flags.token ?? vault.getNodeConfig().authToken ?? undefined,
+                groups: requestedGroups,
               })
             } catch {
               // Tolerated
@@ -945,6 +981,7 @@ export async function executeMemoCli(
                 peerUrl: normalized,
                 peerRole: 'parent',
                 token: flags.token ?? vault.getNodeConfig().authToken ?? undefined,
+                groups: requestedGroups,
               })
             } catch {
               vault.upsertPeer({
@@ -1050,11 +1087,19 @@ export async function executeMemoCli(
           authToken: flags.token ?? vault.getNodeConfig().authToken ?? null,
           lastStatus: 'configured',
         })
+        const groupArg = flags.group ?? flags.groups
+        const requestedGroups = groupArg
+          ? groupArg
+              .split(',')
+              .map((s) => s.trim())
+              .filter(Boolean)
+          : undefined
         try {
           await performPeerHandshake(vault, {
             peerUrl: normalizedUrl,
             peerRole: 'parent',
             token: flags.token ?? vault.getNodeConfig().authToken ?? undefined,
+            groups: requestedGroups,
           })
         } catch {
           vault.upsertPeer({
@@ -1131,6 +1176,25 @@ export async function executeMemoCli(
           })
         }
         const peer = vault.listPeers().find((p) => p.url === normalizedUrl)
+        const groupFlag = flags.group ?? flags.groups
+        if (groupFlag && peer) {
+          const groupNames = groupFlag
+            .split(',')
+            .map((s) => s.trim())
+            .filter(Boolean)
+          for (const g of groupNames) {
+            if (!vault.getGroup(g)) {
+              vault.upsertGroup({ name: g })
+            }
+            vault.addNodeToGroup(g, peer.url)
+            if (peer.peerNodeId) {
+              vault.addNodeToGroup(g, peer.peerNodeId)
+            }
+            if (peer.id) {
+              vault.addNodeToGroup(g, peer.id)
+            }
+          }
+        }
         if (jsonMode) {
           return {
             exitCode: 0,
@@ -1274,6 +1338,407 @@ export async function executeMemoCli(
     }
   }
 
+  if (command === 'group' || command === 'groups') {
+    const subcommand = positional[1] ?? 'list'
+    const vault = new MemoryVault({ dbPath, runtime })
+    try {
+      if (subcommand === 'list') {
+        const groups = vault.listGroups()
+        const unassignedGroupPolicy = vault.getNodeConfig().unassignedGroupPolicy ?? 'none'
+        if (jsonMode) {
+          return {
+            exitCode: 0,
+            stdout: serializeWire(wireSuccess('group', { groups, unassignedGroupPolicy })),
+            stderr: '',
+          }
+        }
+        const lines = [
+          `memoseb group list (default policy for unassigned nodes: ${unassignedGroupPolicy}):`,
+        ]
+        if (groups.length === 0) {
+          lines.push('  (no groups configured)')
+        } else {
+          for (const g of groups) {
+            lines.push(
+              `  • [${g.name}] permissions=${g.permissions}, projects=[${g.projects.join(', ')}], categories=[${g.categories.join(', ')}], hasToken=${Boolean(g.groupToken)}, members=[${g.memberNodeIds.join(', ') || 'none'}]`,
+            )
+            if (g.description) {
+              lines.push(`      description: ${g.description}`)
+            }
+          }
+        }
+        return { exitCode: 0, stdout: `${lines.join('\n')}\n`, stderr: '' }
+      }
+
+      if (subcommand === 'create' || subcommand === 'upsert' || subcommand === 'set') {
+        const groupName = positional[2]
+        if (!groupName) {
+          if (jsonMode) {
+            return {
+              exitCode: 2,
+              stdout: serializeWire(
+                wireFailure(
+                  'group',
+                  'MISSING_GROUP_NAME',
+                  'Group name is required',
+                  'Usage: memoseb group create <name> [options]',
+                ),
+              ),
+              stderr: '',
+            }
+          }
+          return {
+            exitCode: 2,
+            stdout: '',
+            stderr: 'Group name is required. Usage: memoseb group create <name> [options]\n',
+          }
+        }
+
+        const rawProjects = flags.projects ?? flags.project
+        const projects =
+          rawProjects !== undefined
+            ? rawProjects.split(',').map((p) => p.trim()).filter(Boolean)
+            : undefined
+
+        const rawCategories = flags.categories ?? flags.category
+        let categories: string[] | undefined = undefined
+        if (rawCategories !== undefined) {
+          categories = rawCategories.split(',').map((c) => c.trim()).filter(Boolean)
+          for (const cat of categories) {
+            if (cat !== '*' && !isMemoryCategory(cat)) {
+              if (jsonMode) {
+                return {
+                  exitCode: 2,
+                  stdout: serializeWire(
+                    wireFailure(
+                      'group',
+                      'INVALID_CATEGORY',
+                      `Invalid category "${cat}". Must be one of: ${MEMORY_CATEGORIES.join(', ')}, *`,
+                    ),
+                  ),
+                  stderr: '',
+                }
+              }
+              return {
+                exitCode: 2,
+                stdout: '',
+                stderr: `Invalid category "${cat}". Must be one of: ${MEMORY_CATEGORIES.join(', ')}, *\n`,
+              }
+            }
+          }
+        }
+
+        let permissions: GroupPermissionMode | undefined = undefined
+        if (flags.permissions !== undefined) {
+          if (!isGroupPermissionMode(flags.permissions)) {
+            if (jsonMode) {
+              return {
+                exitCode: 2,
+                stdout: serializeWire(
+                  wireFailure(
+                    'group',
+                    'INVALID_PERMISSIONS',
+                    `Invalid permissions "${flags.permissions}". Must be readwrite, readonly, or writeonly`,
+                  ),
+                ),
+                stderr: '',
+              }
+            }
+            return {
+              exitCode: 2,
+              stdout: '',
+              stderr: `Invalid permissions "${flags.permissions}". Must be readwrite, readonly, or writeonly.\n`,
+            }
+          }
+          permissions = flags.permissions
+        }
+
+        const group = vault.upsertGroup({
+          name: groupName,
+          description: flags.description,
+          projects,
+          categories,
+          permissions,
+          groupToken: flags.token,
+        })
+
+        try {
+          const topology = new TopologyStore(runtime)
+          await topology.broadcastSignal(BUNDLE_ID, 'memory.group.updated', {
+            action: 'upsert',
+            group: group.name,
+          })
+        } catch {
+          // ignore
+        }
+
+        if (jsonMode) {
+          return {
+            exitCode: 0,
+            stdout: serializeWire(wireSuccess('group', { group })),
+            stderr: '',
+          }
+        }
+        return {
+          exitCode: 0,
+          stdout: `Created/updated group "${group.name}" (permissions: ${group.permissions}, projects: [${group.projects.join(', ')}], categories: [${group.categories.join(', ')}]).\n`,
+          stderr: '',
+        }
+      }
+
+      if (subcommand === 'add-node' || subcommand === 'assign') {
+        const groupName = positional[2]
+        const nodeIdentifier = positional[3]
+        if (!groupName || !nodeIdentifier) {
+          if (jsonMode) {
+            return {
+              exitCode: 2,
+              stdout: serializeWire(
+                wireFailure(
+                  'group',
+                  'MISSING_ARGUMENTS',
+                  'Group name and node identifier are required',
+                  'Usage: memoseb group add-node <group-name> <node-identifier>',
+                ),
+              ),
+              stderr: '',
+            }
+          }
+          return {
+            exitCode: 2,
+            stdout: '',
+            stderr:
+              'Group name and node identifier are required. Usage: memoseb group add-node <group-name> <node-identifier>\n',
+          }
+        }
+
+        const group = vault.addNodeToGroup(groupName, nodeIdentifier)
+
+        try {
+          const topology = new TopologyStore(runtime)
+          await topology.broadcastSignal(BUNDLE_ID, 'memory.group.updated', {
+            action: 'add_node',
+            group: group.name,
+            node: nodeIdentifier,
+          })
+        } catch {
+          // ignore
+        }
+
+        if (jsonMode) {
+          return {
+            exitCode: 0,
+            stdout: serializeWire(wireSuccess('group', { group, addedNode: nodeIdentifier })),
+            stderr: '',
+          }
+        }
+        return {
+          exitCode: 0,
+          stdout: `Added node "${nodeIdentifier}" to group "${group.name}".\n`,
+          stderr: '',
+        }
+      }
+
+      if (subcommand === 'remove-node' || subcommand === 'unassign') {
+        const groupName = positional[2]
+        const nodeIdentifier = positional[3]
+        if (!groupName || !nodeIdentifier) {
+          if (jsonMode) {
+            return {
+              exitCode: 2,
+              stdout: serializeWire(
+                wireFailure(
+                  'group',
+                  'MISSING_ARGUMENTS',
+                  'Group name and node identifier are required',
+                  'Usage: memoseb group remove-node <group-name> <node-identifier>',
+                ),
+              ),
+              stderr: '',
+            }
+          }
+          return {
+            exitCode: 2,
+            stdout: '',
+            stderr:
+              'Group name and node identifier are required. Usage: memoseb group remove-node <group-name> <node-identifier>\n',
+          }
+        }
+
+        const group = vault.removeNodeFromGroup(groupName, nodeIdentifier)
+
+        try {
+          const topology = new TopologyStore(runtime)
+          await topology.broadcastSignal(BUNDLE_ID, 'memory.group.updated', {
+            action: 'remove_node',
+            group: group.name,
+            node: nodeIdentifier,
+          })
+        } catch {
+          // ignore
+        }
+
+        if (jsonMode) {
+          return {
+            exitCode: 0,
+            stdout: serializeWire(wireSuccess('group', { group, removedNode: nodeIdentifier })),
+            stderr: '',
+          }
+        }
+        return {
+          exitCode: 0,
+          stdout: `Removed node "${nodeIdentifier}" from group "${group.name}".\n`,
+          stderr: '',
+        }
+      }
+
+      if (subcommand === 'delete' || subcommand === 'remove' || subcommand === 'rm') {
+        const groupName = positional[2]
+        if (!groupName) {
+          if (jsonMode) {
+            return {
+              exitCode: 2,
+              stdout: serializeWire(
+                wireFailure(
+                  'group',
+                  'MISSING_GROUP_NAME',
+                  'Group name is required',
+                  'Usage: memoseb group delete <group-name>',
+                ),
+              ),
+              stderr: '',
+            }
+          }
+          return {
+            exitCode: 2,
+            stdout: '',
+            stderr: 'Group name is required. Usage: memoseb group delete <group-name>\n',
+          }
+        }
+
+        const deleted = vault.deleteGroup(groupName)
+
+        if (deleted) {
+          try {
+            const topology = new TopologyStore(runtime)
+            await topology.broadcastSignal(BUNDLE_ID, 'memory.group.updated', {
+              action: 'delete',
+              group: groupName,
+            })
+          } catch {
+            // ignore
+          }
+        }
+
+        if (jsonMode) {
+          return {
+            exitCode: deleted ? 0 : 1,
+            stdout: serializeWire(
+              deleted
+                ? wireSuccess('group', { name: groupName, deleted })
+                : wireFailure('group', 'GROUP_NOT_FOUND', `Group "${groupName}" not found`),
+            ),
+            stderr: '',
+          }
+        }
+        return {
+          exitCode: deleted ? 0 : 1,
+          stdout: deleted ? `Deleted group "${groupName}".\n` : '',
+          stderr: deleted ? '' : `Group "${groupName}" not found.\n`,
+        }
+      }
+
+      if (subcommand === 'default-policy') {
+        const policyArg = positional[2] ?? flags.policy
+        if (policyArg !== 'none' && policyArg !== 'all') {
+          if (jsonMode) {
+            return {
+              exitCode: 2,
+              stdout: serializeWire(
+                wireFailure(
+                  'group',
+                  'INVALID_POLICY',
+                  `Invalid policy "${policyArg}". Must be "none" or "all"`,
+                  'Usage: memoseb group default-policy <none|all>',
+                ),
+              ),
+              stderr: '',
+            }
+          }
+          return {
+            exitCode: 2,
+            stdout: '',
+            stderr:
+              'Invalid policy. Must be "none" or "all". Usage: memoseb group default-policy <none|all>\n',
+          }
+        }
+
+        const config = vault.setUnassignedGroupPolicy(policyArg)
+
+        try {
+          const topology = new TopologyStore(runtime)
+          await topology.broadcastSignal(BUNDLE_ID, 'memory.group.updated', {
+            action: 'default_policy',
+            policy: config.unassignedGroupPolicy,
+          })
+        } catch {
+          // ignore
+        }
+
+        if (jsonMode) {
+          return {
+            exitCode: 0,
+            stdout: serializeWire(
+              wireSuccess('group', { unassignedGroupPolicy: config.unassignedGroupPolicy, config }),
+            ),
+            stderr: '',
+          }
+        }
+        return {
+          exitCode: 0,
+          stdout: `Default unassigned group policy set to "${config.unassignedGroupPolicy}".\n`,
+          stderr: '',
+        }
+      }
+
+      if (jsonMode) {
+        return {
+          exitCode: 2,
+          stdout: serializeWire(
+            wireFailure(
+              'group',
+              'UNKNOWN_SUBCOMMAND',
+              `Unknown group subcommand "${subcommand}"`,
+              'Run "memoseb help"',
+            ),
+          ),
+          stderr: '',
+        }
+      }
+      return {
+        exitCode: 2,
+        stdout: '',
+        stderr: `Unknown group subcommand "${subcommand}". Run "memoseb help".\n`,
+      }
+    } catch (err: any) {
+      const message = err instanceof Error ? err.message : String(err)
+      if (jsonMode) {
+        return {
+          exitCode: 1,
+          stdout: serializeWire(wireFailure('group', 'ERROR', message)),
+          stderr: '',
+        }
+      }
+      return {
+        exitCode: 1,
+        stdout: '',
+        stderr: `Group operation failed: ${message}\n`,
+      }
+    } finally {
+      vault.close()
+    }
+  }
+
   if (command === 'sync') {
     const vault = new MemoryVault({ dbPath, runtime })
     try {
@@ -1398,6 +1863,7 @@ export async function executeMemoCli(
       'export',
       'import',
       'node',
+      'group',
       'sync',
       'mcp',
       'capabilities',
@@ -1419,6 +1885,7 @@ export async function executeMemoCli(
       '  memoseb export [file] [--out <f>] [--json]   Export vault snapshot to JSON file',
       '  memoseb import <file> [--replace] [--json]   Import snapshot JSON into vault',
       '  memoseb node <status|enable|disable|...>     Manage peer-to-peer network node & sync service',
+      '  memoseb group <list|create|add-node|delete|...> Manage peer permission groups and ACLs',
       '  memoseb sync [--url <peer>] [--full] [--json] Synchronize memories with peers',
       '  memoseb mcp                                  Start stdio JSON-RPC 2.0 MCP server',
       '  memoseb capabilities [--json]                Display provider, consumer and signal metadata',

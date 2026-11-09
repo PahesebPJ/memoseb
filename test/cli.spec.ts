@@ -321,6 +321,7 @@ describe('CLI hubseb/v1 Wire Contract, MCP JSON-RPC Server, and Topology Integra
         'memory_export',
         'memory_import',
         'memory_sync',
+        'memory_group',
       ])
 
       // tools/call -> memory_store
@@ -1083,6 +1084,278 @@ describe('CLI hubseb/v1 Wire Contract, MCP JSON-RPC Server, and Topology Integra
         }
       })) as { result: { isError: boolean } }
       assert.equal(syncDisabledRes.result.isError, true)
+    } finally {
+      vault.close()
+    }
+  })
+
+  it('manages groups via CLI group commands and --group flags in node lifecycle', async () => {
+    // 1. memoseb group list empty
+    const listRes = await executeMemoCli(['group', 'list', '--json'], { runtime, dbPath })
+    assert.equal(listRes.exitCode, 0)
+    const listPacket = decodeWire<{ groups: any[]; unassignedGroupPolicy: string }>(listRes.stdout) as WireSuccess<{ groups: any[]; unassignedGroupPolicy: string }>
+    assert.equal(listPacket.status, 'success')
+    assert.equal(listPacket.payload.groups.length, 0)
+    assert.equal(listPacket.payload.unassignedGroupPolicy, 'none')
+
+    // 2. memoseb group create frontend-team
+    const createRes = await executeMemoCli(
+      [
+        'group',
+        'create',
+        'frontend-team',
+        '--projects',
+        'p1,p2',
+        '--categories',
+        'architecture,convention',
+        '--permissions',
+        'readwrite',
+        '--token',
+        'secret-group-token',
+        '--description',
+        'Frontend developers group',
+        '--json'
+      ],
+      { runtime, dbPath }
+    )
+    assert.equal(createRes.exitCode, 0)
+    const createPacket = decodeWire<{ group: any }>(createRes.stdout) as WireSuccess<{ group: any }>
+    assert.equal(createPacket.status, 'success')
+    assert.equal(createPacket.payload.group.name, 'frontend-team')
+    assert.deepEqual(createPacket.payload.group.projects, ['p1', 'p2'])
+    assert.deepEqual(createPacket.payload.group.categories, ['architecture', 'convention'])
+    assert.equal(createPacket.payload.group.permissions, 'readwrite')
+    assert.equal(createPacket.payload.group.groupToken, 'secret-group-token')
+
+    // 3. invalid validations
+    const noNameRes = await executeMemoCli(['group', 'create', '--json'], { runtime, dbPath })
+    assert.equal(noNameRes.exitCode, 2)
+    const noNamePacket = decodeWire(noNameRes.stdout)
+    assert.equal(noNamePacket.status, 'error')
+
+    const badCatRes = await executeMemoCli(
+      ['group', 'create', 'test-group', '--categories', 'unknown-cat', '--json'],
+      { runtime, dbPath }
+    )
+    assert.equal(badCatRes.exitCode, 2)
+    const badCatPacket = decodeWire(badCatRes.stdout)
+    assert.equal(badCatPacket.status, 'error')
+
+    const badPermRes = await executeMemoCli(
+      ['group', 'create', 'test-group', '--permissions', 'invalid-perm', '--json'],
+      { runtime, dbPath }
+    )
+    assert.equal(badPermRes.exitCode, 2)
+    const badPermPacket = decodeWire(badPermRes.stdout)
+    assert.equal(badPermPacket.status, 'error')
+
+    // 4. add-node
+    const addNodeRes = await executeMemoCli(
+      ['group', 'add-node', 'frontend-team', 'http://127.0.0.1:4001', '--json'],
+      { runtime, dbPath }
+    )
+    assert.equal(addNodeRes.exitCode, 0)
+    const addNodePacket = decodeWire<{ group: any; addedNode: string }>(addNodeRes.stdout) as WireSuccess<{ group: any; addedNode: string }>
+    assert.equal(addNodePacket.status, 'success')
+    assert.equal(addNodePacket.payload.addedNode, 'http://127.0.0.1:4001')
+    assert.ok(addNodePacket.payload.group.memberNodeIds.includes('http://127.0.0.1:4001'))
+
+    // 5. remove-node
+    const rmNodeRes = await executeMemoCli(
+      ['group', 'remove-node', 'frontend-team', 'http://127.0.0.1:4001', '--json'],
+      { runtime, dbPath }
+    )
+    assert.equal(rmNodeRes.exitCode, 0)
+    const rmNodePacket = decodeWire<{ group: any; removedNode: string }>(rmNodeRes.stdout) as WireSuccess<{ group: any; removedNode: string }>
+    assert.equal(rmNodePacket.status, 'success')
+    assert.equal(rmNodePacket.payload.removedNode, 'http://127.0.0.1:4001')
+    assert.ok(!rmNodePacket.payload.group.memberNodeIds.includes('http://127.0.0.1:4001'))
+
+    // 6. default-policy
+    const polRes = await executeMemoCli(['group', 'default-policy', 'all', '--json'], { runtime, dbPath })
+    assert.equal(polRes.exitCode, 0)
+    const polPacket = decodeWire<{ unassignedGroupPolicy: string }>(polRes.stdout) as WireSuccess<{ unassignedGroupPolicy: string }>
+    assert.equal(polPacket.payload.unassignedGroupPolicy, 'all')
+
+    const badPolRes = await executeMemoCli(['group', 'default-policy', 'invalid', '--json'], { runtime, dbPath })
+    assert.equal(badPolRes.exitCode, 2)
+
+    // 7. text output checks
+    const textCreateRes = await executeMemoCli(
+      ['group', 'create', 'backend-team', '--permissions', 'readonly'],
+      { runtime, dbPath }
+    )
+    assert.equal(textCreateRes.exitCode, 0)
+    assert.match(textCreateRes.stdout, /backend-team/)
+
+    const textListRes = await executeMemoCli(['group', 'list'], { runtime, dbPath })
+    assert.equal(textListRes.exitCode, 0)
+    assert.match(textListRes.stdout, /frontend-team/)
+    assert.match(textListRes.stdout, /backend-team/)
+
+    // 8. node status includes groups
+    const nodeStatusRes = await executeMemoCli(['node', 'status', '--json'], { runtime, dbPath })
+    assert.equal(nodeStatusRes.exitCode, 0)
+    const nodeStatusPacket = decodeWire<{ groups: any[] }>(nodeStatusRes.stdout) as WireSuccess<{ groups: any[] }>
+    assert.ok(Array.isArray(nodeStatusPacket.payload.groups))
+    assert.equal(nodeStatusPacket.payload.groups.length, 2)
+
+    // 9. node add-child with --group
+    const addChildRes = await executeMemoCli(
+      ['node', 'add-child', 'http://127.0.0.1:9099', '--group', 'auto-created-group', '--json'],
+      { runtime, dbPath }
+    )
+    assert.equal(addChildRes.exitCode, 0)
+    const checkGroupRes = await executeMemoCli(['group', 'list', '--json'], { runtime, dbPath })
+    const checkGroupPacket = decodeWire<{ groups: any[] }>(checkGroupRes.stdout) as WireSuccess<{ groups: any[] }>
+    const autoGroup = checkGroupPacket.payload.groups.find((g: any) => g.name === 'auto-created-group')
+    assert.ok(autoGroup)
+    assert.ok(autoGroup.memberNodeIds.includes('http://127.0.0.1:9099'))
+
+    // 10. delete group
+    const delRes = await executeMemoCli(['group', 'delete', 'frontend-team', '--json'], { runtime, dbPath })
+    assert.equal(delRes.exitCode, 0)
+    const delNotFound = await executeMemoCli(['group', 'delete', 'frontend-team', '--json'], { runtime, dbPath })
+    assert.equal(delNotFound.exitCode, 1)
+  })
+
+  it('handles MCP memory_group actions (list, create, add_node, remove_node, delete, default_policy)', async () => {
+    const vault = new MemoryVault({ dbPath, runtime })
+    try {
+      // 1. list
+      const listRes = (await handleMcpRequest(vault, {
+        jsonrpc: '2.0',
+        id: 201,
+        method: 'tools/call',
+        params: {
+          name: 'memory_group',
+          arguments: { action: 'list' }
+        }
+      })) as { result: { content: Array<{ type: string; text: string }> } }
+      const listPayload = JSON.parse(listRes.result.content[0]!.text) as {
+        groups: any[]
+        unassignedGroupPolicy: string
+      }
+      assert.ok(Array.isArray(listPayload.groups))
+
+      // 2. create
+      const createRes = (await handleMcpRequest(vault, {
+        jsonrpc: '2.0',
+        id: 202,
+        method: 'tools/call',
+        params: {
+          name: 'memory_group',
+          arguments: {
+            action: 'create',
+            name: 'mcp-team',
+            projects: ['proj-a', 'proj-b'],
+            categories: ['architecture', 'domain'],
+            permissions: 'readonly',
+            description: 'MCP created group'
+          }
+        }
+      })) as { result: { content: Array<{ type: string; text: string }> } }
+      const createPayload = JSON.parse(createRes.result.content[0]!.text) as {
+        group: any
+      }
+      assert.equal(createPayload.group.name, 'mcp-team')
+      assert.equal(createPayload.group.permissions, 'readonly')
+      assert.deepEqual(createPayload.group.projects, ['proj-a', 'proj-b'])
+
+      // 3. invalid create
+      const badCatRes = (await handleMcpRequest(vault, {
+        jsonrpc: '2.0',
+        id: 203,
+        method: 'tools/call',
+        params: {
+          name: 'memory_group',
+          arguments: {
+            action: 'create',
+            name: 'bad-group',
+            categories: ['not-a-category']
+          }
+        }
+      })) as { result: { isError: boolean } }
+      assert.equal(badCatRes.result.isError, true)
+
+      // 4. add_node
+      const addNodeRes = (await handleMcpRequest(vault, {
+        jsonrpc: '2.0',
+        id: 204,
+        method: 'tools/call',
+        params: {
+          name: 'memory_group',
+          arguments: {
+            action: 'add_node',
+            name: 'mcp-team',
+            node: 'node-alpha'
+          }
+        }
+      })) as { result: { content: Array<{ type: string; text: string }> } }
+      const addNodePayload = JSON.parse(addNodeRes.result.content[0]!.text) as {
+        group: any
+        addedNode: string
+      }
+      assert.equal(addNodePayload.addedNode, 'node-alpha')
+      assert.ok(addNodePayload.group.memberNodeIds.includes('node-alpha'))
+
+      // 5. remove_node
+      const rmNodeRes = (await handleMcpRequest(vault, {
+        jsonrpc: '2.0',
+        id: 205,
+        method: 'tools/call',
+        params: {
+          name: 'memory_group',
+          arguments: {
+            action: 'remove_node',
+            name: 'mcp-team',
+            node: 'node-alpha'
+          }
+        }
+      })) as { result: { content: Array<{ type: string; text: string }> } }
+      const rmNodePayload = JSON.parse(rmNodeRes.result.content[0]!.text) as {
+        group: any
+        removedNode: string
+      }
+      assert.equal(rmNodePayload.removedNode, 'node-alpha')
+      assert.ok(!rmNodePayload.group.memberNodeIds.includes('node-alpha'))
+
+      // 6. default_policy
+      const polRes = (await handleMcpRequest(vault, {
+        jsonrpc: '2.0',
+        id: 206,
+        method: 'tools/call',
+        params: {
+          name: 'memory_group',
+          arguments: {
+            action: 'default_policy',
+            policy: 'all'
+          }
+        }
+      })) as { result: { content: Array<{ type: string; text: string }> } }
+      const polPayload = JSON.parse(polRes.result.content[0]!.text) as {
+        unassignedGroupPolicy: string
+      }
+      assert.equal(polPayload.unassignedGroupPolicy, 'all')
+
+      // 7. delete
+      const delRes = (await handleMcpRequest(vault, {
+        jsonrpc: '2.0',
+        id: 207,
+        method: 'tools/call',
+        params: {
+          name: 'memory_group',
+          arguments: {
+            action: 'delete',
+            name: 'mcp-team'
+          }
+        }
+      })) as { result: { content: Array<{ type: string; text: string }> } }
+      const delPayload = JSON.parse(delRes.result.content[0]!.text) as {
+        name: string
+        deleted: boolean
+      }
+      assert.equal(delPayload.deleted, true)
     } finally {
       vault.close()
     }
