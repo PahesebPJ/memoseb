@@ -1,4 +1,5 @@
 import crypto from 'node:crypto'
+import os from 'node:os'
 import path from 'node:path'
 import type { DatabaseSync } from 'node:sqlite'
 import { SystemRuntime } from 'hubseb'
@@ -14,8 +15,23 @@ import { detectProject, slugifyProjectId } from './project-detector.ts'
 import {
   isMemoryCategory,
   openVaultDatabase,
-  type MemoryCategory
+  type MemoryCategory,
+  type NodeConfiguration,
+  type NodeRole,
+  type SyncPeerRecord
 } from './schema.ts'
+import {
+  computeSnapshotChecksum,
+  verifySnapshot,
+  type ExportOptions,
+  type ImportOptions,
+  type ImportResult,
+  type VaultSnapshotV1,
+  type ExportedProject,
+  type ExportedTombstone
+} from './snapshot.ts'
+
+export * from './snapshot.ts'
 
 export interface MemoryRecord {
   id: string
@@ -170,23 +186,57 @@ function deriveDefaultTitle(content: string): string {
   return `${firstLine.slice(0, 69)}...`
 }
 
+interface RawPeerRow {
+  id: string
+  peer_node_id: string | null
+  role: string
+  name: string
+  url: string
+  auth_token: string | null
+  last_sync_at: string | null
+  last_status: string | null
+  updated_at: string
+}
+
+function mapRowToPeerRecord(row: RawPeerRow): SyncPeerRecord {
+  return {
+    id: row.id,
+    peerNodeId: row.peer_node_id ?? null,
+    role: row.role === 'parent' ? 'parent' : 'child',
+    name: row.name,
+    url: row.url,
+    authToken: row.auth_token ?? null,
+    lastSyncAt: row.last_sync_at ?? null,
+    lastStatus: row.last_status ?? null,
+    updatedAt: row.updated_at
+  }
+}
+
 export class MemoryVault {
   readonly dbPath: string
   private readonly db: DatabaseSync
   private readonly embedder: EmbeddingProvider
+  private readonly runtime: SystemRuntime
 
   constructor(options?: {
     dbPath?: string
     runtime?: SystemRuntime
     embedder?: EmbeddingProvider
   }) {
-    const runtime = options?.runtime ?? new SystemRuntime()
+    this.runtime = options?.runtime ?? new SystemRuntime()
     this.dbPath =
       options?.dbPath ??
-      runtime.env.MEMOSEB_DB_PATH ??
-      path.join(runtime.stateRoot, '..', 'memoseb', 'vault.sqlite')
+      this.runtime.env.MEMOSEB_DB_PATH ??
+      path.join(this.runtime.stateRoot, '..', 'memoseb', 'vault.sqlite')
     this.db = openVaultDatabase(this.dbPath)
     this.embedder = options?.embedder ?? new LocalFeatureHashEmbedder()
+  }
+
+  private get runtimeEnvToken(): string | null {
+    const token =
+      this.runtime.env.MEMOSEB_SYNC_TOKEN?.trim() ||
+      process.env.MEMOSEB_SYNC_TOKEN?.trim()
+    return token && token.length > 0 ? token : null
   }
 
   private resolveProjectContext(input?: {
@@ -265,6 +315,13 @@ export class MemoryVault {
     const tokenCount = estimateTokens(`${title}\n${trimmedContent}`)
 
     if (existing) {
+      this.db
+        .prepare(
+          `DELETE FROM memory_tombstones
+           WHERE (project_id = ? AND content_hash = ?) OR memory_id = ?`
+        )
+        .run(project.id, contentHash, existing.id)
+
       const mergedImportance =
         input.importance !== undefined
           ? importance
@@ -340,6 +397,13 @@ export class MemoryVault {
     }
 
     const id = crypto.randomUUID()
+    this.db
+      .prepare(
+        `DELETE FROM memory_tombstones
+         WHERE (project_id = ? AND content_hash = ?) OR memory_id = ?`
+      )
+      .run(project.id, contentHash, id)
+
     this.db
       .prepare(
         `INSERT INTO memories (
@@ -639,15 +703,909 @@ export class MemoryVault {
 
   forgetMemory(id: string): boolean {
     const existing = this.db
-      .prepare(`SELECT id FROM memories WHERE id = ?`)
-      .get(id) as { id: string } | undefined
+      .prepare(
+        `SELECT id, project_id, content_hash FROM memories WHERE id = ?`
+      )
+      .get(id) as
+      | { id: string; project_id: string; content_hash: string }
+      | undefined
     if (!existing) {
       return false
     }
+
+    const now = new Date().toISOString()
+    const nodeId = this.getNodeId()
+
     this.db.prepare(`DELETE FROM memories_fts WHERE memory_id = ?`).run(id)
     this.db.prepare(`DELETE FROM memory_vectors WHERE memory_id = ?`).run(id)
     this.db.prepare(`DELETE FROM memories WHERE id = ?`).run(id)
+
+    this.db
+      .prepare(
+        `INSERT INTO memory_tombstones (
+           memory_id, project_id, content_hash, deleted_at, origin_node_id
+         ) VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(memory_id) DO UPDATE SET
+           project_id = excluded.project_id,
+           content_hash = excluded.content_hash,
+           deleted_at = excluded.deleted_at,
+           origin_node_id = excluded.origin_node_id`
+      )
+      .run(existing.id, existing.project_id, existing.content_hash, now, nodeId)
+
     return true
+  }
+
+  getNodeId(): string {
+    const row = this.db
+      .prepare(`SELECT value FROM node_meta WHERE key = 'node.id'`)
+      .get() as { value: string } | undefined
+    if (row && row.value.trim().length > 0) {
+      return row.value.trim()
+    }
+    const newId = crypto.randomUUID()
+    const now = new Date().toISOString()
+    this.db
+      .prepare(
+        `INSERT INTO node_meta (key, value, updated_at)
+         VALUES ('node.id', ?, ?)
+         ON CONFLICT(key) DO UPDATE SET
+           value = excluded.value,
+           updated_at = excluded.updated_at`
+      )
+      .run(newId, now)
+    return newId
+  }
+
+  getNodeConfig(): NodeConfiguration {
+    const rows = this.db
+      .prepare(`SELECT key, value FROM node_meta`)
+      .all() as Array<{ key: string; value: string }>
+    const meta = new Map<string, string>()
+    for (const r of rows) {
+      meta.set(r.key, r.value)
+    }
+
+    const nodeId = this.getNodeId()
+    const rawName = meta.get('node.name')?.trim()
+    const nodeName = rawName && rawName.length > 0 ? rawName : os.hostname()
+    const enabled = meta.get('node.enabled') === 'true'
+
+    const rawRole = meta.get('node.role')
+    const role: NodeRole =
+      rawRole === 'parent' || rawRole === 'child' ? rawRole : 'standalone'
+
+    const rawHost = meta.get('node.listen_host')?.trim()
+    const listenHost = rawHost && rawHost.length > 0 ? rawHost : '0.0.0.0'
+
+    const rawPort = Number(meta.get('node.listen_port'))
+    const listenPort = Number.isInteger(rawPort) && rawPort > 0 ? rawPort : 7432
+
+    const nodeAuthToken = meta.get('node.auth_token')?.trim()
+    const authToken =
+      nodeAuthToken && nodeAuthToken.length > 0
+        ? nodeAuthToken
+        : this.runtimeEnvToken
+
+    const nodeAutoSync = meta.get('node.auto_sync')
+    let autoSync = true
+    if (nodeAutoSync !== undefined) {
+      autoSync = nodeAutoSync === 'true'
+    } else {
+      const envAutoSync =
+        this.runtime.env.MEMOSEB_AUTO_SYNC ?? process.env.MEMOSEB_AUTO_SYNC
+      if (envAutoSync !== undefined) {
+        autoSync = envAutoSync === 'true' || envAutoSync === '1'
+      }
+    }
+
+    const rawLan = meta.get('node.lan_discovery')
+    const lanDiscovery = rawLan !== undefined ? rawLan === 'true' : true
+
+    return {
+      nodeId,
+      nodeName,
+      enabled,
+      role,
+      listenHost,
+      listenPort,
+      authToken,
+      autoSync,
+      lanDiscovery
+    }
+  }
+
+  updateNodeConfig(
+    patch: Partial<Omit<NodeConfiguration, 'nodeId'>>
+  ): NodeConfiguration {
+    const now = new Date().toISOString()
+    const upsert = this.db.prepare(
+      `INSERT INTO node_meta (key, value, updated_at)
+       VALUES (?, ?, ?)
+       ON CONFLICT(key) DO UPDATE SET
+         value = excluded.value,
+         updated_at = excluded.updated_at`
+    )
+    const del = this.db.prepare(`DELETE FROM node_meta WHERE key = ?`)
+
+    if (patch.nodeName !== undefined) {
+      upsert.run('node.name', patch.nodeName.trim(), now)
+    }
+    if (patch.enabled !== undefined) {
+      upsert.run('node.enabled', String(patch.enabled), now)
+    }
+    if (patch.role !== undefined) {
+      upsert.run('node.role', patch.role, now)
+    }
+    if (patch.listenHost !== undefined) {
+      upsert.run('node.listen_host', patch.listenHost.trim(), now)
+    }
+    if (patch.listenPort !== undefined) {
+      upsert.run('node.listen_port', String(patch.listenPort), now)
+    }
+    if (patch.authToken !== undefined) {
+      if (patch.authToken === null || patch.authToken === '') {
+        del.run('node.auth_token')
+      } else {
+        upsert.run('node.auth_token', patch.authToken.trim(), now)
+      }
+    }
+    if (patch.autoSync !== undefined) {
+      upsert.run('node.auto_sync', String(patch.autoSync), now)
+    }
+    if (patch.lanDiscovery !== undefined) {
+      upsert.run('node.lan_discovery', String(patch.lanDiscovery), now)
+    }
+
+    return this.getNodeConfig()
+  }
+
+  enableNodeMode(options: {
+    role: 'parent' | 'child'
+    nodeName?: string
+    listenHost?: string
+    listenPort?: number
+    authToken?: string | null
+    autoSync?: boolean
+    lanDiscovery?: boolean
+  }): NodeConfiguration {
+    return this.updateNodeConfig({
+      enabled: true,
+      role: options.role,
+      ...(options.nodeName !== undefined ? { nodeName: options.nodeName } : {}),
+      ...(options.listenHost !== undefined
+        ? { listenHost: options.listenHost }
+        : {}),
+      ...(options.listenPort !== undefined
+        ? { listenPort: options.listenPort }
+        : {}),
+      ...(options.authToken !== undefined
+        ? { authToken: options.authToken }
+        : {}),
+      ...(options.autoSync !== undefined ? { autoSync: options.autoSync } : {}),
+      ...(options.lanDiscovery !== undefined
+        ? { lanDiscovery: options.lanDiscovery }
+        : {})
+    })
+  }
+
+  disableNodeMode(options?: { purgePeers?: boolean }): NodeConfiguration {
+    this.updateNodeConfig({
+      enabled: false,
+      role: 'standalone'
+    })
+    if (options?.purgePeers === true) {
+      this.db.prepare(`DELETE FROM sync_peers`).run()
+    }
+    return this.getNodeConfig()
+  }
+
+  upsertPeer(input: {
+    role: 'parent' | 'child'
+    url: string
+    name?: string
+    peerNodeId?: string | null
+    authToken?: string | null
+    lastSyncAt?: string | null
+    lastStatus?: string | null
+  }): SyncPeerRecord {
+    const normalizedUrl = input.url.trim().replace(/\/+$/, '')
+    if (input.role === 'parent') {
+      this.db
+        .prepare(`DELETE FROM sync_peers WHERE role = 'parent' AND url != ?`)
+        .run(normalizedUrl)
+    }
+
+    const existing = this.db
+      .prepare(`SELECT * FROM sync_peers WHERE url = ?`)
+      .get(normalizedUrl) as RawPeerRow | undefined
+
+    const now = new Date().toISOString()
+    if (existing) {
+      const peerName = input.name?.trim() || existing.name
+      const peerNodeId =
+        input.peerNodeId !== undefined ? input.peerNodeId : existing.peer_node_id
+      const authToken =
+        input.authToken !== undefined ? input.authToken : existing.auth_token
+      const lastSyncAt =
+        input.lastSyncAt !== undefined ? input.lastSyncAt : existing.last_sync_at
+      const lastStatus =
+        input.lastStatus !== undefined ? input.lastStatus : existing.last_status
+
+      this.db
+        .prepare(
+          `UPDATE sync_peers
+           SET role = ?,
+               name = ?,
+               peer_node_id = ?,
+               auth_token = ?,
+               last_sync_at = ?,
+               last_status = ?,
+               updated_at = ?
+           WHERE id = ?`
+        )
+        .run(
+          input.role,
+          peerName,
+          peerNodeId,
+          authToken,
+          lastSyncAt,
+          lastStatus,
+          now,
+          existing.id
+        )
+
+      const updated = this.db
+        .prepare(`SELECT * FROM sync_peers WHERE id = ?`)
+        .get(existing.id) as unknown as RawPeerRow
+      return mapRowToPeerRecord(updated)
+    }
+
+    const id = crypto.randomUUID()
+    let defaultName = normalizedUrl
+    try {
+      defaultName = new URL(normalizedUrl).host || normalizedUrl
+    } catch {
+      defaultName = normalizedUrl
+    }
+    const peerName = input.name?.trim() || defaultName
+
+    this.db
+      .prepare(
+        `INSERT INTO sync_peers (
+           id, peer_node_id, role, name, url, auth_token, last_sync_at, last_status, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        id,
+        input.peerNodeId ?? null,
+        input.role,
+        peerName,
+        normalizedUrl,
+        input.authToken ?? null,
+        input.lastSyncAt ?? null,
+        input.lastStatus ?? null,
+        now
+      )
+
+    const inserted = this.db
+      .prepare(`SELECT * FROM sync_peers WHERE id = ?`)
+      .get(id) as unknown as RawPeerRow
+    return mapRowToPeerRecord(inserted)
+  }
+
+  removePeer(urlOrId: string): boolean {
+    const trimmed = urlOrId.trim()
+    const normalizedUrl = trimmed.replace(/\/+$/, '')
+    const res = this.db
+      .prepare(
+        `DELETE FROM sync_peers
+         WHERE id = ? OR peer_node_id = ? OR name = ? OR url = ? OR url = ?`
+      )
+      .run(trimmed, trimmed, trimmed, trimmed, normalizedUrl)
+    return res.changes > 0
+  }
+
+  listPeers(role?: 'parent' | 'child'): SyncPeerRecord[] {
+    let rows: RawPeerRow[]
+    if (role) {
+      rows = this.db
+        .prepare(
+          `SELECT * FROM sync_peers WHERE role = ? ORDER BY updated_at DESC`
+        )
+        .all(role) as unknown as RawPeerRow[]
+    } else {
+      rows = this.db
+        .prepare(`SELECT * FROM sync_peers ORDER BY updated_at DESC`)
+        .all() as unknown as RawPeerRow[]
+    }
+    return rows.map(mapRowToPeerRecord)
+  }
+
+  updatePeerSyncState(
+    urlOrId: string,
+    state: {
+      lastSyncAt?: string | null
+      lastStatus?: string | null
+      peerNodeId?: string | null
+      name?: string
+    }
+  ): void {
+    const trimmed = urlOrId.trim()
+    const normalizedUrl = trimmed.replace(/\/+$/, '')
+    const peer = this.db
+      .prepare(
+        `SELECT * FROM sync_peers
+         WHERE id = ? OR peer_node_id = ? OR name = ? OR url = ? OR url = ?
+         LIMIT 1`
+      )
+      .get(trimmed, trimmed, trimmed, trimmed, normalizedUrl) as
+      | RawPeerRow
+      | undefined
+    if (!peer) {
+      return
+    }
+    const now = new Date().toISOString()
+    const lastSyncAt =
+      state.lastSyncAt !== undefined ? state.lastSyncAt : peer.last_sync_at
+    const lastStatus =
+      state.lastStatus !== undefined ? state.lastStatus : peer.last_status
+    const peerNodeId =
+      state.peerNodeId !== undefined ? state.peerNodeId : peer.peer_node_id
+    const name =
+      state.name !== undefined && state.name.trim().length > 0
+        ? state.name.trim()
+        : peer.name
+
+    this.db
+      .prepare(
+        `UPDATE sync_peers
+         SET last_sync_at = ?,
+             last_status = ?,
+             peer_node_id = ?,
+             name = ?,
+             updated_at = ?
+         WHERE id = ?`
+      )
+      .run(lastSyncAt, lastStatus, peerNodeId, name, now, peer.id)
+  }
+
+  exportSnapshot(options?: ExportOptions): VaultSnapshotV1 {
+    const targetProjectId = options?.projectId
+      ? slugifyProjectId(options.projectId)
+      : null
+    const since = options?.since ?? null
+    const includeTombstones = options?.includeTombstones !== false
+
+    let memoriesSql = 'SELECT * FROM memories WHERE 1=1'
+    const memoriesParams: string[] = []
+    if (targetProjectId) {
+      memoriesSql += ' AND project_id = ?'
+      memoriesParams.push(targetProjectId)
+    }
+    if (since) {
+      memoriesSql += ' AND updated_at > ?'
+      memoriesParams.push(since)
+    }
+    memoriesSql += ' ORDER BY created_at ASC, id ASC'
+    const memoryRows = this.db
+      .prepare(memoriesSql)
+      .all(...memoriesParams) as unknown as RawMemoryRow[]
+    const exportedMemories: MemoryRecord[] = memoryRows.map(mapRowToMemoryRecord)
+
+    let exportedTombstones: ExportedTombstone[] = []
+    if (includeTombstones) {
+      let tombstonesSql = 'SELECT * FROM memory_tombstones WHERE 1=1'
+      const tombstonesParams: string[] = []
+      if (targetProjectId) {
+        tombstonesSql += ' AND project_id = ?'
+        tombstonesParams.push(targetProjectId)
+      }
+      if (since) {
+        tombstonesSql += ' AND deleted_at > ?'
+        tombstonesParams.push(since)
+      }
+      tombstonesSql += ' ORDER BY deleted_at ASC, memory_id ASC'
+      const tombstoneRows = this.db
+        .prepare(tombstonesSql)
+        .all(...tombstonesParams) as unknown as Array<{
+        memory_id: string
+        project_id: string
+        content_hash: string
+        deleted_at: string
+        origin_node_id: string | null
+      }>
+      exportedTombstones = tombstoneRows.map((r) => ({
+        memoryId: r.memory_id,
+        projectId: r.project_id,
+        contentHash: r.content_hash,
+        deletedAt: r.deleted_at,
+        originNodeId: r.origin_node_id ?? null
+      }))
+    }
+
+    const projectMap = new Map<string, ExportedProject>()
+    if (targetProjectId) {
+      const pRow = this.db
+        .prepare(`SELECT * FROM projects WHERE id = ?`)
+        .get(targetProjectId) as
+        | {
+            id: string
+            name: string
+            root_path: string
+            updated_at: string
+          }
+        | undefined
+      if (pRow) {
+        projectMap.set(pRow.id, {
+          id: pRow.id,
+          name: pRow.name,
+          rootPath: pRow.root_path,
+          updatedAt: pRow.updated_at
+        })
+      }
+    } else if (since) {
+      const pRows = this.db
+        .prepare(`SELECT * FROM projects WHERE updated_at > ?`)
+        .all(since) as unknown as Array<{
+        id: string
+        name: string
+        root_path: string
+        updated_at: string
+      }>
+      for (const r of pRows) {
+        projectMap.set(r.id, {
+          id: r.id,
+          name: r.name,
+          rootPath: r.root_path,
+          updatedAt: r.updated_at
+        })
+      }
+    } else {
+      const pRows = this.db
+        .prepare(`SELECT * FROM projects`)
+        .all() as unknown as Array<{
+        id: string
+        name: string
+        root_path: string
+        updated_at: string
+      }>
+      for (const r of pRows) {
+        projectMap.set(r.id, {
+          id: r.id,
+          name: r.name,
+          rootPath: r.root_path,
+          updatedAt: r.updated_at
+        })
+      }
+    }
+
+    for (const mem of exportedMemories) {
+      if (!projectMap.has(mem.projectId)) {
+        const pRow = this.db
+          .prepare(`SELECT * FROM projects WHERE id = ?`)
+          .get(mem.projectId) as
+          | {
+              id: string
+              name: string
+              root_path: string
+              updated_at: string
+            }
+          | undefined
+        if (pRow) {
+          projectMap.set(pRow.id, {
+            id: pRow.id,
+            name: pRow.name,
+            rootPath: pRow.root_path,
+            updatedAt: pRow.updated_at
+          })
+        }
+      }
+    }
+
+    const exportedProjects = Array.from(projectMap.values()).sort((a, b) =>
+      a.id.localeCompare(b.id)
+    )
+
+    const basePayload: Omit<VaultSnapshotV1, 'checksum'> = {
+      format: 'memoseb-snapshot',
+      version: 1,
+      exportedAt: new Date().toISOString(),
+      originNodeId: this.getNodeId(),
+      projectFilter: targetProjectId,
+      projects: exportedProjects,
+      memories: exportedMemories,
+      tombstones: exportedTombstones
+    }
+
+    const checksum = computeSnapshotChecksum(basePayload)
+    return {
+      ...basePayload,
+      checksum
+    }
+  }
+
+  importSnapshot(
+    rawSnapshot: VaultSnapshotV1,
+    options?: ImportOptions
+  ): ImportResult {
+    const snapshot = verifySnapshot(rawSnapshot)
+    const strategy = options?.strategy ?? 'merge'
+    const targetProjectId = options?.projectId
+      ? slugifyProjectId(options.projectId)
+      : snapshot.projectFilter
+    const includeTombstones = options?.includeTombstones !== false
+
+    let projectsImported = 0
+    let memoriesCreated = 0
+    let memoriesUpdated = 0
+    let memoriesSkipped = 0
+    let tombstonesApplied = 0
+
+    this.db.exec('BEGIN IMMEDIATE;')
+    try {
+      if (strategy === 'replace') {
+        if (targetProjectId) {
+          this.db
+            .prepare(`DELETE FROM memories_fts WHERE project_id = ?`)
+            .run(targetProjectId)
+          this.db
+            .prepare(
+              `DELETE FROM memory_vectors WHERE memory_id IN (SELECT id FROM memories WHERE project_id = ?)`
+            )
+            .run(targetProjectId)
+          this.db
+            .prepare(`DELETE FROM memories WHERE project_id = ?`)
+            .run(targetProjectId)
+          this.db
+            .prepare(`DELETE FROM memory_tombstones WHERE project_id = ?`)
+            .run(targetProjectId)
+        } else {
+          this.db.prepare(`DELETE FROM memories_fts`).run()
+          this.db.prepare(`DELETE FROM memory_vectors`).run()
+          this.db.prepare(`DELETE FROM memories`).run()
+          this.db.prepare(`DELETE FROM memory_tombstones`).run()
+          this.db.prepare(`DELETE FROM projects`).run()
+        }
+      }
+
+      // 1. Import projects
+      const projectsToImport = targetProjectId
+        ? snapshot.projects.filter((p) => p.id === targetProjectId)
+        : snapshot.projects
+
+      const projectUpsertMerge = this.db.prepare(
+        `INSERT INTO projects (id, name, root_path, updated_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET
+           name = excluded.name,
+           root_path = excluded.root_path,
+           updated_at = excluded.updated_at
+         WHERE excluded.updated_at >= projects.updated_at`
+      )
+
+      const projectUpsertReplace = this.db.prepare(
+        `INSERT INTO projects (id, name, root_path, updated_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET
+           name = excluded.name,
+           root_path = excluded.root_path,
+           updated_at = excluded.updated_at`
+      )
+
+      for (const p of projectsToImport) {
+        if (strategy === 'replace') {
+          projectUpsertReplace.run(p.id, p.name, p.rootPath, p.updatedAt)
+        } else {
+          projectUpsertMerge.run(p.id, p.name, p.rootPath, p.updatedAt)
+        }
+        projectsImported++
+      }
+
+      // 2. Process tombstones
+      if (includeTombstones) {
+        for (const tombstone of snapshot.tombstones) {
+          if (targetProjectId && tombstone.projectId !== targetProjectId) {
+            continue
+          }
+
+          const localTombstone = this.db
+            .prepare(
+              `SELECT memory_id, deleted_at FROM memory_tombstones
+               WHERE memory_id = ? OR (project_id = ? AND content_hash = ?)
+               LIMIT 1`
+            )
+            .get(
+              tombstone.memoryId,
+              tombstone.projectId,
+              tombstone.contentHash
+            ) as { memory_id: string; deleted_at: string } | undefined
+
+          if (!localTombstone || tombstone.deletedAt >= localTombstone.deleted_at) {
+            if (
+              localTombstone &&
+              localTombstone.memory_id !== tombstone.memoryId
+            ) {
+              this.db
+                .prepare(`DELETE FROM memory_tombstones WHERE memory_id = ?`)
+                .run(localTombstone.memory_id)
+            }
+            this.db
+              .prepare(
+                `INSERT INTO memory_tombstones (
+                   memory_id, project_id, content_hash, deleted_at, origin_node_id
+                 ) VALUES (?, ?, ?, ?, ?)
+                 ON CONFLICT(memory_id) DO UPDATE SET
+                   project_id = excluded.project_id,
+                   content_hash = excluded.content_hash,
+                   deleted_at = excluded.deleted_at,
+                   origin_node_id = excluded.origin_node_id`
+              )
+              .run(
+                tombstone.memoryId,
+                tombstone.projectId,
+                tombstone.contentHash,
+                tombstone.deletedAt,
+                tombstone.originNodeId ?? null
+              )
+          }
+
+          const localMem = this.db
+            .prepare(
+              `SELECT id, updated_at FROM memories
+               WHERE id = ? OR (project_id = ? AND content_hash = ?)
+               LIMIT 1`
+            )
+            .get(
+              tombstone.memoryId,
+              tombstone.projectId,
+              tombstone.contentHash
+            ) as { id: string; updated_at: string } | undefined
+
+          if (localMem && localMem.updated_at <= tombstone.deletedAt) {
+            this.db
+              .prepare(`DELETE FROM memories_fts WHERE memory_id = ?`)
+              .run(localMem.id)
+            this.db
+              .prepare(`DELETE FROM memory_vectors WHERE memory_id = ?`)
+              .run(localMem.id)
+            this.db
+              .prepare(`DELETE FROM memories WHERE id = ?`)
+              .run(localMem.id)
+            tombstonesApplied++
+          }
+        }
+      }
+
+      // 3. Process memories
+      for (const memory of snapshot.memories) {
+        if (targetProjectId && memory.projectId !== targetProjectId) {
+          continue
+        }
+
+        const localTombstone = this.db
+          .prepare(
+            `SELECT deleted_at FROM memory_tombstones
+             WHERE memory_id = ? OR (project_id = ? AND content_hash = ?)
+             LIMIT 1`
+          )
+          .get(memory.id, memory.projectId, memory.contentHash) as
+          | { deleted_at: string }
+          | undefined
+
+        if (localTombstone && localTombstone.deleted_at >= memory.updatedAt) {
+          memoriesSkipped++
+          continue
+        }
+
+        this.db
+          .prepare(
+            `DELETE FROM memory_tombstones
+             WHERE (project_id = ? AND content_hash = ?) OR memory_id = ?`
+          )
+          .run(memory.projectId, memory.contentHash, memory.id)
+
+        const localMem = this.db
+          .prepare(
+            `SELECT * FROM memories
+             WHERE id = ? OR (project_id = ? AND content_hash = ?)
+             LIMIT 1`
+          )
+          .get(memory.id, memory.projectId, memory.contentHash) as
+          | RawMemoryRow
+          | undefined
+
+        if (!localMem) {
+          const projectExists = this.db
+            .prepare(`SELECT id FROM projects WHERE id = ?`)
+            .get(memory.projectId)
+          if (!projectExists) {
+            const snapProject = snapshot.projects.find(
+              (p) => p.id === memory.projectId
+            )
+            const pName = snapProject?.name || memory.projectId
+            const pRoot =
+              snapProject?.rootPath ||
+              (memory.projectId === 'global'
+                ? 'global'
+                : path.resolve(process.cwd()))
+            const pUpdated = snapProject?.updatedAt || memory.updatedAt
+            this.db
+              .prepare(
+                `INSERT INTO projects (id, name, root_path, updated_at)
+                 VALUES (?, ?, ?, ?)
+                 ON CONFLICT(id) DO UPDATE SET updated_at = excluded.updated_at`
+              )
+              .run(memory.projectId, pName, pRoot, pUpdated)
+          }
+
+          const tagsJson = JSON.stringify(memory.tags ?? [])
+          const tagsText = (memory.tags ?? []).join(' ')
+          const tokenCount =
+            memory.tokenCount ||
+            estimateTokens(`${memory.title}\n${memory.content}`)
+
+          this.db
+            .prepare(
+              `INSERT INTO memories (
+                 id, project_id, category, title, content, tags, source_agent,
+                 content_hash, token_count, importance, access_count, created_at, updated_at
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+            )
+            .run(
+              memory.id,
+              memory.projectId,
+              memory.category,
+              memory.title,
+              memory.content,
+              tagsJson,
+              memory.sourceAgent ?? null,
+              memory.contentHash,
+              tokenCount,
+              memory.importance,
+              memory.accessCount ?? 0,
+              memory.createdAt,
+              memory.updatedAt
+            )
+
+          this.db
+            .prepare(
+              `INSERT INTO memories_fts (memory_id, project_id, title, content, tags)
+               VALUES (?, ?, ?, ?, ?)`
+            )
+            .run(
+              memory.id,
+              memory.projectId,
+              memory.title,
+              memory.content,
+              tagsText
+            )
+
+          const embeddingText = `${memory.title}\n${memory.content}\n${tagsText}`
+          const vector = this.embedder.embed(embeddingText)
+          const serializedVector = serializeVector(vector)
+          this.db
+            .prepare(
+              `INSERT INTO memory_vectors (memory_id, dimensions, embedding, model)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(memory_id) DO UPDATE SET
+                 dimensions = excluded.dimensions,
+                 embedding = excluded.embedding,
+                 model = excluded.model`
+            )
+            .run(
+              memory.id,
+              this.embedder.dimensions,
+              serializedVector,
+              this.embedder.model
+            )
+
+          memoriesCreated++
+        } else {
+          const shouldUpdate =
+            memory.updatedAt > localMem.updated_at ||
+            (memory.updatedAt === localMem.updated_at &&
+              (memory.title !== localMem.title ||
+                memory.importance !== Number(localMem.importance)))
+
+          if (shouldUpdate) {
+            const mergedAccessCount = Math.max(
+              Number(localMem.access_count),
+              memory.accessCount ?? 0
+            )
+            const tagsJson = JSON.stringify(memory.tags ?? [])
+            const tagsText = (memory.tags ?? []).join(' ')
+            const tokenCount =
+              memory.tokenCount ||
+              estimateTokens(`${memory.title}\n${memory.content}`)
+
+            this.db
+              .prepare(
+                `UPDATE memories
+                 SET title = ?,
+                     category = ?,
+                     content = ?,
+                     tags = ?,
+                     source_agent = ?,
+                     importance = ?,
+                     token_count = ?,
+                     access_count = ?,
+                     updated_at = ?
+                 WHERE id = ?`
+              )
+              .run(
+                memory.title,
+                memory.category,
+                memory.content,
+                tagsJson,
+                memory.sourceAgent ?? null,
+                memory.importance,
+                tokenCount,
+                mergedAccessCount,
+                memory.updatedAt,
+                localMem.id
+              )
+
+            this.db
+              .prepare(`DELETE FROM memories_fts WHERE memory_id = ?`)
+              .run(localMem.id)
+            this.db
+              .prepare(
+                `INSERT INTO memories_fts (memory_id, project_id, title, content, tags)
+                 VALUES (?, ?, ?, ?, ?)`
+              )
+              .run(
+                localMem.id,
+                memory.projectId,
+                memory.title,
+                memory.content,
+                tagsText
+              )
+
+            const embeddingText = `${memory.title}\n${memory.content}\n${tagsText}`
+            const vector = this.embedder.embed(embeddingText)
+            const serializedVector = serializeVector(vector)
+            this.db
+              .prepare(
+                `INSERT INTO memory_vectors (memory_id, dimensions, embedding, model)
+                 VALUES (?, ?, ?, ?)
+                 ON CONFLICT(memory_id) DO UPDATE SET
+                   dimensions = excluded.dimensions,
+                   embedding = excluded.embedding,
+                   model = excluded.model`
+              )
+              .run(
+                localMem.id,
+                this.embedder.dimensions,
+                serializedVector,
+                this.embedder.model
+              )
+
+            memoriesUpdated++
+          } else {
+            memoriesSkipped++
+          }
+        }
+      }
+
+      this.db.exec('COMMIT;')
+    } catch (err) {
+      try {
+        this.db.exec('ROLLBACK;')
+      } catch {
+        // Ignore secondary rollback errors
+      }
+      throw err
+    }
+
+    return {
+      strategy,
+      projectsImported,
+      memoriesCreated,
+      memoriesUpdated,
+      memoriesSkipped,
+      tombstonesApplied
+    }
   }
 
   listProjects(): ProjectSummary[] {
