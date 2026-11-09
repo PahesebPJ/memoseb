@@ -5,17 +5,21 @@ import https from 'node:https'
 import type { AddressInfo } from 'node:net'
 import os from 'node:os'
 import type {
+  EffectivePeerPermissions,
+  GroupPermissionMode,
   MemoryCategory,
   NodeConfiguration,
   NodeRole,
   PeerRole,
+  SyncGroupRecord,
   SyncPeerRecord
 } from './schema.ts'
-import type {
-  ExportedProject,
-  ExportedTombstone,
-  ImportResult,
-  VaultSnapshotV1
+import {
+  filterSnapshotByPermissions,
+  type ExportedProject,
+  type ExportedTombstone,
+  type ImportResult,
+  type VaultSnapshotV1
 } from './snapshot.ts'
 import type { MemoryRecord, VaultStats } from './vault.ts'
 
@@ -79,6 +83,28 @@ export interface SyncCapableVault {
     }
   ): SnapshotImportResult
   getStats(): VaultStats
+  upsertGroup?(input: {
+    name: string
+    description?: string
+    projects?: readonly string[]
+    categories?: readonly string[]
+    permissions?: GroupPermissionMode
+    groupToken?: string | null
+  }): SyncGroupRecord
+  getGroup?(nameOrId: string): SyncGroupRecord | null
+  listGroups?(): SyncGroupRecord[]
+  deleteGroup?(nameOrId: string): boolean
+  addNodeToGroup?(groupNameOrId: string, peerIdentifier: string): SyncGroupRecord
+  removeNodeFromGroup?(groupNameOrId: string, peerIdentifier: string): SyncGroupRecord
+  getPeerGroups?(peerIdentifiers: readonly (string | null | undefined)[]): SyncGroupRecord[]
+  findGroupByToken?(token: string | null | undefined): SyncGroupRecord | null
+  evaluatePeerPermissions?(input: {
+    peerId?: string | null
+    peerNodeId?: string | null
+    peerName?: string | null
+    peerUrl?: string | null
+    matchedGroupByToken?: string | null
+  }): EffectivePeerPermissions
 }
 
 export interface DiscoveredParentNode {
@@ -126,6 +152,7 @@ export interface HandshakeResult {
   status: string
   timestamp: string
   peer: SyncPeerRecord
+  assignedGroups?: string[]
 }
 
 export interface PeerSyncResult {
@@ -136,6 +163,7 @@ export interface PeerSyncResult {
   pushed: SnapshotImportResult
   pulled: SnapshotImportResult
   syncedAt: string
+  effectiveGroups?: string[]
 }
 
 export interface SyncPeerError {
@@ -464,7 +492,7 @@ export async function startSyncServer(
         return
       }
 
-      // 2. Auth Verification
+      // 2. Auth Verification (Dual: Node Global Token or Group Token)
       const expectedToken =
         options?.token !== undefined ? options.token : currentConfig.authToken
 
@@ -480,7 +508,13 @@ export async function startSyncServer(
         providedToken = req.headers['x-memoseb-token'].trim()
       }
 
-      if (!verifyAuthToken(expectedToken, providedToken)) {
+      let matchedGroup: SyncGroupRecord | null = null
+      if (providedToken && vault.findGroupByToken) {
+        matchedGroup = vault.findGroupByToken(providedToken) ?? null
+      }
+      const isGlobalTokenValid = verifyAuthToken(expectedToken, providedToken)
+
+      if (!isGlobalTokenValid && !matchedGroup) {
         sendJson(401, {
           ok: false,
           error: 'UNAUTHORIZED',
@@ -549,7 +583,13 @@ export async function startSyncServer(
 
         // Endpoint: POST /api/v1/sync/handshake
         if (pathname === '/api/v1/sync/handshake') {
-          const { nodeId, nodeName, role: clientRole, callbackUrl } = body
+          const {
+            nodeId,
+            nodeName,
+            role: clientRole,
+            callbackUrl,
+            groups
+          } = body
           if (!nodeId || !clientRole) {
             sendJson(400, {
               ok: false,
@@ -559,13 +599,20 @@ export async function startSyncServer(
             return
           }
 
+          let safeCallbackUrl: string | undefined
+          if (typeof callbackUrl === 'string' && callbackUrl.trim().length > 0) {
+            try {
+              safeCallbackUrl = normalizePeerUrl(callbackUrl)
+            } catch {
+              // ignore malformed callbackUrl
+            }
+          }
+
           if (
-            typeof callbackUrl === 'string' &&
-            callbackUrl.trim().length > 0 &&
+            safeCallbackUrl &&
             ((currentConfig.role === 'parent' && clientRole === 'child') ||
               (currentConfig.role === 'child' && clientRole === 'parent'))
           ) {
-            const safeCallbackUrl = normalizePeerUrl(callbackUrl)
             vault.upsertPeer({
               role: clientRole,
               url: safeCallbackUrl,
@@ -575,11 +622,60 @@ export async function startSyncServer(
             })
           }
 
+          if (matchedGroup) {
+            vault.addNodeToGroup?.(matchedGroup.id, nodeId)
+            if (safeCallbackUrl) {
+              vault.addNodeToGroup?.(matchedGroup.id, safeCallbackUrl)
+            }
+          }
+
+          const requestedGroups: string[] = Array.isArray(groups) ? groups : []
+          if (isGlobalTokenValid && requestedGroups.length > 0) {
+            for (const groupName of requestedGroups) {
+              if (typeof groupName === 'string') {
+                const grp = vault.getGroup?.(groupName)
+                if (grp) {
+                  vault.addNodeToGroup?.(grp.id, nodeId)
+                  if (safeCallbackUrl) {
+                    vault.addNodeToGroup?.(grp.id, safeCallbackUrl)
+                  }
+                }
+              }
+            }
+          }
+
+          let existingPeerId: string | null = null
+          if (vault.listPeers) {
+            const peers = vault.listPeers()
+            const found = peers.find(
+              (p) =>
+                (nodeId && p.peerNodeId === nodeId) ||
+                (safeCallbackUrl && p.url === safeCallbackUrl)
+            )
+            if (found) existingPeerId = found.id
+          }
+
+          const policy: EffectivePeerPermissions = vault.evaluatePeerPermissions
+            ? vault.evaluatePeerPermissions({
+                peerId: existingPeerId,
+                peerNodeId: nodeId,
+                peerName: nodeName || null,
+                peerUrl: safeCallbackUrl || null,
+                matchedGroupByToken: matchedGroup?.id ?? null
+              })
+            : {
+                unrestricted: true,
+                groups: [],
+                canPush: () => true,
+                canPull: () => true
+              }
+
           sendJson(200, {
             ok: true,
             nodeId: currentConfig.nodeId,
             nodeName: currentConfig.nodeName,
             role: currentConfig.role,
+            assignedGroups: policy.groups,
             stats: vault.getStats(),
             timestamp: new Date().toISOString()
           })
@@ -607,20 +703,92 @@ export async function startSyncServer(
             return
           }
 
-          const appliedOnServer = vault.importSnapshot(delta, {
+          let safeCallbackUrl: string | undefined
+          if (typeof callbackUrl === 'string' && callbackUrl.trim().length > 0) {
+            try {
+              safeCallbackUrl = normalizePeerUrl(callbackUrl)
+            } catch {
+              // ignore malformed callbackUrl
+            }
+          }
+
+          if (matchedGroup && clientNodeId) {
+            vault.addNodeToGroup?.(matchedGroup.id, clientNodeId)
+            if (safeCallbackUrl) {
+              vault.addNodeToGroup?.(matchedGroup.id, safeCallbackUrl)
+            }
+          }
+
+          let existingPeerId: string | null = null
+          if (vault.listPeers) {
+            const peers = vault.listPeers()
+            const found = peers.find(
+              (p) =>
+                (clientNodeId && p.peerNodeId === clientNodeId) ||
+                (safeCallbackUrl && p.url === safeCallbackUrl)
+            )
+            if (found) existingPeerId = found.id
+          }
+
+          const policy: EffectivePeerPermissions = vault.evaluatePeerPermissions
+            ? vault.evaluatePeerPermissions({
+                peerId: existingPeerId,
+                peerNodeId: clientNodeId ?? null,
+                peerName: clientName ?? null,
+                peerUrl: safeCallbackUrl ?? null,
+                matchedGroupByToken: matchedGroup?.id ?? null
+              })
+            : {
+                unrestricted: true,
+                groups: [],
+                canPush: () => true,
+                canPull: () => true
+              }
+
+          let incomingDelta = delta
+          let incomingDroppedMemories = 0
+          if (
+            !policy.unrestricted &&
+            delta &&
+            Array.isArray((delta as VaultSnapshotV1).memories)
+          ) {
+            const { filtered, droppedMemories } = filterSnapshotByPermissions(
+              delta as VaultSnapshotV1,
+              (proj, cat) => policy.canPush(proj, cat)
+            )
+            incomingDelta = filtered
+            incomingDroppedMemories = droppedMemories
+          }
+
+          const appliedOnServer = vault.importSnapshot(incomingDelta, {
             strategy: 'merge',
             projectId: projectId ?? undefined
           })
+          if (incomingDroppedMemories > 0) {
+            appliedOnServer.memoriesSkipped += incomingDroppedMemories
+          }
 
-          const serverDelta = vault.exportSnapshot({
+          const rawServerDelta = vault.exportSnapshot({
             since: since ?? undefined,
             projectId: projectId ?? undefined
           })
 
+          let serverDelta = rawServerDelta
+          if (
+            !policy.unrestricted &&
+            rawServerDelta &&
+            Array.isArray((rawServerDelta as VaultSnapshotV1).memories)
+          ) {
+            const { filtered } = filterSnapshotByPermissions(
+              rawServerDelta as VaultSnapshotV1,
+              (proj, cat) => policy.canPull(proj, cat)
+            )
+            serverDelta = filtered
+          }
+
           const serverTimestamp = new Date().toISOString()
 
-          if (typeof callbackUrl === 'string' && callbackUrl.trim().length > 0) {
-            const safeCallbackUrl = normalizePeerUrl(callbackUrl)
+          if (safeCallbackUrl) {
             vault.upsertPeer({
               role: clientRole ?? 'child',
               url: safeCallbackUrl,
@@ -638,7 +806,8 @@ export async function startSyncServer(
             serverRole: currentConfig.role,
             serverTimestamp,
             appliedOnServer,
-            serverDelta
+            serverDelta,
+            effectiveGroups: policy.groups
           })
           return
         }
@@ -690,16 +859,49 @@ export async function startSyncServer(
           return
         }
         const nonce = typeof data.nonce === 'string' ? data.nonce : ''
-        const hasAuth = Boolean(cfg.authToken && cfg.authToken.length > 0)
+
+        const serverToken =
+          options?.token !== undefined ? options.token : cfg.authToken
+        const groupTokens: string[] = (vault.listGroups?.() ?? [])
+          .map((g) => g.groupToken)
+          .filter((t): t is string => typeof t === 'string' && t.length > 0)
+
+        const availableTokens: string[] = []
+        if (serverToken && serverToken.length > 0) {
+          availableTokens.push(serverToken)
+        }
+        for (const gt of groupTokens) {
+          if (!availableTokens.includes(gt)) {
+            availableTokens.push(gt)
+          }
+        }
+        const hasAuth = availableTokens.length > 0
+
+        let matchedToken: string | null = null
         if (data.authTag && hasAuth) {
-          const expected = crypto
-            .createHmac('sha256', cfg.authToken!)
-            .update(nonce)
-            .digest('hex')
-          if (!verifyAuthToken(expected, typeof data.authTag === 'string' ? data.authTag : null)) {
+          if (typeof data.authTag === 'string') {
+            for (const candidate of availableTokens) {
+              const expectedTag = crypto
+                .createHmac('sha256', candidate)
+                .update(nonce)
+                .digest('hex')
+              if (verifyAuthToken(expectedTag, data.authTag)) {
+                matchedToken = candidate
+                break
+              }
+            }
+          }
+          if (!matchedToken) {
             return
           }
         }
+
+        const signingToken =
+          matchedToken ??
+          (serverToken && serverToken.length > 0
+            ? serverToken
+            : (availableTokens[0] ?? null))
+
         const response: AnnouncePacket = {
           magic: DISCOVERY_MAGIC_RESPONSE,
           nonce,
@@ -709,10 +911,10 @@ export async function startSyncServer(
           port: actualHttpPort,
           urls: getLocalLanUrls(actualHttpPort),
           requiresAuth: hasAuth,
-          ...(hasAuth
+          ...(hasAuth && signingToken
             ? {
                 authTag: crypto
-                  .createHmac('sha256', cfg.authToken!)
+                  .createHmac('sha256', signingToken)
                   .update(nonce)
                   .digest('hex')
               }
@@ -774,6 +976,7 @@ export async function performPeerHandshake(
     peerRole: 'parent' | 'child'
     token?: string | null
     callbackUrl?: string
+    groups?: readonly string[]
     timeoutMs?: number
   }
 ): Promise<HandshakeResult> {
@@ -791,7 +994,8 @@ export async function performPeerHandshake(
     nodeId: config.nodeId,
     nodeName: config.nodeName,
     role: myRole,
-    callbackUrl: options.callbackUrl
+    callbackUrl: options.callbackUrl,
+    groups: options.groups
   }
 
   const res = await sendJsonRequest<{
@@ -799,6 +1003,7 @@ export async function performPeerHandshake(
     nodeId: string
     nodeName: string
     role: string
+    assignedGroups?: string[]
     stats?: any
     timestamp?: string
   }>(targetUrl, {
@@ -825,7 +1030,8 @@ export async function performPeerHandshake(
     peerRole: options.peerRole,
     status: 'paired',
     timestamp,
-    peer: peerRecord
+    peer: peerRecord,
+    assignedGroups: res.assignedGroups
   }
 }
 
@@ -865,10 +1071,39 @@ export async function syncWithPeer(
   const since = options.full ? undefined : (existingPeer?.lastSyncAt ?? undefined)
 
   try {
-    const localDelta = vault.exportSnapshot({
+    let localDelta = vault.exportSnapshot({
       since,
       projectId: options.projectId
     })
+
+    const isParentInitiator = config.role === 'parent'
+    const childPolicy: EffectivePeerPermissions =
+      isParentInitiator && vault.evaluatePeerPermissions
+        ? vault.evaluatePeerPermissions({
+            peerId: existingPeer?.id ?? null,
+            peerNodeId: existingPeer?.peerNodeId ?? null,
+            peerName: existingPeer?.name ?? null,
+            peerUrl: normalizedUrl
+          })
+        : {
+            unrestricted: true,
+            groups: [],
+            canPush: () => true,
+            canPull: () => true
+          }
+
+    if (
+      isParentInitiator &&
+      !childPolicy.unrestricted &&
+      localDelta &&
+      Array.isArray((localDelta as VaultSnapshotV1).memories)
+    ) {
+      const { filtered } = filterSnapshotByPermissions(
+        localDelta as VaultSnapshotV1,
+        (proj, cat) => childPolicy.canPull(proj, cat)
+      )
+      localDelta = filtered
+    }
 
     const myRole: 'parent' | 'child' =
       config.role === 'standalone'
@@ -896,6 +1131,7 @@ export async function syncWithPeer(
       serverTimestamp: string
       appliedOnServer: SnapshotImportResult
       serverDelta: VaultSnapshotV1
+      effectiveGroups?: string[]
     }>(targetUrl, {
       method: 'POST',
       token: effectiveToken,
@@ -903,10 +1139,29 @@ export async function syncWithPeer(
       timeoutMs: options.timeoutMs ?? 15000
     })
 
-    const pulled = vault.importSnapshot(res.serverDelta, {
+    let incomingServerDelta = res.serverDelta
+    let incomingDroppedMemories = 0
+    if (
+      isParentInitiator &&
+      !childPolicy.unrestricted &&
+      res.serverDelta &&
+      Array.isArray(res.serverDelta.memories)
+    ) {
+      const { filtered, droppedMemories } = filterSnapshotByPermissions(
+        res.serverDelta,
+        (proj, cat) => childPolicy.canPush(proj, cat)
+      )
+      incomingServerDelta = filtered
+      incomingDroppedMemories = droppedMemories
+    }
+
+    const pulled = vault.importSnapshot(incomingServerDelta, {
       strategy: 'merge',
       projectId: options.projectId
     })
+    if (incomingDroppedMemories > 0) {
+      pulled.memoriesSkipped += incomingDroppedMemories
+    }
 
     if (existingPeer) {
       vault.updatePeerSyncState(existingPeer.id, {
@@ -934,7 +1189,8 @@ export async function syncWithPeer(
       peerRole,
       pushed: res.appliedOnServer,
       pulled,
-      syncedAt: res.serverTimestamp
+      syncedAt: res.serverTimestamp,
+      effectiveGroups: res.effectiveGroups
     }
   } catch (err: any) {
     if (existingPeer) {
