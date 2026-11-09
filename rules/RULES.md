@@ -20,3 +20,6 @@
   - Por CLI: `memoseb export [file] [--project <id>]` y `memoseb import <file> [--replace] [--project <id>]`
   - Por MCP: herramientas `memory_export` y `memory_import`.
 - Para sincronización distribuida en red Padre ↔ Hijos (desactivada por defecto en modo `standalone`), gestiona la conectividad con `memoseb node (enable|disable|discover|serve)` y sincroniza deltas bidireccionales con `memoseb sync` (o la herramienta MCP `memory_sync`).
+- Para gobernar el acceso granular y segmentar qué nodos pueden leer o escribir según proyecto y categoría, administra grupos de permisos y reglas ACL:
+  - Por CLI: `memoseb group <create|list|add-node|remove-node|delete|default-policy>`
+  - Por MCP: herramienta `memory_group`.

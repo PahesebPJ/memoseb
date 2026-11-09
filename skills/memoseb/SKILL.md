@@ -1,6 +1,6 @@
 ---
 name: memoseb
-description: Gestiona la bóveda de memoria híbrida (vectorial + FTS5) multi-proyecto con presupuesto de tokens mediante memoseb (analyze, context, recall, remember, export, import, node, sync, projects, stats, forget) o su servidor MCP.
+description: Gestiona la bóveda de memoria híbrida (vectorial + FTS5) multi-proyecto con presupuesto de tokens mediante memoseb (analyze, context, recall, remember, export, import, node, group, sync, projects, stats, forget) o su servidor MCP.
 ---
 
 # Bóveda de Memoria `/memoseb`
@@ -29,19 +29,22 @@ Usa `memoseb` para dotar a los agentes de memoria persistente entre sesiones, ai
      --tags "sqlite,fts5,vectors" \
      --importance 0.9
    ```
-4. **Portabilidad y Sincronización (`export`, `import`, `sync`):**
+4. **Portabilidad, Sincronización y Control de Acceso (`export`, `import`, `group`, `sync`):**
    - **Snapshots Portables:** Respalda o transfiere memorias con verificación SHA-256 e importación Last-Write-Wins:
      ```bash
      memoseb export ./snapshots/memoseb-backup.json --project mi-proyecto
      memoseb import ./snapshots/memoseb-backup.json
      ```
-   - **Red Padre ↔ Hijos:** Sincroniza conocimiento acumulado entre agentes o estaciones de trabajo:
+   - **Red Padre ↔ Hijos y Grupos ACL:** Sincroniza conocimiento acumulado gobernando permisos por proyecto y categoría:
      ```bash
-     # En Padre:
+     # En Padre: habilitar servicio y segmentar accesos con grupos de permisos
      memoseb node enable --role parent --port 7432 --token <secreto> && memoseb node serve
-     # En Hijo (auto-descubrimiento LAN o conexión directa):
-     memoseb node enable --role child --discover --token <secreto>
-     # Sincronización bidireccional:
+     memoseb group create frontend-team --projects frontend-app --permissions readwrite --token <token-grupo>
+     memoseb group default-policy none
+
+     # En Hijo (auto-descubrimiento LAN o conexión directa con grupo asignado):
+     memoseb node enable --role child --discover --token <token-grupo>
+     # Sincronización bidireccional gobernada por ACL:
      memoseb sync
      ```
 
@@ -78,5 +81,6 @@ Cuando necesites indexar un repositorio nuevo o el usuario pida analizar un proy
 - `memoseb export [file] [--project <id>]`: Exporta un snapshot portable JSON con checksum SHA-256 (MCP: `memory_export`).
 - `memoseb import <file> [--replace] [--project <id>]`: Importa un snapshot JSON con resolución Last-Write-Wins o `--replace`, regenerando FTS5 y vectores (MCP: `memory_import`).
 - `memoseb node (status|enable|disable|discover|set-parent|add-child|remove|serve)`: Gestiona el ciclo de vida del nodo de red (servidor HTTP, descubrimiento LAN UDP y administración de peers).
+- `memoseb group (list|create|add-node|remove-node|delete|default-policy)`: Administra grupos de permisos y reglas ACL de sincronización por proyecto, categoría y modo (`readwrite`, `readonly`, `writeonly`) (MCP: `memory_group`).
 - `memoseb sync [--url <peer>] [--project <id>] [--full]`: Sincronización bidireccional de deltas y tombstones con nodos configurados (MCP: `memory_sync`).
-- `memoseb mcp`: Inicia el servidor MCP sobre `stdio` (JSON-RPC 2.0) exponiendo `memory_store`, `memory_recall`, `memory_briefing`, `memory_forget`, `memory_analyze`, `memory_export`, `memory_import` y `memory_sync`.
+- `memoseb mcp`: Inicia el servidor MCP sobre `stdio` (JSON-RPC 2.0) exponiendo `memory_store`, `memory_recall`, `memory_briefing`, `memory_forget`, `memory_analyze`, `memory_export`, `memory_import`, `memory_sync` y `memory_group`.
