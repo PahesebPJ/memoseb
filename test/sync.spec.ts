@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict'
 import crypto from 'node:crypto'
+import fs from 'node:fs'
 import http from 'node:http'
+import os from 'node:os'
+import path from 'node:path'
 import { describe, it } from 'node:test'
 import type { NodeConfiguration, NodeRole, SyncPeerRecord } from '../src/core/schema.ts'
 import {
@@ -20,7 +23,7 @@ import {
   type SyncCapableVault,
   type VaultSnapshotV1
 } from '../src/core/sync.ts'
-import type { VaultStats } from '../src/core/vault.ts'
+import { MemoryVault, type VaultStats } from '../src/core/vault.ts'
 
 class MockSyncVault implements SyncCapableVault {
   nodeConfig: NodeConfiguration
@@ -737,5 +740,87 @@ describe('Sync Engine: Multi-Child Parent Synchronization with Pass-2 Propagatio
     const resAttempt = await triggerAutoSyncIfEnabled(vault, { timeoutMs: 200 })
     assert.ok(resAttempt !== null)
     assert.equal(resAttempt.errors.length, 1)
+  })
+
+  it('propagates tombstones bidirectionally and deletes memories across real vaults via syncWithPeer', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'memoseb-sync-tomb-'))
+    try {
+      const parentDb = path.join(tmpDir, 'parent.sqlite')
+      const child1Db = path.join(tmpDir, 'child1.sqlite')
+      const child2Db = path.join(tmpDir, 'child2.sqlite')
+
+      const parentVault = new MemoryVault({ dbPath: parentDb })
+      parentVault.enableNodeMode({ role: 'parent', listenPort: 0 })
+
+      const child1Vault = new MemoryVault({ dbPath: child1Db })
+      child1Vault.enableNodeMode({ role: 'child', listenPort: 0 })
+
+      const child2Vault = new MemoryVault({ dbPath: child2Db })
+      child2Vault.enableNodeMode({ role: 'child', listenPort: 0 })
+
+      // Child 1 creates a memory
+      const m1 = child1Vault.storeMemory({
+        projectId: 'sync-mesh',
+        category: 'architecture',
+        title: 'Microservices Mesh',
+        content: 'Service mesh topology for child 1.'
+      })
+
+      const parentServer = await startSyncServer(parentVault, {
+        host: '127.0.0.1',
+        port: 0,
+        enableUdpDiscovery: false
+      })
+      const parentUrl = `http://127.0.0.1:${parentServer.port}`
+
+      try {
+        // Child 1 syncs with Parent
+        await syncWithPeer(child1Vault, {
+          peerUrl: parentUrl,
+          peerRole: 'parent'
+        })
+        // Parent now has m1
+        assert.equal(parentVault.recallMemories('Microservices', { projectId: 'sync-mesh' }).memories.length, 1)
+
+        // Child 2 syncs with Parent
+        await syncWithPeer(child2Vault, {
+          peerUrl: parentUrl,
+          peerRole: 'parent'
+        })
+        // Child 2 now has m1
+        assert.equal(child2Vault.recallMemories('Microservices', { projectId: 'sync-mesh' }).memories.length, 1)
+
+        // Child 1 forgets m1, creating a tombstone
+        const forgotten = child1Vault.forgetMemory(m1.memory.id)
+        assert.equal(forgotten, true)
+
+        // Child 1 syncs with Parent
+        const syncRes1 = await syncWithPeer(child1Vault, {
+          peerUrl: parentUrl,
+          peerRole: 'parent'
+        })
+        assert.ok(syncRes1.pushed.tombstonesApplied >= 0)
+
+        // Parent memory should now be deleted!
+        assert.equal(parentVault.recallMemories('Microservices', { projectId: 'sync-mesh' }).memories.length, 0)
+
+        // Child 2 syncs with Parent
+        const syncRes2 = await syncWithPeer(child2Vault, {
+          peerUrl: parentUrl,
+          peerRole: 'parent'
+        })
+        assert.equal(syncRes2.pulled.tombstonesApplied, 1)
+
+        // Child 2 memory should now be deleted!
+        assert.equal(child2Vault.recallMemories('Microservices', { projectId: 'sync-mesh' }).memories.length, 0)
+      } finally {
+        await parentServer.close()
+        parentVault.close()
+        child1Vault.close()
+        child2Vault.close()
+      }
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true })
+    }
   })
 })

@@ -569,7 +569,75 @@ describe('CLI hubseb/v1 Wire Contract, MCP JSON-RPC Server, and Topology Integra
     assert.equal(impTextRes.exitCode, 0)
     assert.ok(impTextRes.stdout.includes('Imported snapshot'))
 
-    // 4. Test missing file error
+    // 4. Test export with --project
+    const projExportPath = path.join(tmpDir, 'proj-export.json')
+    const projExpRes = await executeMemoCli(
+      ['export', projExportPath, '--project', 'proj-export', '--json'],
+      { runtime, dbPath }
+    )
+    assert.equal(projExpRes.exitCode, 0)
+    const projExpPacket = decodeWire<{
+      filePath: string
+      checksum: string
+      projectCount: number
+      memoryCount: number
+    }>(projExpRes.stdout) as WireSuccess<{
+      filePath: string
+      checksum: string
+      projectCount: number
+      memoryCount: number
+    }>
+    assert.equal(projExpPacket.payload.projectCount, 1)
+
+    // Seed vault2 with another project
+    await executeMemoCli(
+      [
+        'remember',
+        'Project beta persistent memory',
+        '--project',
+        'proj-beta',
+        '--title',
+        'Beta Memory',
+        '--json'
+      ],
+      { runtime, dbPath: dbPath2 }
+    )
+
+    // 5. Test import with --replace and --project
+    const impProjReplaceRes = await executeMemoCli(
+      ['import', projExportPath, '--db', dbPath2, '--project', 'proj-export', '--replace', '--json'],
+      { runtime }
+    )
+    assert.equal(impProjReplaceRes.exitCode, 0)
+    const impProjReplacePacket = decodeWire<{ strategy: string }>(impProjReplaceRes.stdout) as WireSuccess<{ strategy: string }>
+    assert.equal(impProjReplacePacket.payload.strategy, 'replace')
+
+    // Confirm proj-beta is still intact in vault2
+    const betaRecall = await executeMemoCli(
+      ['recall', 'Beta Memory', '--project', 'proj-beta', '--db', dbPath2, '--json'],
+      { runtime }
+    )
+    const betaPacket = decodeWire<RecallResult>(betaRecall.stdout) as WireSuccess<RecallResult>
+    assert.equal(betaPacket.payload.memories.length, 1)
+
+    // 6. Test global replace with --replace
+    const impGlobalReplaceRes = await executeMemoCli(
+      ['import', exportPath, '--db', dbPath2, '--replace', '--json'],
+      { runtime }
+    )
+    assert.equal(impGlobalReplaceRes.exitCode, 0)
+    const impGlobalReplacePacket = decodeWire<{ strategy: string }>(impGlobalReplaceRes.stdout) as WireSuccess<{ strategy: string }>
+    assert.equal(impGlobalReplacePacket.payload.strategy, 'replace')
+
+    // Confirm proj-beta is now wiped from vault2
+    const betaRecallAfter = await executeMemoCli(
+      ['recall', 'Beta Memory', '--project', 'proj-beta', '--db', dbPath2, '--json'],
+      { runtime }
+    )
+    const betaPacketAfter = decodeWire<RecallResult>(betaRecallAfter.stdout) as WireSuccess<RecallResult>
+    assert.equal(betaPacketAfter.payload.memories.length, 0)
+
+    // 7. Test missing file error
     const missingRes = await executeMemoCli(['import', '--json'], { runtime })
     assert.equal(missingRes.exitCode, 2)
   })
@@ -671,6 +739,68 @@ describe('CLI hubseb/v1 Wire Contract, MCP JSON-RPC Server, and Topology Integra
     assert.equal(disablePacket.payload.peers.length, 0)
   })
 
+  it('activates child node via UDP discovery with active parent node using memoseb node enable --role child --discover', async () => {
+    // 1. Initial state standalone (enabled: false)
+    const childDb = path.join(tmpDir, 'child-disc-vault.sqlite')
+    const initStatus = await executeMemoCli(['node', 'status', '--json'], { runtime, dbPath: childDb })
+    assert.equal(initStatus.exitCode, 0)
+    const initPacket = decodeWire<{ config: { enabled: boolean; role: string } }>(initStatus.stdout) as WireSuccess<{ config: { enabled: boolean; role: string } }>
+    assert.equal(initPacket.payload.config.enabled, false)
+    assert.equal(initPacket.payload.config.role, 'standalone')
+
+    // 2. Start an active parent node with UDP discovery
+    const parentDb = path.join(tmpDir, 'parent-disc-vault.sqlite')
+    const parentVault = new MemoryVault({ dbPath: parentDb, runtime })
+    parentVault.enableNodeMode({ role: 'parent', listenPort: 0, lanDiscovery: true })
+    const parentServer = await startSyncServer(parentVault, {
+      host: '127.0.0.1',
+      port: 0,
+      enableUdpDiscovery: true,
+      udpPort: 0
+    })
+    const parentUdpPort = parentServer.udpPort!
+
+    try {
+      // 3. Child enables node mode as child with --discover pointing to parent UDP port
+      const enableDiscRes = await executeMemoCli(
+        ['node', 'enable', '--role', 'child', '--discover', '--port', String(parentUdpPort), '--json'],
+        { runtime, dbPath: childDb }
+      )
+      assert.equal(enableDiscRes.exitCode, 0)
+      const enableDiscPacket = decodeWire<{
+        config: { enabled: boolean; role: string }
+        peers: Array<{ role: string; peerNodeId: string }>
+      }>(enableDiscRes.stdout) as WireSuccess<{
+        config: { enabled: boolean; role: string }
+        peers: Array<{ role: string; peerNodeId: string }>
+      }>
+      assert.equal(enableDiscPacket.payload.config.enabled, true)
+      assert.equal(enableDiscPacket.payload.config.role, 'child')
+      assert.ok(enableDiscPacket.payload.peers.length >= 1)
+      assert.equal(enableDiscPacket.payload.peers[0]?.role, 'parent')
+      assert.equal(enableDiscPacket.payload.peers[0]?.peerNodeId, parentVault.getNodeId())
+
+      // 4. Disable child node
+      const disableRes = await executeMemoCli(['node', 'disable', '--purge-peers', '--json'], {
+        runtime,
+        dbPath: childDb
+      })
+      assert.equal(disableRes.exitCode, 0)
+      const disablePacket = decodeWire<{
+        config: { enabled: boolean }
+        peers: unknown[]
+      }>(disableRes.stdout) as WireSuccess<{
+        config: { enabled: boolean }
+        peers: unknown[]
+      }>
+      assert.equal(disablePacket.payload.config.enabled, false)
+      assert.equal(disablePacket.payload.peers.length, 0)
+    } finally {
+      await parentServer.close()
+      parentVault.close()
+    }
+  })
+
   it('executes CLI sync command against peer and all-peers', async () => {
     // 1. Sync fails when node is disabled and no --url is given
     const syncFailRes = await executeMemoCli(['sync', '--json'], { runtime, dbPath })
@@ -723,6 +853,142 @@ describe('CLI hubseb/v1 Wire Contract, MCP JSON-RPC Server, and Topology Integra
       }
     } finally {
       await serverHandle.close()
+      parentVault.close()
+    }
+  })
+
+  it('executes bidirectional CLI sync across a parent and two children with forget/tombstone propagation', async () => {
+    const parentDb = path.join(tmpDir, 'mesh-parent.sqlite')
+    const child1Db = path.join(tmpDir, 'mesh-child1.sqlite')
+    const child2Db = path.join(tmpDir, 'mesh-child2.sqlite')
+
+    // 1. Enable parent node via CLI
+    const parentEnable = await executeMemoCli(
+      ['node', 'enable', '--role', 'parent', '--port', '0', '--json'],
+      { runtime, dbPath: parentDb }
+    )
+    assert.equal(parentEnable.exitCode, 0)
+
+    // Start parent sync server
+    const parentVault = new MemoryVault({ dbPath: parentDb, runtime })
+    const parentServer = await startSyncServer(parentVault, {
+      host: '127.0.0.1',
+      port: 0,
+      enableUdpDiscovery: false
+    })
+    const parentUrl = `http://127.0.0.1:${parentServer.port}`
+
+    try {
+      // 2. Connect Child 1 and Child 2 to Parent via CLI
+      await executeMemoCli(
+        ['node', 'enable', '--role', 'child', '--parent', parentUrl, '--json'],
+        { runtime, dbPath: child1Db }
+      )
+      await executeMemoCli(
+        ['node', 'enable', '--role', 'child', '--parent', parentUrl, '--json'],
+        { runtime, dbPath: child2Db }
+      )
+
+      // 3. Store initial memories
+      await executeMemoCli(
+        [
+          'remember',
+          'Parent mesh configuration knowledge',
+          '--project',
+          'mesh-proj',
+          '--title',
+          'Parent Knowledge',
+          '--json'
+        ],
+        { runtime, dbPath: parentDb }
+      )
+
+      const rem1 = await executeMemoCli(
+        [
+          'remember',
+          'Child 1 edge node findings',
+          '--project',
+          'mesh-proj',
+          '--title',
+          'Child 1 Findings',
+          '--json'
+        ],
+        { runtime, dbPath: child1Db }
+      )
+      const rem1Packet = decodeWire<StoreMemoryResult>(rem1.stdout) as WireSuccess<StoreMemoryResult>
+      const mem1Id = rem1Packet.payload.memory.id
+
+      // 4. Child 1 synchronizes with Parent via CLI (syncs Child 1 <-> Parent)
+      const sync1Res = await executeMemoCli(['sync', '--json'], { runtime, dbPath: child1Db })
+      assert.equal(sync1Res.exitCode, 0)
+
+      // Allow clock tick so Child 2's timestamp is strictly after Child 1's initial sync
+      await new Promise((resolve) => setTimeout(resolve, 20))
+
+      // 5. Child 2 records metrics knowledge chronologically after Child 1's initial sync
+      await executeMemoCli(
+        [
+          'remember',
+          'Child 2 telemetry and metrics',
+          '--project',
+          'mesh-proj',
+          '--title',
+          'Child 2 Metrics',
+          '--json'
+        ],
+        { runtime, dbPath: child2Db }
+      )
+
+      // 6. Child 2 synchronizes with Parent via CLI (pushes Child 2, pulls Child 1 and Parent memories)
+      const sync2Res = await executeMemoCli(['sync', '--json'], { runtime, dbPath: child2Db })
+      assert.equal(sync2Res.exitCode, 0)
+
+      // 7. Child 1 synchronizes again to pull Child 2's memory from Parent
+      const sync1Res2 = await executeMemoCli(['sync', '--json'], { runtime, dbPath: child1Db })
+      assert.equal(sync1Res2.exitCode, 0)
+
+      // Verify Child 1 has all memories via CLI recall
+      const c1Recall = await executeMemoCli(
+        ['recall', 'Child 2 Metrics', '--project', 'mesh-proj', '--json'],
+        { runtime, dbPath: child1Db }
+      )
+      const c1RecallPacket = decodeWire<RecallResult>(c1Recall.stdout) as WireSuccess<RecallResult>
+      assert.ok(c1RecallPacket.payload.memories.some((m) => m.title === 'Child 2 Metrics'))
+
+      // Verify Child 2 has all memories via CLI recall
+      const c2Recall = await executeMemoCli(
+        ['recall', 'Child 1 Findings', '--project', 'mesh-proj', '--json'],
+        { runtime, dbPath: child2Db }
+      )
+      const c2RecallPacket = decodeWire<RecallResult>(c2Recall.stdout) as WireSuccess<RecallResult>
+      assert.ok(c2RecallPacket.payload.memories.some((m) => m.title === 'Child 1 Findings'))
+
+      // 8. Test tombstone propagation: Child 1 forgets its memory
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      const forgetRes = await executeMemoCli(['forget', mem1Id, '--json'], { runtime, dbPath: child1Db })
+      assert.equal(forgetRes.exitCode, 0)
+
+      // Child 1 syncs to push tombstone to Parent
+      const sync1Forget = await executeMemoCli(['sync', '--json'], { runtime, dbPath: child1Db })
+      assert.equal(sync1Forget.exitCode, 0)
+
+      // Child 2 syncs to pull tombstone from Parent
+      const sync2Forget = await executeMemoCli(['sync', '--json'], { runtime, dbPath: child2Db })
+      assert.equal(sync2Forget.exitCode, 0)
+
+      // Verify Child 2 has forgotten Child 1's memory
+      const c2RecallAfter = await executeMemoCli(
+        ['recall', 'Child 1 Findings', '--project', 'mesh-proj', '--json'],
+        { runtime, dbPath: child2Db }
+      )
+      const c2RecallAfterPacket = decodeWire<RecallResult>(c2RecallAfter.stdout) as WireSuccess<RecallResult>
+      assert.ok(!c2RecallAfterPacket.payload.memories.some((m) => m.title === 'Child 1 Findings'))
+
+      // Verify Parent also has forgotten Child 1's memory
+      const parentMemories = parentVault.recallMemories('Child 1 Findings', { projectId: 'mesh-proj' }).memories
+      assert.ok(!parentMemories.some((m) => m.title === 'Child 1 Findings'))
+    } finally {
+      await parentServer.close()
       parentVault.close()
     }
   })
