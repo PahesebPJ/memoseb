@@ -13,12 +13,18 @@ import {
 } from './embedder.ts'
 import { detectProject, slugifyProjectId } from './project-detector.ts'
 import {
+  isGroupPermissionMode,
   isMemoryCategory,
+  isUnassignedGroupPolicy,
   openVaultDatabase,
+  type EffectivePeerPermissions,
+  type GroupPermissionMode,
   type MemoryCategory,
   type NodeConfiguration,
   type NodeRole,
-  type SyncPeerRecord
+  type SyncGroupRecord,
+  type SyncPeerRecord,
+  type UnassignedGroupPolicy
 } from './schema.ts'
 import {
   computeSnapshotChecksum,
@@ -184,6 +190,35 @@ function deriveDefaultTitle(content: string): string {
     return firstLine
   }
   return `${firstLine.slice(0, 69)}...`
+}
+
+interface RawGroupRow {
+  id: string
+  name: string
+  description: string
+  projects: string
+  categories: string
+  permissions: string
+  group_token: string | null
+  created_at: string
+  updated_at: string
+}
+
+function normalizeGroupName(rawName: string): string {
+  const trimmed = (rawName ?? '').trim()
+  if (!trimmed) {
+    throw new Error('Group name cannot be empty.')
+  }
+  const withoutScope = trimmed.replace(/^@[^/]+\//, '')
+  const slug = withoutScope
+    .toLowerCase()
+    .replace(/[^a-z0-9-]+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-+|-+$/g, '')
+  if (!slug) {
+    throw new Error('Group name cannot be empty.')
+  }
+  return slug
 }
 
 interface RawPeerRow {
@@ -802,6 +837,10 @@ export class MemoryVault {
     const rawLan = meta.get('node.lan_discovery')
     const lanDiscovery = rawLan !== undefined ? rawLan === 'true' : true
 
+    const rawUnassigned = meta.get('node.unassigned_group_policy')
+    const unassignedGroupPolicy: UnassignedGroupPolicy =
+      rawUnassigned === 'all' ? 'all' : 'none'
+
     return {
       nodeId,
       nodeName,
@@ -811,7 +850,8 @@ export class MemoryVault {
       listenPort,
       authToken,
       autoSync,
-      lanDiscovery
+      lanDiscovery,
+      unassignedGroupPolicy
     }
   }
 
@@ -856,8 +896,20 @@ export class MemoryVault {
     if (patch.lanDiscovery !== undefined) {
       upsert.run('node.lan_discovery', String(patch.lanDiscovery), now)
     }
+    if (patch.unassignedGroupPolicy !== undefined) {
+      const policyVal: UnassignedGroupPolicy =
+        patch.unassignedGroupPolicy === 'all' ? 'all' : 'none'
+      upsert.run('node.unassigned_group_policy', policyVal, now)
+    }
 
     return this.getNodeConfig()
+  }
+
+  setUnassignedGroupPolicy(
+    policy: UnassignedGroupPolicy
+  ): NodeConfiguration {
+    const validPolicy: UnassignedGroupPolicy = policy === 'all' ? 'all' : 'none'
+    return this.updateNodeConfig({ unassignedGroupPolicy: validPolicy })
   }
 
   enableNodeMode(options: {
@@ -1068,6 +1120,515 @@ export class MemoryVault {
          WHERE id = ?`
       )
       .run(lastSyncAt, lastStatus, peerNodeId, name, now, peer.id)
+  }
+
+  upsertGroup(input: {
+    name: string
+    description?: string
+    projects?: readonly string[]
+    categories?: readonly string[]
+    permissions?: GroupPermissionMode
+    groupToken?: string | null
+  }): SyncGroupRecord {
+    const groupName = normalizeGroupName(input.name)
+    const existing = this.getGroup(groupName)
+    const now = new Date().toISOString()
+
+    const description =
+      input.description !== undefined
+        ? input.description.trim()
+        : existing
+          ? existing.description
+          : ''
+
+    let projects: string[]
+    if (input.projects !== undefined) {
+      if (input.projects.length === 0 || input.projects.includes('*')) {
+        projects = ['*']
+      } else {
+        const set = new Set<string>()
+        for (const p of input.projects) {
+          const trimmed = p.trim()
+          if (!trimmed) continue
+          const slug = slugifyProjectId(trimmed)
+          if (slug) {
+            set.add(slug)
+          }
+        }
+        projects = Array.from(set)
+      }
+    } else if (existing) {
+      projects = existing.projects
+    } else {
+      projects = ['*']
+    }
+
+    let categories: string[]
+    if (input.categories !== undefined) {
+      if (input.categories.length === 0 || input.categories.includes('*')) {
+        categories = ['*']
+      } else {
+        const set = new Set<string>()
+        for (const cat of input.categories) {
+          const trimmed = cat.trim()
+          if (!isMemoryCategory(trimmed)) {
+            throw new Error(
+              `Invalid memory category: "${cat}". Must be one of: architecture, convention, bugfix, decision, domain.`
+            )
+          }
+          set.add(trimmed)
+        }
+        categories = Array.from(set)
+      }
+    } else if (existing) {
+      categories = existing.categories
+    } else {
+      categories = ['*']
+    }
+
+    let permissions: GroupPermissionMode
+    if (input.permissions !== undefined) {
+      if (!isGroupPermissionMode(input.permissions)) {
+        throw new Error(
+          `Invalid group permission mode: "${input.permissions}". Must be one of: readwrite, readonly, writeonly.`
+        )
+      }
+      permissions = input.permissions
+    } else if (existing) {
+      permissions = existing.permissions
+    } else {
+      permissions = 'readwrite'
+    }
+
+    let groupToken: string | null
+    if (input.groupToken !== undefined) {
+      if (input.groupToken === null || input.groupToken.trim() === '') {
+        groupToken = null
+      } else {
+        groupToken = input.groupToken.trim()
+      }
+    } else if (existing) {
+      groupToken = existing.groupToken
+    } else {
+      groupToken = null
+    }
+
+    if (existing) {
+      this.db
+        .prepare(
+          `UPDATE sync_groups
+           SET description = ?,
+               projects = ?,
+               categories = ?,
+               permissions = ?,
+               group_token = ?,
+               updated_at = ?
+           WHERE id = ?`
+        )
+        .run(
+          description,
+          JSON.stringify(projects),
+          JSON.stringify(categories),
+          permissions,
+          groupToken,
+          now,
+          existing.id
+        )
+      return this.getGroup(existing.id)!
+    }
+
+    const id = crypto.randomUUID()
+    this.db
+      .prepare(
+        `INSERT INTO sync_groups (
+           id, name, description, projects, categories, permissions, group_token, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        id,
+        groupName,
+        description,
+        JSON.stringify(projects),
+        JSON.stringify(categories),
+        permissions,
+        groupToken,
+        now,
+        now
+      )
+
+    return this.getGroup(id)!
+  }
+
+  getGroup(nameOrId: string): SyncGroupRecord | null {
+    const trimmed = nameOrId?.trim()
+    if (!trimmed) {
+      return null
+    }
+    const slug = slugifyProjectId(trimmed)
+    const row = this.db
+      .prepare(
+        `SELECT * FROM sync_groups
+         WHERE id = ? OR name = ? OR name = ?
+         LIMIT 1`
+      )
+      .get(trimmed, trimmed, slug) as RawGroupRow | undefined
+    if (!row) {
+      return null
+    }
+    return this.mapRowToGroupRecord(row)
+  }
+
+  listGroups(): SyncGroupRecord[] {
+    const rows = this.db
+      .prepare(`SELECT * FROM sync_groups ORDER BY name ASC`)
+      .all() as unknown as RawGroupRow[]
+    return rows.map((r) => this.mapRowToGroupRecord(r))
+  }
+
+  deleteGroup(nameOrId: string): boolean {
+    const group = this.getGroup(nameOrId)
+    if (!group) {
+      return false
+    }
+    this.db
+      .prepare(`DELETE FROM sync_group_members WHERE group_id = ?`)
+      .run(group.id)
+    const res = this.db
+      .prepare(`DELETE FROM sync_groups WHERE id = ?`)
+      .run(group.id)
+    return res.changes > 0
+  }
+
+  addNodeToGroup(
+    groupNameOrId: string,
+    peerIdentifier: string
+  ): SyncGroupRecord {
+    const group = this.getGroup(groupNameOrId)
+    if (!group) {
+      throw new Error(`Group "${groupNameOrId}" not found.`)
+    }
+
+    const trimmedId = peerIdentifier?.trim()
+    if (!trimmedId) {
+      throw new Error('Peer identifier cannot be empty.')
+    }
+    const normalizedUrl = trimmedId.replace(/\/+$/, '')
+
+    const peer = this.db
+      .prepare(
+        `SELECT * FROM sync_peers
+         WHERE id = ? OR peer_node_id = ? OR name = ? OR url = ? OR url = ?
+         LIMIT 1`
+      )
+      .get(trimmedId, trimmedId, trimmedId, trimmedId, normalizedUrl) as
+      | RawPeerRow
+      | undefined
+
+    const identifiersToInsert = new Set<string>()
+    identifiersToInsert.add(trimmedId)
+    if (peer?.peer_node_id) {
+      identifiersToInsert.add(peer.peer_node_id)
+    }
+
+    const now = new Date().toISOString()
+    const insertStmt = this.db.prepare(
+      `INSERT OR IGNORE INTO sync_group_members (group_id, peer_identifier, added_at)
+       VALUES (?, ?, ?)`
+    )
+    for (const id of identifiersToInsert) {
+      insertStmt.run(group.id, id, now)
+    }
+
+    return this.getGroup(group.id)!
+  }
+
+  removeNodeFromGroup(
+    groupNameOrId: string,
+    peerIdentifier: string
+  ): SyncGroupRecord {
+    const group = this.getGroup(groupNameOrId)
+    if (!group) {
+      throw new Error(`Group "${groupNameOrId}" not found.`)
+    }
+
+    const trimmedId = peerIdentifier?.trim()
+    if (!trimmedId) {
+      throw new Error('Peer identifier cannot be empty.')
+    }
+    const normalizedUrl = trimmedId.replace(/\/+$/, '')
+
+    const peer = this.db
+      .prepare(
+        `SELECT * FROM sync_peers
+         WHERE id = ? OR peer_node_id = ? OR name = ? OR url = ? OR url = ?
+         LIMIT 1`
+      )
+      .get(trimmedId, trimmedId, trimmedId, trimmedId, normalizedUrl) as
+      | RawPeerRow
+      | undefined
+
+    const toRemove = new Set<string>([trimmedId])
+    if (peer) {
+      if (peer.id) toRemove.add(peer.id)
+      if (peer.peer_node_id) toRemove.add(peer.peer_node_id)
+      if (peer.name) toRemove.add(peer.name)
+      if (peer.url) {
+        toRemove.add(peer.url)
+        toRemove.add(peer.url.replace(/\/+$/, ''))
+      }
+    }
+
+    const delStmt = this.db.prepare(
+      `DELETE FROM sync_group_members WHERE group_id = ? AND peer_identifier = ?`
+    )
+    for (const id of toRemove) {
+      delStmt.run(group.id, id)
+    }
+
+    return this.getGroup(group.id)!
+  }
+
+  getPeerGroups(
+    peerIdentifiers: readonly (string | null | undefined)[]
+  ): SyncGroupRecord[] {
+    const searchIds = new Set<string>()
+    for (const raw of peerIdentifiers) {
+      if (typeof raw === 'string') {
+        const trimmed = raw.trim()
+        if (trimmed.length > 0) {
+          searchIds.add(trimmed)
+          searchIds.add(trimmed.replace(/\/+$/, ''))
+        }
+      }
+    }
+
+    if (searchIds.size === 0) {
+      return []
+    }
+
+    const peerRows = this.db
+      .prepare(`SELECT * FROM sync_peers`)
+      .all() as unknown as RawPeerRow[]
+
+    for (const peer of peerRows) {
+      const normUrl = peer.url.replace(/\/+$/, '')
+      const matches =
+        searchIds.has(peer.id) ||
+        (peer.peer_node_id !== null && searchIds.has(peer.peer_node_id)) ||
+        searchIds.has(peer.name) ||
+        searchIds.has(peer.url) ||
+        searchIds.has(normUrl)
+
+      if (matches) {
+        if (peer.id) searchIds.add(peer.id)
+        if (peer.peer_node_id) searchIds.add(peer.peer_node_id)
+        if (peer.name) searchIds.add(peer.name)
+        if (peer.url) {
+          searchIds.add(peer.url)
+          searchIds.add(normUrl)
+        }
+      }
+    }
+
+    const idList = Array.from(searchIds)
+    const placeholders = idList.map(() => '?').join(',')
+    const groupRows = this.db
+      .prepare(
+        `SELECT DISTINCT g.*
+         FROM sync_groups g
+         JOIN sync_group_members m ON g.id = m.group_id
+         WHERE m.peer_identifier IN (${placeholders})
+         ORDER BY g.name ASC`
+      )
+      .all(...idList) as unknown as RawGroupRow[]
+
+    return groupRows.map((r) => this.mapRowToGroupRecord(r))
+  }
+
+  findGroupByToken(token: string | null | undefined): SyncGroupRecord | null {
+    if (!token || typeof token !== 'string') {
+      return null
+    }
+    const trimmed = token.trim()
+    if (!trimmed) {
+      return null
+    }
+
+    const tokenHash = crypto.createHash('sha256').update(trimmed).digest()
+
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM sync_groups
+         WHERE group_token IS NOT NULL AND group_token != ''
+         ORDER BY name ASC`
+      )
+      .all() as unknown as RawGroupRow[]
+
+    for (const row of rows) {
+      if (!row.group_token) continue
+      const rowHash = crypto
+        .createHash('sha256')
+        .update(row.group_token.trim())
+        .digest()
+      if (crypto.timingSafeEqual(tokenHash, rowHash)) {
+        return this.mapRowToGroupRecord(row)
+      }
+    }
+
+    return null
+  }
+
+  evaluatePeerPermissions(input?: {
+    peerId?: string | null
+    peerNodeId?: string | null
+    peerName?: string | null
+    peerUrl?: string | null
+    matchedGroupByToken?: string | null
+  }): EffectivePeerPermissions {
+    const allGroups = this.listGroups()
+    if (allGroups.length === 0) {
+      return {
+        unrestricted: true,
+        groups: [],
+        canPush: () => true,
+        canPull: () => true
+      }
+    }
+
+    const memberGroups = this.getPeerGroups([
+      input?.peerId,
+      input?.peerNodeId,
+      input?.peerName,
+      input?.peerUrl
+    ])
+
+    if (input?.matchedGroupByToken && input.matchedGroupByToken.trim()) {
+      const tokenGroup =
+        this.getGroup(input.matchedGroupByToken) ??
+        this.findGroupByToken(input.matchedGroupByToken)
+      if (tokenGroup && !memberGroups.some((g) => g.id === tokenGroup.id)) {
+        memberGroups.push(tokenGroup)
+      }
+    }
+
+    if (memberGroups.length === 0) {
+      const policy = this.getNodeConfig().unassignedGroupPolicy ?? 'none'
+      if (policy === 'all') {
+        return {
+          unrestricted: true,
+          groups: [],
+          canPush: () => true,
+          canPull: () => true
+        }
+      }
+      return {
+        unrestricted: false,
+        groups: [],
+        canPush: () => false,
+        canPull: () => false
+      }
+    }
+
+    return {
+      unrestricted: false,
+      groups: memberGroups.map((g) => g.name),
+      canPush: (projectId: string, category?: MemoryCategory | string) => {
+        const normProject = slugifyProjectId(projectId)
+        const normCategory =
+          category !== undefined &&
+          category !== null &&
+          String(category).trim().length > 0
+            ? String(category).trim()
+            : undefined
+        return memberGroups.some((group) => {
+          const hasPerm =
+            group.permissions === 'readwrite' || group.permissions === 'writeonly'
+          if (!hasPerm) return false
+
+          const projectMatches =
+            group.projects.includes('*') || group.projects.includes(normProject)
+          if (!projectMatches) return false
+
+          const categoryMatches =
+            !normCategory ||
+            group.categories.includes('*') ||
+            group.categories.includes(normCategory)
+          return categoryMatches
+        })
+      },
+      canPull: (projectId: string, category?: MemoryCategory | string) => {
+        const normProject = slugifyProjectId(projectId)
+        const normCategory =
+          category !== undefined &&
+          category !== null &&
+          String(category).trim().length > 0
+            ? String(category).trim()
+            : undefined
+        return memberGroups.some((group) => {
+          const hasPerm =
+            group.permissions === 'readwrite' || group.permissions === 'readonly'
+          if (!hasPerm) return false
+
+          const projectMatches =
+            group.projects.includes('*') || group.projects.includes(normProject)
+          if (!projectMatches) return false
+
+          const categoryMatches =
+            !normCategory ||
+            group.categories.includes('*') ||
+            group.categories.includes(normCategory)
+          return categoryMatches
+        })
+      }
+    }
+  }
+
+  private mapRowToGroupRecord(row: RawGroupRow): SyncGroupRecord {
+    const memberRows = this.db
+      .prepare(
+        `SELECT peer_identifier FROM sync_group_members
+         WHERE group_id = ?
+         ORDER BY added_at ASC, peer_identifier ASC`
+      )
+      .all(row.id) as Array<{ peer_identifier: string }>
+    const memberNodeIds = memberRows.map((m) => m.peer_identifier)
+
+    let projects: string[] = ['*']
+    try {
+      const parsed = JSON.parse(row.projects)
+      if (Array.isArray(parsed)) {
+        projects = parsed.map(String)
+      }
+    } catch {
+      // fallback
+    }
+
+    let categories: string[] = ['*']
+    try {
+      const parsed = JSON.parse(row.categories)
+      if (Array.isArray(parsed)) {
+        categories = parsed.map(String)
+      }
+    } catch {
+      // fallback
+    }
+
+    const permissions: GroupPermissionMode = isGroupPermissionMode(row.permissions)
+      ? row.permissions
+      : 'readwrite'
+
+    return {
+      id: row.id,
+      name: row.name,
+      description: row.description ?? '',
+      projects,
+      categories,
+      permissions,
+      groupToken: row.group_token ?? null,
+      memberNodeIds,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at
+    }
   }
 
   exportSnapshot(options?: ExportOptions): VaultSnapshotV1 {
