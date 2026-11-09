@@ -8,3 +8,4 @@ trigger: always_on
 - Al descubrir decisiones de arquitectura, convenciones del repositorio o causas raíz de bugs, persiste el aprendizaje con `memoseb remember "<aprendizaje>" --category <architecture|convention|bugfix|decision|domain>` o la herramienta MCP `memory_store`.
 - Mantén los recuerdos concisos y elimina entradas obsoletas con `memoseb forget <id>` o `memory_forget`.
 - Para portabilidad y sincronización multi-máquina, exporta o importa snapshots con `memoseb export` / `memoseb import` (herramientas MCP `memory_export` / `memory_import`) y sincroniza en red Padre ↔ Hijos mediante `memoseb node (enable|disable|discover|serve)` y `memoseb sync` (`memory_sync`).
+- Para gobernar el acceso granular y segmentar qué nodos sincronizan qué proyectos o categorías, administra grupos de permisos y ACL con `memoseb group (create|list|add-node|remove-node|delete|default-policy)` y la herramienta MCP `memory_group`.

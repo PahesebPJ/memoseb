@@ -59,6 +59,7 @@ memoseb stats [--json]                       # Muestra métricas globales de la 
 memoseb export [file] [--project <id>]       # Exporta el cerebro a un snapshot JSON portable con checksum SHA-256
 memoseb import <file> [--replace] [--project <id>] # Importa un snapshot JSON en otra máquina (merge LWW por defecto o --replace)
 memoseb node status | enable | disable | discover | set-parent | add-child | remove | serve # Gestión opcional de red Padre ↔ Hijos
+memoseb group create | list | add-node | remove-node | delete | default-policy # Control de acceso y grupos de permisos (ACL)
 memoseb sync [--url <peer>] [--project <id>] [--full] # Sincronización bidireccional Padre ↔ Hijos
 memoseb mcp                                  # Inicia el servidor MCP JSON-RPC 2.0 por stdio
 memoseb check [--json]                       # Verifica la integridad SHA-256 de las directivas en cada host
@@ -83,12 +84,17 @@ memoseb capabilities [--json]                # Muestra capacidades (provides/con
 | `--strategy <s>` | `import` | Estrategia de importación: `merge` (por defecto) o `replace` |
 | `--role <r>` | `node enable`, `node serve` | Rol del nodo en la topología de red: `parent` o `child` |
 | `--port <N>` | `node enable`, `node serve`, `node discover` | Puerto HTTP/UDP para el servicio de red (por defecto `7432`) |
-| `--token <sec>` | `node enable`, `node set-parent`, `node add-child`, `sync` | Secreto/token Bearer para autenticación segura entre nodos |
+| `--token <sec>` | `node enable`, `node set-parent`, `node add-child`, `group create`, `sync` | Secreto/token Bearer para autenticación segura entre nodos o token dedicado de grupo |
 | `--parent <url>` | `node enable` | URL directa del nodo Padre al habilitar un nodo Hijo |
 | `--discover` | `node enable` | Auto-descubre un nodo Padre en la red LAN local mediante sondeo UDP |
 | `--url <peer>` | `sync`, `node set-parent`, `node add-child`, `node remove` | URL del peer remoto (ej. `http://192.168.1.50:7432`) |
 | `--full` | `sync` | Fuerza una sincronización completa de snapshot en lugar de sincronización delta |
 | `--purge-peers` | `node disable` | Elimina los peers registrados al desactivar la red del nodo |
+| `--projects <p1,p2>` | `group create` | Proyectos autorizados para el grupo (separados por comas o `*` para todos) |
+| `--categories <c1,c2>` | `group create` | Categorías autorizadas para el grupo (`architecture`, `convention`, `bugfix`, `decision`, `domain`, o `*`) |
+| `--permissions <m>` | `group create` | Modo de acceso del grupo: `readwrite` (por defecto), `readonly` o `writeonly` |
+| `--policy <p>` | `group default-policy` | Política para nodos sin grupo asignado: `none` (denegar) o `all` (permitir todo) |
+| `--group <name>` | `node add-child`, `node set-parent`, `node enable` | Asigna o solicita vinculación al grupo de permisos especificado |
 
 ## Portabilidad entre Máquinas (`export` / `import`)
 
@@ -258,6 +264,76 @@ memoseb node disable
 memoseb node disable --purge-peers
 ```
 
+### Control de Acceso y Grupos de Permisos (`memoseb group`)
+
+Cuando múltiples agentes, equipos o nodos hijos se sincronizan con un nodo Padre central, `memoseb` permite segmentar y gobernar el acceso mediante **Listas de Control de Acceso (ACL)** y **Grupos de Permisos**.
+
+#### Principios de Operación
+- **Sin grupos configurados**: La sincronización es irrestricta (`unrestricted`). Cualquier peer autenticado con el token del nodo tiene acceso completo de lectura y escritura a todos los proyectos y categorías.
+- **Con grupos activos**: En cuanto se crea al menos un grupo, se activa el control de acceso granular. Los nodos sincronizan únicamente los proyectos y categorías autorizados en sus grupos.
+- **Política para nodos no asignados (`default-policy`)**: Define el comportamiento ante nodos autenticados que no pertenecen a ningún grupo:
+  - `none` (predeterminada): Bloquea push y pull para nodos sin grupo asignado.
+  - `all`: Concede acceso irrestricto de lectura y escritura a los nodos sin grupo.
+- **Modos de Permiso**:
+  - `readwrite` (predeterminado): El nodo puede enviar (`push`) y recibir (`pull`) memorias dentro de los proyectos y categorías autorizados.
+  - `readonly`: El nodo solo puede recibir (`pull`) memorias autorizadas del Padre; los intentos de `push` son rechazados.
+  - `writeonly`: El nodo solo puede emitir (`push`) memorias hacia el Padre; no recibe deltas en `pull`.
+
+#### Ejemplos Prácticos de Configuración
+
+##### 1. Crear un Grupo Restringido a un Proyecto Específico
+```bash
+# Crear grupo con acceso de lectura y escritura solo al proyecto "proyecto-x" y token dedicado
+memoseb group create grupo-x --projects proyecto-x --permissions readwrite --token "token-grupo-x"
+```
+
+##### 2. Restringir por Categorías y Modo Solo Lectura
+```bash
+# Permitir únicamente lectura de convenciones y arquitectura del proyecto "core-api"
+memoseb group create equipo-analisis --projects core-api --categories architecture,domain --permissions readonly
+```
+
+##### 3. Asignación de Nodos Hijos a Grupos
+
+Los nodos hijos pueden asignarse a uno o más grupos de forma manual o automática:
+
+- **Asignación manual vía CLI**:
+  ```bash
+  # Asignar un nodo por URL, Node ID o nombre
+  memoseb group add-node grupo-x http://192.168.1.100:7432
+
+  # Desasignar el nodo del grupo
+  memoseb group remove-node grupo-x http://192.168.1.100:7432
+  ```
+
+- **Al registrar un hijo en el Padre**:
+  ```bash
+  # Registra el peer y lo asocia automáticamente al grupo
+  memoseb node add-child http://192.168.1.100:7432 --group grupo-x
+  ```
+
+- **Automática por Token dedicado o Handshake**:
+  - **Por token dedicado**: Si el grupo fue creado con `--token token-grupo-x`, cualquier hijo que se configure usando ese token (`memoseb node enable --role child --token token-grupo-x`) es asignado automáticamente al grupo al autenticarse.
+  - **Por flag `--group` en el hijo**: Si el hijo especifica `--group grupo-x` al conectarse (`memoseb node enable --role child --group grupo-x --token <secreto>`), el nodo Padre asocia el nodo al grupo durante el handshake.
+
+##### 4. Política por Defecto para Nodos sin Grupo
+```bash
+# Denegar sincronización a cualquier nodo no registrado explícitamente en un grupo (recomendado)
+memoseb group default-policy none
+
+# O permitir sincronización irrestricta a nodos no asignados
+memoseb group default-policy all
+```
+
+##### 5. Listar y Eliminar Grupos
+```bash
+# Listar todos los grupos configurados, miembros y política activa
+memoseb group list
+
+# Eliminar un grupo
+memoseb group delete grupo-x
+```
+
 ## Servidor MCP (`memoseb mcp`)
 
 `memoseb` incluye un servidor **Model Context Protocol (MCP)** nativo (`2024-11-05`) sobre `stdio`. Añádelo a la configuración MCP de tu cliente (Claude Code, Antigravity, Cursor, OpenCode, etc.):
@@ -285,3 +361,4 @@ memoseb node disable --purge-peers
 | `memory_export` | `filePath`, `projectId` | Exporta la bóveda completa o un proyecto a un snapshot JSON portable con checksum SHA-256 |
 | `memory_import` | `filePath` (req), `strategy`, `projectId` | Importa un snapshot JSON con resolución Last-Write-Wins (o `--replace`), reindexando FTS5 y vectores |
 | `memory_sync` | `peerUrl`, `projectId`, `full` | Ejecuta sincronización bidireccional de deltas y tombstones con el nodo Padre o peer remoto |
+| `memory_group` | `action` (req: `list`, `create`, `add_node`, `remove_node`, `delete`, `default_policy`), `name`, `projects`, `categories`, `permissions`, `groupToken`, `description`, `node`, `policy` | Administra grupos de permisos y reglas ACL de sincronización por proyecto, categoría y modo de acceso |
