@@ -3,7 +3,12 @@ export * from './core/analyzer.ts'
 export * from './core/embedder.ts'
 export * from './core/project-detector.ts'
 export * from './core/schema.ts'
+export * from './core/snapshot.ts'
+export * from './core/sync.ts'
 export * from './core/vault.ts'
 export * from './mcp/server.ts'
 export * from './setup.ts'
+export type { VaultSnapshotV1 } from './core/snapshot.ts'
 export { PACKAGE_ROOT, VERSION } from './version.ts'
+
+

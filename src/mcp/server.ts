@@ -3,6 +3,12 @@ import path from 'node:path'
 import readline from 'node:readline'
 import { analyzeAndStoreProject } from '../core/analyzer.ts'
 import { MEMORY_CATEGORIES, type MemoryCategory } from '../core/schema.ts'
+import { readSnapshotFile, writeSnapshotFile } from '../core/snapshot.ts'
+import {
+  syncAllPeers,
+  syncWithPeer,
+  triggerAutoSyncIfEnabled,
+} from '../core/sync.ts'
 import type { MemoryVault } from '../core/vault.ts'
 import { BUNDLE_ID, VERSION } from '../version.ts'
 
@@ -139,6 +145,71 @@ export const MCP_TOOLS = [
       },
     },
   },
+  {
+    name: 'memory_export',
+    description:
+      'Export the memoseb vault (all projects or a single project) to a portable JSON snapshot file.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        filePath: {
+          type: 'string',
+          description:
+            'Optional target path to save the snapshot JSON file. If omitted, returns the snapshot object in the response.',
+        },
+        projectId: {
+          type: 'string',
+          description: 'Optional project identifier override.',
+        },
+      },
+    },
+  },
+  {
+    name: 'memory_import',
+    description:
+      'Import a portable memoseb JSON snapshot file into the local vault (merge with Last-Write-Wins or replace).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        filePath: {
+          type: 'string',
+          description: 'Path to the memoseb snapshot JSON file to import.',
+        },
+        strategy: {
+          type: 'string',
+          enum: ['merge', 'replace'],
+          description: "Import strategy: 'merge' with Last-Write-Wins (default) or 'replace' all memories.",
+        },
+        projectId: {
+          type: 'string',
+          description: 'Optional project identifier override.',
+        },
+      },
+      required: ['filePath'],
+    },
+  },
+  {
+    name: 'memory_sync',
+    description:
+      'Synchronize memories bidirectionally with the configured parent node or registered child nodes when node networking is enabled.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        peerUrl: {
+          type: 'string',
+          description: 'Optional peer URL to synchronize with directly.',
+        },
+        projectId: {
+          type: 'string',
+          description: 'Optional project identifier override.',
+        },
+        full: {
+          type: 'boolean',
+          description: 'If true, performs a full snapshot sync instead of delta synchronization.',
+        },
+      },
+    },
+  },
 ] as const
 
 function parseTags(raw: unknown): string[] | undefined {
@@ -239,6 +310,7 @@ export async function handleMcpRequest(
           sourceAgent: typeof args.sourceAgent === 'string' ? args.sourceAgent : undefined,
           importance: typeof args.importance === 'number' ? args.importance : undefined,
         })
+        await triggerAutoSyncIfEnabled(vault, { projectId: stored.memory.projectId })
         return {
           jsonrpc: JSONRPC_VERSION,
           id,
@@ -292,6 +364,9 @@ export async function handleMcpRequest(
           }
         }
         const deleted = vault.forgetMemory(targetId)
+        if (deleted) {
+          await triggerAutoSyncIfEnabled(vault)
+        }
         return {
           jsonrpc: JSONRPC_VERSION,
           id,
@@ -320,11 +395,148 @@ export async function handleMcpRequest(
           dryRun: Boolean(args.dryRun),
           sourceAgent: 'mcp-analyzer',
         })
+        if (!args.dryRun) {
+          await triggerAutoSyncIfEnabled(vault, { projectId: report.project.id })
+        }
         return {
           jsonrpc: JSONRPC_VERSION,
           id,
           result: {
             content: [{ type: 'text', text: JSON.stringify(report, null, 2) }],
+          },
+        }
+      }
+
+      if (toolName === 'memory_export') {
+        const projectId = typeof args.projectId === 'string' ? args.projectId : undefined
+        const snapshot = vault.exportSnapshot({ projectId })
+        const rawFilePath =
+          typeof args.filePath === 'string' && args.filePath.trim() ? args.filePath.trim() : undefined
+        if (rawFilePath) {
+          const writtenPath = writeSnapshotFile(rawFilePath, snapshot)
+          return {
+            jsonrpc: JSONRPC_VERSION,
+            id,
+            result: {
+              content: [
+                {
+                  type: 'text',
+                  text: JSON.stringify(
+                    {
+                      filePath: writtenPath,
+                      checksum: snapshot.checksum,
+                      projectCount: snapshot.projects.length,
+                      memoryCount: snapshot.memories.length,
+                      tombstoneCount: snapshot.tombstones.length,
+                    },
+                    null,
+                    2,
+                  ),
+                },
+              ],
+            },
+          }
+        }
+        return {
+          jsonrpc: JSONRPC_VERSION,
+          id,
+          result: {
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify(
+                  {
+                    checksum: snapshot.checksum,
+                    projectCount: snapshot.projects.length,
+                    memoryCount: snapshot.memories.length,
+                    tombstoneCount: snapshot.tombstones.length,
+                    snapshot,
+                  },
+                  null,
+                  2,
+                ),
+              },
+            ],
+          },
+        }
+      }
+
+      if (toolName === 'memory_import') {
+        const rawFilePath = typeof args.filePath === 'string' ? args.filePath.trim() : ''
+        if (!rawFilePath) {
+          return {
+            jsonrpc: JSONRPC_VERSION,
+            id,
+            result: {
+              isError: true,
+              content: [{ type: 'text', text: 'Missing required argument: filePath' }],
+            },
+          }
+        }
+        const resolvedPath = path.resolve(rawFilePath)
+        const snapshot = readSnapshotFile(resolvedPath)
+        const strategy = args.strategy === 'replace' ? 'replace' : 'merge'
+        const projectId = typeof args.projectId === 'string' ? args.projectId : undefined
+        const result = vault.importSnapshot(snapshot, { strategy, projectId })
+        return {
+          jsonrpc: JSONRPC_VERSION,
+          id,
+          result: {
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify({ filePath: resolvedPath, ...result }, null, 2),
+              },
+            ],
+          },
+        }
+      }
+
+      if (toolName === 'memory_sync') {
+        const peerUrl =
+          typeof args.peerUrl === 'string' && args.peerUrl.trim() ? args.peerUrl.trim() : undefined
+        const projectId = typeof args.projectId === 'string' ? args.projectId : undefined
+        const full = Boolean(args.full)
+        if (peerUrl) {
+          const syncResult = await syncWithPeer(vault, {
+            peerUrl,
+            projectId,
+            full,
+            forceWhenDisabled: true,
+          })
+          return {
+            jsonrpc: JSONRPC_VERSION,
+            id,
+            result: {
+              content: [{ type: 'text', text: JSON.stringify(syncResult, null, 2) }],
+            },
+          }
+        }
+        const config = vault.getNodeConfig()
+        if (!config.enabled) {
+          return {
+            jsonrpc: JSONRPC_VERSION,
+            id,
+            result: {
+              isError: true,
+              content: [
+                {
+                  type: 'text',
+                  text: 'Node networking is disabled. Run "memoseb node enable" or specify peerUrl.',
+                },
+              ],
+            },
+          }
+        }
+        const syncResult = await syncAllPeers(vault, {
+          projectId,
+          full,
+        })
+        return {
+          jsonrpc: JSONRPC_VERSION,
+          id,
+          result: {
+            content: [{ type: 'text', text: JSON.stringify(syncResult, null, 2) }],
           },
         }
       }

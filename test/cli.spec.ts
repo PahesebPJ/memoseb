@@ -19,6 +19,7 @@ import type {
   VaultStats
 } from '../src/core/vault.ts'
 import { MemoryVault } from '../src/core/vault.ts'
+import { startSyncServer } from '../src/core/sync.ts'
 import { handleMcpRequest } from '../src/mcp/server.ts'
 import { deployMemoseb } from '../src/setup.ts'
 
@@ -316,7 +317,10 @@ describe('CLI hubseb/v1 Wire Contract, MCP JSON-RPC Server, and Topology Integra
         'memory_recall',
         'memory_briefing',
         'memory_forget',
-        'memory_analyze'
+        'memory_analyze',
+        'memory_export',
+        'memory_import',
+        'memory_sync',
       ])
 
       // tools/call -> memory_store
@@ -483,5 +487,338 @@ describe('CLI hubseb/v1 Wire Contract, MCP JSON-RPC Server, and Topology Integra
         status: 'connected'
       }
     ])
+  })
+
+  it('executes CLI export and import commands and emits signals', async () => {
+    // 1. Store memories in primary vault
+    await executeMemoCli(
+      [
+        'remember',
+        'Architecture pattern: hexagonal architecture with dependency injection',
+        '--project',
+        'proj-export',
+        '--category',
+        'architecture',
+        '--title',
+        'Hexagonal Architecture',
+        '--json'
+      ],
+      { runtime, dbPath }
+    )
+    await executeMemoCli(
+      [
+        'remember',
+        'Convention: always use conventional commits',
+        '--project',
+        'proj-export',
+        '--category',
+        'convention',
+        '--title',
+        'Git Commits',
+        '--json'
+      ],
+      { runtime, dbPath }
+    )
+
+    // 2. Export vault snapshot
+    const exportPath = path.join(tmpDir, 'test-export.json')
+    const expRes = await executeMemoCli(['export', exportPath, '--json'], { runtime, dbPath })
+    assert.equal(expRes.exitCode, 0)
+    const expPacket = decodeWire<{
+      filePath: string
+      checksum: string
+      projectCount: number
+      memoryCount: number
+      tombstoneCount: number
+    }>(expRes.stdout) as WireSuccess<{
+      filePath: string
+      checksum: string
+      projectCount: number
+      memoryCount: number
+      tombstoneCount: number
+    }>
+    assert.equal(expPacket.action, 'export')
+    assert.equal(fs.existsSync(exportPath), true)
+    assert.ok(expPacket.payload.memoryCount >= 2)
+
+    // Also test text output format for export
+    const expTextPath = path.join(tmpDir, 'test-export-text.json')
+    const expTextRes = await executeMemoCli(['export', expTextPath], { runtime, dbPath })
+    assert.equal(expTextRes.exitCode, 0)
+    assert.ok(expTextRes.stdout.includes('Exported memoseb snapshot'))
+
+    // 3. Import snapshot into a second vault
+    const dbPath2 = path.join(tmpDir, 'vault2.sqlite')
+    const impRes = await executeMemoCli(['import', exportPath, '--db', dbPath2, '--json'], { runtime })
+    assert.equal(impRes.exitCode, 0)
+    const impPacket = decodeWire<{
+      strategy: string
+      projectsImported: number
+      memoriesCreated: number
+    }>(impRes.stdout) as WireSuccess<{
+      strategy: string
+      projectsImported: number
+      memoriesCreated: number
+    }>
+    assert.equal(impPacket.action, 'import')
+    assert.equal(impPacket.payload.strategy, 'merge')
+    assert.equal(impPacket.payload.memoriesCreated, expPacket.payload.memoryCount)
+
+    // Test text output format for import
+    const impTextRes = await executeMemoCli(['import', exportPath, '--db', dbPath2], { runtime })
+    assert.equal(impTextRes.exitCode, 0)
+    assert.ok(impTextRes.stdout.includes('Imported snapshot'))
+
+    // 4. Test missing file error
+    const missingRes = await executeMemoCli(['import', '--json'], { runtime })
+    assert.equal(missingRes.exitCode, 2)
+  })
+
+  it('manages node lifecycle with CLI node commands (status, enable, disable, set-parent, add-child, remove)', async () => {
+    // 1. Initial node status (disabled / standalone)
+    const statusRes = await executeMemoCli(['node', 'status', '--json'], { runtime, dbPath })
+    assert.equal(statusRes.exitCode, 0)
+    const statusPacket = decodeWire<{
+      config: { enabled: boolean; role: string }
+      peers: unknown[]
+      lanUrls: string[]
+    }>(statusRes.stdout) as WireSuccess<{
+      config: { enabled: boolean; role: string }
+      peers: unknown[]
+      lanUrls: string[]
+    }>
+    assert.equal(statusPacket.payload.config.enabled, false)
+    assert.equal(statusPacket.payload.config.role, 'standalone')
+
+    // Test text status output
+    const statusTextRes = await executeMemoCli(['node'], { runtime, dbPath })
+    assert.equal(statusTextRes.exitCode, 0)
+    assert.ok(statusTextRes.stdout.includes('Status:      DISABLED (standalone)'))
+
+    // 2. Enable node mode as parent
+    const enableRes = await executeMemoCli(
+      ['node', 'enable', '--role', 'parent', '--name', 'test-parent-cli', '--port', '8765', '--json'],
+      { runtime, dbPath }
+    )
+    assert.equal(enableRes.exitCode, 0)
+    const enablePacket = decodeWire<{
+      config: { enabled: boolean; role: string; nodeName: string; listenPort: number }
+    }>(enableRes.stdout) as WireSuccess<{
+      config: { enabled: boolean; role: string; nodeName: string; listenPort: number }
+    }>
+    assert.equal(enablePacket.payload.config.enabled, true)
+    assert.equal(enablePacket.payload.config.role, 'parent')
+    assert.equal(enablePacket.payload.config.nodeName, 'test-parent-cli')
+    assert.equal(enablePacket.payload.config.listenPort, 8765)
+
+    // 3. Add child peer
+    const addChildRes = await executeMemoCli(
+      ['node', 'add-child', 'http://127.0.0.1:8766', '--name', 'worker-1', '--json'],
+      { runtime, dbPath }
+    )
+    assert.equal(addChildRes.exitCode, 0)
+    const addChildPacket = decodeWire<{
+      peer: { url: string; role: string; name: string }
+    }>(addChildRes.stdout) as WireSuccess<{
+      peer: { url: string; role: string; name: string }
+    }>
+    assert.equal(addChildPacket.payload.peer.url, 'http://127.0.0.1:8766')
+    assert.equal(addChildPacket.payload.peer.role, 'child')
+    assert.equal(addChildPacket.payload.peer.name, 'worker-1')
+
+    // 4. Set parent peer (switches role to child)
+    const setParentRes = await executeMemoCli(
+      ['node', 'set-parent', 'http://127.0.0.1:9000', '--name', 'main-cloud', '--json'],
+      { runtime, dbPath }
+    )
+    assert.equal(setParentRes.exitCode, 0)
+    const setParentPacket = decodeWire<{
+      peer: { url: string; role: string }
+      config: { role: string }
+    }>(setParentRes.stdout) as WireSuccess<{
+      peer: { url: string; role: string }
+      config: { role: string }
+    }>
+    assert.equal(setParentPacket.payload.peer.url, 'http://127.0.0.1:9000')
+    assert.equal(setParentPacket.payload.peer.role, 'parent')
+    assert.equal(setParentPacket.payload.config.role, 'child')
+
+    // 5. Remove peer
+    const removeRes = await executeMemoCli(
+      ['node', 'remove', 'http://127.0.0.1:8766', '--json'],
+      { runtime, dbPath }
+    )
+    assert.equal(removeRes.exitCode, 0)
+    const removePacket = decodeWire<{ target: string; removed: boolean }>(
+      removeRes.stdout
+    ) as WireSuccess<{ target: string; removed: boolean }>
+    assert.equal(removePacket.payload.removed, true)
+
+    // 6. Disable node mode
+    const disableRes = await executeMemoCli(['node', 'disable', '--purge-peers', '--json'], {
+      runtime,
+      dbPath
+    })
+    assert.equal(disableRes.exitCode, 0)
+    const disablePacket = decodeWire<{
+      config: { enabled: boolean }
+      peers: unknown[]
+    }>(disableRes.stdout) as WireSuccess<{
+      config: { enabled: boolean }
+      peers: unknown[]
+    }>
+    assert.equal(disablePacket.payload.config.enabled, false)
+    assert.equal(disablePacket.payload.peers.length, 0)
+  })
+
+  it('executes CLI sync command against peer and all-peers', async () => {
+    // 1. Sync fails when node is disabled and no --url is given
+    const syncFailRes = await executeMemoCli(['sync', '--json'], { runtime, dbPath })
+    assert.equal(syncFailRes.exitCode, 1)
+
+    // 2. Start an isolated parent node sync server
+    const parentDb = path.join(tmpDir, 'parent-vault.sqlite')
+    const parentVault = new MemoryVault({ dbPath: parentDb, runtime })
+    parentVault.enableNodeMode({ role: 'parent', listenPort: 0 })
+    parentVault.storeMemory({
+      content: 'Parent node memory to synchronize downstream.',
+      category: 'decision',
+      title: 'Sync Decision',
+      projectId: 'sync-proj'
+    })
+
+    const serverHandle = await startSyncServer(parentVault, {
+      host: '127.0.0.1',
+      port: 0,
+      enableUdpDiscovery: false
+    })
+    const parentUrl = `http://127.0.0.1:${serverHandle.port}`
+
+    try {
+      // 3. Child vault synchronizes via --url
+      const childDb = path.join(tmpDir, 'child-vault.sqlite')
+      const syncRes = await executeMemoCli(
+        ['sync', '--url', parentUrl, '--project', 'sync-proj', '--json'],
+        { runtime, dbPath: childDb }
+      )
+      assert.equal(syncRes.exitCode, 0)
+      const syncPacket = decodeWire<{
+        peerUrl: string
+        pulled: { memoriesCreated: number }
+      }>(syncRes.stdout) as WireSuccess<{
+        peerUrl: string
+        pulled: { memoriesCreated: number }
+      }>
+      assert.equal(syncPacket.action, 'sync')
+      assert.equal(syncPacket.payload.pulled.memoriesCreated, 1)
+
+      // Verify memory was pulled into child vault
+      const childVault = new MemoryVault({ dbPath: childDb, runtime })
+      try {
+        const briefing = childVault.getProjectBriefing({ projectId: 'sync-proj' })
+        assert.equal(briefing.memories.length, 1)
+        assert.equal(briefing.memories[0]?.title, 'Sync Decision')
+      } finally {
+        childVault.close()
+      }
+    } finally {
+      await serverHandle.close()
+      parentVault.close()
+    }
+  })
+
+  it('handles MCP memory_export, memory_import, and memory_sync with auto-sync triggers', async () => {
+    const vault = new MemoryVault({ dbPath, runtime })
+    try {
+      vault.storeMemory({
+        content: 'MCP export test memory content.',
+        category: 'domain',
+        title: 'MCP Export',
+        projectId: 'mcp-export-proj'
+      })
+
+      // 1. memory_export (in-memory without filePath)
+      const expRes = (await handleMcpRequest(vault, {
+        jsonrpc: '2.0',
+        id: 101,
+        method: 'tools/call',
+        params: {
+          name: 'memory_export',
+          arguments: {
+            projectId: 'mcp-export-proj'
+          }
+        }
+      })) as { result: { content: Array<{ type: string; text: string }> } }
+      const expPayload = JSON.parse(expRes.result.content[0]!.text) as {
+        checksum: string
+        memoryCount: number
+        snapshot: { format: string }
+      }
+      assert.ok(expPayload.checksum)
+      assert.equal(expPayload.memoryCount, 1)
+      assert.equal(expPayload.snapshot.format, 'memoseb-snapshot')
+
+      // 2. memory_export (written to filePath)
+      const mcpExportFile = path.join(tmpDir, 'mcp-snapshot.json')
+      const expFileRes = (await handleMcpRequest(vault, {
+        jsonrpc: '2.0',
+        id: 102,
+        method: 'tools/call',
+        params: {
+          name: 'memory_export',
+          arguments: {
+            filePath: mcpExportFile,
+            projectId: 'mcp-export-proj'
+          }
+        }
+      })) as { result: { content: Array<{ type: string; text: string }> } }
+      const expFilePayload = JSON.parse(expFileRes.result.content[0]!.text) as {
+        filePath: string
+        checksum: string
+        memoryCount: number
+      }
+      assert.equal(fs.existsSync(mcpExportFile), true)
+      assert.equal(expFilePayload.memoryCount, 1)
+
+      // 3. memory_import into another vault
+      const targetVaultDb = path.join(tmpDir, 'mcp-target-vault.sqlite')
+      const targetVault = new MemoryVault({ dbPath: targetVaultDb, runtime })
+      try {
+        const impRes = (await handleMcpRequest(targetVault, {
+          jsonrpc: '2.0',
+          id: 103,
+          method: 'tools/call',
+          params: {
+            name: 'memory_import',
+            arguments: {
+              filePath: mcpExportFile,
+              strategy: 'merge'
+            }
+          }
+        })) as { result: { content: Array<{ type: string; text: string }> } }
+        const impPayload = JSON.parse(impRes.result.content[0]!.text) as {
+          strategy: string
+          memoriesCreated: number
+        }
+        assert.equal(impPayload.strategy, 'merge')
+        assert.equal(impPayload.memoriesCreated, 1)
+      } finally {
+        targetVault.close()
+      }
+
+      // 4. memory_sync with disabled node returns error
+      const syncDisabledRes = (await handleMcpRequest(vault, {
+        jsonrpc: '2.0',
+        id: 104,
+        method: 'tools/call',
+        params: {
+          name: 'memory_sync',
+          arguments: {}
+        }
+      })) as { result: { isError: boolean } }
+      assert.equal(syncDisabledRes.result.isError, true)
+    } finally {
+      vault.close()
+    }
   })
 })

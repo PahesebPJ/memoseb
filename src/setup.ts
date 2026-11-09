@@ -17,7 +17,14 @@ import { BUNDLE_ID as VERSION_BUNDLE_ID, PACKAGE_ROOT, VERSION } from './version
 export const BUNDLE_ID = VERSION_BUNDLE_ID
 export const PROVIDES = ['memory.vault']
 export const CONSUMES: string[] = []
-export const SIGNALS = ['memory.stored', 'memory.forgotten', 'memoseb.deployed']
+export const SIGNALS = [
+  'memory.stored',
+  'memory.forgotten',
+  'memory.exported',
+  'memory.imported',
+  'memory.synced',
+  'memoseb.deployed',
+]
 
 export const RULES_FILE = path.join(PACKAGE_ROOT, 'rules', 'RULES.md')
 export const ANTIGRAVITY_RULES_FILE = path.join(PACKAGE_ROOT, 'rules', 'antigravity.md')
