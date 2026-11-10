@@ -34,6 +34,12 @@ import {
   type ImportResult,
   type VaultSnapshotV1
 } from './snapshot.ts'
+import {
+  firstIpv4,
+  isTailscaleIpv4,
+  localTailscaleIpv4,
+  type TailscaleStatus
+} from './tailscale.ts'
 import type { MemoryRecord, VaultStats } from './vault.ts'
 
 export const DISCOVERY_MAGIC_REQUEST = 'MEMOSEB_DISCOVER_V1' as const
@@ -96,6 +102,7 @@ export interface SyncCapableVault {
     }
   ): SnapshotImportResult
   getStats(): VaultStats
+  getDataVersion?(): number
   upsertGroup?(input: {
     name: string
     description?: string
@@ -233,6 +240,61 @@ export function getLocalLanUrls(port: number): string[] {
   }
 
   return Array.from(new Set(urls))
+}
+
+export function isLoopbackHost(host: string | null | undefined): boolean {
+  if (!host) return false
+  const h = host.trim().toLowerCase().replace(/^\[|\]$/g, '')
+  return h === 'localhost' || h === '::1' || /^127\.\d+\.\d+\.\d+$/.test(h)
+}
+
+/**
+ * URL por la que un peer puede devolvernos la llamada: loopback si el peer es
+ * local, si no la IPv4 de Tailscale (preferida) o la primera IPv4 de LAN.
+ * Devuelve undefined si el nodo solo escucha en loopback y el peer es remoto.
+ */
+export function resolveCallbackUrl(
+  peerUrl: string,
+  options: {
+    port: number
+    listenHost?: string | null
+    interfaces?: NodeJS.Dict<os.NetworkInterfaceInfo[]>
+  }
+): string | undefined {
+  let peerHost: string
+  try {
+    peerHost = new URL(peerUrl).hostname
+  } catch {
+    return undefined
+  }
+  const listenHost = options.listenHost?.trim() || '0.0.0.0'
+  const isWildcard = listenHost === '0.0.0.0' || listenHost === '::'
+
+  if (isLoopbackHost(peerHost)) {
+    if (isWildcard || isLoopbackHost(listenHost)) {
+      return `http://127.0.0.1:${options.port}`
+    }
+    return `http://${listenHost}:${options.port}`
+  }
+  if (isLoopbackHost(listenHost)) {
+    return undefined
+  }
+  if (!isWildcard) {
+    return `http://${listenHost}:${options.port}`
+  }
+  const interfaces = options.interfaces ?? os.networkInterfaces()
+  const tailscaleIp = localTailscaleIpv4(interfaces)
+  if (tailscaleIp) {
+    return `http://${tailscaleIp}:${options.port}`
+  }
+  for (const list of Object.values(interfaces)) {
+    for (const info of list ?? []) {
+      if (info.family === 'IPv4' && !info.internal && info.address) {
+        return `http://${info.address}:${options.port}`
+      }
+    }
+  }
+  return undefined
 }
 
 export function verifyAuthToken(
@@ -485,6 +547,140 @@ export async function discoverLanNodes(options?: {
 
 export const discoverLanParents = discoverLanNodes
 
+/**
+ * Sondea por HTTP unicast GET /api/v1/p2p/status en cada host. Solo devuelve
+ * nodos que responden ok, anuncian p2p-memory-contract y no son el propio nodo.
+ */
+export async function probeP2PNodes(
+  hosts: readonly string[],
+  options: {
+    port: number
+    token?: string | null
+    selfNodeId?: string
+    timeoutMs?: number
+    concurrency?: number
+  }
+): Promise<DiscoveredLanNode[]> {
+  const unique = Array.from(new Set(hosts.filter((h) => h.trim().length > 0)))
+  const found = new Map<string, DiscoveredLanNode>()
+  const concurrency = Math.max(1, options.concurrency ?? 8)
+  let cursor = 0
+
+  const probeOne = async (host: string) => {
+    const hostPart = host.includes(':') ? `[${host}]` : host
+    const url = `http://${hostPart}:${options.port}`
+    try {
+      const res = await sendJsonRequest<any>(`${url}/api/v1/p2p/status`, {
+        method: 'GET',
+        token: options.token ?? null,
+        timeoutMs: options.timeoutMs ?? 2000
+      })
+      const data = unwrapP2PEnvelope(res) as any
+      const nodeId = typeof data?.nodeId === 'string' ? data.nodeId : null
+      const contracts: string[] = Array.isArray(data?.supportedContracts)
+        ? data.supportedContracts.filter((c: unknown) => typeof c === 'string')
+        : []
+      if (
+        data?.ok !== true ||
+        !nodeId ||
+        nodeId === options.selfNodeId ||
+        !contracts.includes('p2p-memory-contract')
+      ) {
+        return
+      }
+      if (found.has(nodeId)) return
+      found.set(nodeId, {
+        nodeId,
+        nodeName: typeof data.nodeName === 'string' && data.nodeName ? data.nodeName : host,
+        role: 'peer',
+        port: options.port,
+        urls: [url],
+        address: host,
+        requiresAuth: Boolean(options.token),
+        app: typeof data.app === 'string' ? data.app : undefined,
+        contracts
+      })
+    } catch {
+      // Host caído, sin memoseb/gaze o token rechazado: se ignora
+    }
+  }
+
+  const workers = Array.from({ length: Math.min(concurrency, unique.length) }, async () => {
+    while (cursor < unique.length) {
+      const host = unique[cursor++]!
+      await probeOne(host)
+    }
+  })
+  await Promise.all(workers)
+  return Array.from(found.values())
+}
+
+/**
+ * Descubrimiento unicast por Tailscale: sondea la primera IPv4 de cada peer en
+ * línea del tailnet. Con Tailscale ausente o sin Running no hay nada que sondear.
+ */
+export async function discoverTailnetNodes(
+  status: TailscaleStatus | null,
+  options: {
+    port: number
+    token?: string | null
+    selfNodeId?: string
+    timeoutMs?: number
+  }
+): Promise<DiscoveredLanNode[]> {
+  if (!status || status.backendState !== 'Running') {
+    return []
+  }
+  const selfIps = new Set(status.selfIps)
+  const hosts: string[] = []
+  for (const peer of status.peers) {
+    if (!peer.online) continue
+    const ip = firstIpv4(peer.ips)
+    if (ip && !selfIps.has(ip) && isTailscaleIpv4(ip)) {
+      hosts.push(ip)
+    }
+  }
+  return probeP2PNodes(hosts, options)
+}
+
+/**
+ * Registra como peers los nodos descubiertos que aún no se conocen (por
+ * nodeId o URL). Devuelve solo los registrados en esta llamada.
+ */
+export function registerDiscoveredPeers(
+  vault: SyncCapableVault,
+  nodes: readonly DiscoveredLanNode[]
+): SyncPeerRecord[] {
+  const config = vault.getNodeConfig()
+  const known = vault.listPeers()
+  const registered: SyncPeerRecord[] = []
+  for (const node of nodes) {
+    if (node.role !== 'peer' || node.nodeId === config.nodeId) continue
+    if (node.contracts && !node.contracts.includes('p2p-memory-contract')) continue
+    const rawUrl = node.urls[0] ?? `http://${node.address}:${node.port}`
+    let url: string
+    try {
+      url = normalizePeerUrl(rawUrl)
+    } catch {
+      continue
+    }
+    const exists = known.some(
+      (p) => p.url === url || (p.peerNodeId !== null && p.peerNodeId === node.nodeId)
+    )
+    if (exists) continue
+    const peer = vault.upsertPeer({
+      role: 'peer',
+      url,
+      name: node.nodeName,
+      peerNodeId: node.nodeId,
+      lastStatus: 'discovered'
+    })
+    known.push(peer)
+    registered.push(peer)
+  }
+  return registered
+}
+
 export async function startSyncServer(
   vault: SyncCapableVault,
   options?: {
@@ -493,6 +689,7 @@ export async function startSyncServer(
     token?: string | null
     enableUdpDiscovery?: boolean
     udpPort?: number
+    onImported?: (result: SnapshotImportResult) => void
   }
 ): Promise<SyncServerHandle> {
   const initialConfig = vault.getNodeConfig()
@@ -545,13 +742,22 @@ export async function startSyncServer(
       if (providedToken && vault.findGroupByToken) {
         matchedGroup = vault.findGroupByToken(providedToken) ?? null
       }
-      const isGlobalTokenValid = verifyAuthToken(expectedToken, providedToken)
+      // Un nodo peer expuesto fuera de loopback nunca atiende sin token global.
+      const tokenRequired =
+        !expectedToken &&
+        currentConfig.role === 'peer' &&
+        !isLoopbackHost(listenHost)
+      const isGlobalTokenValid = tokenRequired
+        ? false
+        : verifyAuthToken(expectedToken, providedToken)
 
       if (!isGlobalTokenValid && !matchedGroup) {
         sendJson(401, {
           ok: false,
-          error: 'UNAUTHORIZED',
-          message: 'Invalid or missing sync token.'
+          error: tokenRequired ? 'TOKEN_REQUIRED' : 'UNAUTHORIZED',
+          message: tokenRequired
+            ? 'This peer node has no sync token configured; refusing unauthenticated access. Configure one with "memoseb node enable --role peer --token <t>".'
+            : 'Invalid or missing sync token.'
         })
         return
       }
@@ -883,6 +1089,13 @@ export async function startSyncServer(
           })
           if (incomingDroppedMemories > 0) {
             appliedOnServer.memoriesSkipped += incomingDroppedMemories
+          }
+          if (options?.onImported) {
+            try {
+              options.onImported(appliedOnServer)
+            } catch {
+              // El aviso de importación nunca rompe el intercambio
+            }
           }
 
           const rawServerDelta = vault.exportSnapshot({
@@ -1221,6 +1434,7 @@ export async function syncWithPeer(
     forceWhenDisabled?: boolean
     timeoutMs?: number
     contract?: 'memoseb' | 'p2p' | 'gaze'
+    callbackUrl?: string
   }
 ): Promise<PeerSyncResult> {
   const config = vault.getNodeConfig()
@@ -1239,13 +1453,17 @@ export async function syncWithPeer(
       p.peerNodeId === options.peerUrl
   )
 
-  const effectiveToken =
-    options.token !== undefined
-      ? options.token
-      : (existingPeer?.authToken ?? null)
   const peerRole = normalizePeerRole(
     options.peerRole ?? existingPeer?.role ?? 'parent'
   )
+  // Una malla p2p comparte un único token global: los peers registrados por
+  // descubrimiento o por callbackUrl no guardan token propio.
+  const effectiveToken =
+    options.token !== undefined
+      ? options.token
+      : (existingPeer?.authToken ??
+        (peerRole === 'peer' ? config.authToken : null) ??
+        null)
   const since = options.full ? undefined : (existingPeer?.lastSyncAt ?? undefined)
 
   try {
@@ -1311,7 +1529,7 @@ export async function syncWithPeer(
       clientNodeId: config.nodeId,
       clientName: config.nodeName,
       clientRole: myRole,
-      callbackUrl: undefined,
+      callbackUrl: options.callbackUrl,
       since: since ?? null,
       projectId: options.projectId ?? null,
       delta: payloadToSend,
@@ -1450,6 +1668,7 @@ export async function syncAllPeers(
     full?: boolean
     token?: string | null
     timeoutMs?: number
+    callbackUrl?: string | ((peerUrl: string) => string | undefined)
   }
 ): Promise<SyncSummaryResult> {
   const config = vault.getNodeConfig()
@@ -1478,6 +1697,10 @@ export async function syncAllPeers(
 
   const results: PeerSyncResult[] = []
   const errors: SyncPeerError[] = []
+  const callbackFor = (peerUrl: string): string | undefined =>
+    typeof options?.callbackUrl === 'function'
+      ? options.callbackUrl(peerUrl)
+      : options?.callbackUrl
 
   // Pass 1: Bi-directional synchronization across all target peers
   for (const peer of targetPeers) {
@@ -1485,10 +1708,11 @@ export async function syncAllPeers(
       const res = await syncWithPeer(vault, {
         peerUrl: peer.url,
         peerRole: peer.role,
-        token: options?.token !== undefined ? options.token : peer.authToken,
+        token: options?.token !== undefined ? options.token : (peer.authToken ?? undefined),
         projectId: options?.projectId,
         full: options?.full,
-        timeoutMs: options?.timeoutMs
+        timeoutMs: options?.timeoutMs,
+        callbackUrl: callbackFor(peer.url)
       })
       results.push(res)
     } catch (err: any) {
@@ -1511,10 +1735,11 @@ export async function syncAllPeers(
         const propResult = await syncWithPeer(vault, {
           peerUrl: peer.url,
           peerRole: peer.role,
-          token: options?.token !== undefined ? options.token : peer.authToken,
+          token: options?.token !== undefined ? options.token : (peer.authToken ?? undefined),
           projectId: options?.projectId,
           full: true,
-          timeoutMs: options?.timeoutMs
+          timeoutMs: options?.timeoutMs,
+          callbackUrl: callbackFor(peer.url)
         })
 
         const prevIdx = results.findIndex((r) => r.peerUrl === peer.url)

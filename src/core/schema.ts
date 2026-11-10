@@ -25,7 +25,12 @@ export interface NodeConfiguration {
   autoSync: boolean
   lanDiscovery: boolean
   unassignedGroupPolicy?: UnassignedGroupPolicy
+  syncIntervalMinutes?: number
+  tailscaleDiscovery?: boolean
+  tailscaleBin?: string | null
 }
+
+export const DEFAULT_SYNC_INTERVAL_MINUTES = 5
 
 export interface SyncPeerRecord {
   id: string

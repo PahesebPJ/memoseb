@@ -9,9 +9,14 @@ import type { NodeConfiguration, NodeRole, PeerRole, SyncPeerRecord } from '../s
 import {
   discoverLanNodes,
   discoverLanParents,
+  discoverTailnetNodes,
   getLocalLanUrls,
+  isLoopbackHost,
   normalizePeerUrl,
   performPeerHandshake,
+  probeP2PNodes,
+  registerDiscoveredPeers,
+  resolveCallbackUrl,
   startSyncServer,
   syncAllPeers,
   syncWithPeer,
@@ -33,6 +38,14 @@ import {
   type P2PSyncPayloadV1
 } from '../src/core/p2p-contract.ts'
 import { MemoryVault, type VaultStats } from '../src/core/vault.ts'
+import { discoverPeers, startAutoSyncLoop } from '../src/core/auto-sync.ts'
+import {
+  isTailscaleIpv4,
+  locateTailscaleBinary,
+  parseTailscaleStatus,
+  probeTailscale,
+  tailscaleFallbackPaths
+} from '../src/core/tailscale.ts'
 
 class MockSyncVault implements SyncCapableVault {
   nodeConfig: NodeConfiguration
@@ -1275,6 +1288,531 @@ describe('Sync Engine: Direct HTTP Exchange with Simulated Gaze P2P Client & Gro
         vault.close()
       }
     } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true })
+    }
+  })
+})
+
+async function waitFor(
+  predicate: () => boolean,
+  timeoutMs = 8000,
+  stepMs = 50
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (predicate()) return
+    await new Promise((r) => setTimeout(r, stepMs))
+  }
+  assert.fail(`condition not met within ${timeoutMs}ms`)
+}
+
+function fakeTailscaleRuntime(input: {
+  platform?: NodeJS.Platform
+  env?: NodeJS.ProcessEnv
+  stdout?: string
+  exitCode?: number
+  throws?: boolean
+}) {
+  const calls: Array<{ executable: string; args: readonly string[] }> = []
+  return {
+    calls,
+    runtime: {
+      platform: input.platform ?? 'darwin',
+      env: input.env ?? {},
+      execProcess: async (executable: string, args: readonly string[] = []) => {
+        calls.push({ executable, args })
+        if (input.throws) throw new Error('spawn ENOENT')
+        return { exitCode: input.exitCode ?? 0, stdout: input.stdout ?? '', stderr: '' }
+      }
+    }
+  }
+}
+
+const RUNNING_STATUS = {
+  BackendState: 'Running',
+  TailscaleIPs: ['100.101.1.1', 'fd7a:115c:a1e0::1'],
+  Self: { HostName: 'mac', TailscaleIPs: ['100.101.1.1'] },
+  Peer: {
+    'nodekey:a': {
+      HostName: 'win-a',
+      DNSName: 'win-a.tail1234.ts.net.',
+      OS: 'windows',
+      TailscaleIPs: ['100.101.2.2', 'fd7a:115c:a1e0::2'],
+      Online: true
+    },
+    'nodekey:b': {
+      HostName: 'win-b',
+      DNSName: 'win-b.tail1234.ts.net.',
+      OS: 'windows',
+      TailscaleIPs: ['100.101.3.3'],
+      Online: false
+    }
+  }
+}
+
+describe('Sync Engine: Tailscale Discovery, Callback URL, Token Policy and Auto-Sync Loop', () => {
+  it('parses tailscale status --json and locates the binary per platform', () => {
+    const status = parseTailscaleStatus(RUNNING_STATUS)
+    assert.equal(status.backendState, 'Running')
+    assert.deepEqual(status.selfIps, ['100.101.1.1', 'fd7a:115c:a1e0::1'])
+    assert.equal(status.peers.length, 2)
+    assert.equal(status.peers[0]?.dnsName, 'win-a.tail1234.ts.net')
+    assert.equal(status.peers[1]?.online, false)
+
+    assert.equal(isTailscaleIpv4('100.64.0.1'), true)
+    assert.equal(isTailscaleIpv4('100.127.255.255'), true)
+    assert.equal(isTailscaleIpv4('100.128.0.1'), false)
+    assert.equal(isTailscaleIpv4('192.168.1.10'), false)
+
+    const exists = (set: string[]) => (p: string) => set.includes(p)
+    assert.equal(
+      locateTailscaleBinary({ platform: 'darwin', env: {} }, '/custom/tailscale', exists(['/custom/tailscale'])),
+      '/custom/tailscale'
+    )
+    assert.equal(
+      locateTailscaleBinary({ platform: 'darwin', env: {} }, '/missing', exists([])),
+      null
+    )
+    assert.equal(
+      locateTailscaleBinary(
+        { platform: 'darwin', env: { PATH: '/usr/bin:/bin' } },
+        null,
+        exists(['/bin/tailscale', '/opt/homebrew/bin/tailscale'])
+      ),
+      '/bin/tailscale'
+    )
+    assert.equal(
+      locateTailscaleBinary(
+        { platform: 'darwin', env: {} },
+        null,
+        exists(['/usr/local/bin/tailscale', '/Applications/Tailscale.app/Contents/MacOS/Tailscale'])
+      ),
+      '/usr/local/bin/tailscale'
+    )
+    assert.equal(
+      locateTailscaleBinary(
+        { platform: 'darwin', env: {} },
+        null,
+        exists(['/Applications/Tailscale.app/Contents/MacOS/Tailscale'])
+      ),
+      '/Applications/Tailscale.app/Contents/MacOS/Tailscale'
+    )
+    assert.equal(
+      locateTailscaleBinary(
+        { platform: 'win32', env: { PATH: 'C:\\Windows;C:\\Tools' } },
+        null,
+        exists(['C:\\Tools\\tailscale.exe', 'C:\\Program Files\\Tailscale\\tailscale.exe'])
+      ),
+      'C:\\Tools\\tailscale.exe'
+    )
+    assert.equal(
+      locateTailscaleBinary(
+        { platform: 'win32', env: { PATH: 'C:\\Windows' } },
+        null,
+        exists(['C:\\Program Files\\Tailscale\\tailscale.exe'])
+      ),
+      'C:\\Program Files\\Tailscale\\tailscale.exe'
+    )
+    assert.ok(tailscaleFallbackPaths('linux').includes('/usr/bin/tailscale'))
+  })
+
+  it('degrades gracefully when Tailscale is absent, not Running or failing', async () => {
+    const absent = fakeTailscaleRuntime({})
+    const resAbsent = await probeTailscale(absent.runtime, { isExecutable: () => false })
+    assert.equal(resAbsent.state, 'absent')
+    assert.equal(absent.calls.length, 0)
+
+    const needsLogin = fakeTailscaleRuntime({
+      stdout: JSON.stringify({ BackendState: 'NeedsLogin', Peer: {} })
+    })
+    const resNeeds = await probeTailscale(needsLogin.runtime, {
+      binary: '/opt/homebrew/bin/tailscale',
+      isExecutable: () => true
+    })
+    assert.equal(resNeeds.state, 'not-running')
+    assert.deepEqual(needsLogin.calls[0]?.args, ['status', '--json'])
+
+    const broken = fakeTailscaleRuntime({ throws: true })
+    const resBroken = await probeTailscale(broken.runtime, {
+      binary: '/opt/homebrew/bin/tailscale',
+      isExecutable: () => true
+    })
+    assert.equal(resBroken.state, 'error')
+
+    const running = fakeTailscaleRuntime({ stdout: JSON.stringify(RUNNING_STATUS) })
+    const resRunning = await probeTailscale(running.runtime, {
+      binary: '/opt/homebrew/bin/tailscale',
+      isExecutable: () => true
+    })
+    assert.equal(resRunning.state, 'running')
+
+    assert.deepEqual(await discoverTailnetNodes(null, { port: 7432 }), [])
+    assert.deepEqual(
+      await discoverTailnetNodes(
+        { backendState: 'NeedsLogin', selfIps: [], selfHostName: '', peers: [] },
+        { port: 7432 }
+      ),
+      []
+    )
+    const onlySelfAndOffline = parseTailscaleStatus({
+      ...RUNNING_STATUS,
+      Peer: {
+        'nodekey:b': RUNNING_STATUS.Peer['nodekey:b'],
+        'nodekey:self': { HostName: 'mac', TailscaleIPs: ['100.101.1.1'], Online: true }
+      }
+    })
+    assert.deepEqual(await discoverTailnetNodes(onlySelfAndOffline, { port: 7432 }), [])
+
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'memoseb-ts-absent-'))
+    const vault = new MemoryVault({ dbPath: path.join(tmpDir, 'vault.db') })
+    try {
+      vault.enableNodeMode({ role: 'peer', authToken: 'tok' })
+      const result = await discoverPeers(vault, needsLogin.runtime, {
+        port: 7432,
+        lan: false,
+        probeTailscale: async () => ({ state: 'not-running', binary: '/x', backendState: 'NeedsLogin' })
+      })
+      assert.equal(result.tailscale, 'not-running')
+      assert.deepEqual(result.nodes, [])
+    } finally {
+      vault.close()
+      fs.rmSync(tmpDir, { recursive: true, force: true })
+    }
+  })
+
+  it('probes p2p status over unicast with auth and auto-registers valid peers', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'memoseb-ts-probe-'))
+    const vaultA = new MemoryVault({ dbPath: path.join(tmpDir, 'a.db') })
+    const vaultB = new MemoryVault({ dbPath: path.join(tmpDir, 'b.db') })
+    const token = 'shared-tailnet-token'
+    try {
+      vaultA.enableNodeMode({ role: 'peer', nodeName: 'Node A', authToken: token })
+      vaultB.enableNodeMode({ role: 'peer', nodeName: 'Node B', authToken: token })
+      const serverB = await startSyncServer(vaultB, {
+        host: '127.0.0.1',
+        port: 0,
+        enableUdpDiscovery: false
+      })
+      try {
+        const denied = await probeP2PNodes(['127.0.0.1'], {
+          port: serverB.port,
+          token: 'wrong-token'
+        })
+        assert.deepEqual(denied, [])
+
+        const self = await probeP2PNodes(['127.0.0.1'], {
+          port: serverB.port,
+          token,
+          selfNodeId: vaultB.getNodeId()
+        })
+        assert.deepEqual(self, [])
+
+        const found = await probeP2PNodes(['127.0.0.1', '127.0.0.1'], {
+          port: serverB.port,
+          token
+        })
+        assert.equal(found.length, 1)
+        assert.equal(found[0]?.nodeId, vaultB.getNodeId())
+        assert.equal(found[0]?.nodeName, 'Node B')
+        assert.equal(found[0]?.urls[0], `http://127.0.0.1:${serverB.port}`)
+
+        const registered = registerDiscoveredPeers(vaultA, found)
+        assert.equal(registered.length, 1)
+        assert.equal(registered[0]?.peerNodeId, vaultB.getNodeId())
+        assert.equal(registered[0]?.lastStatus, 'discovered')
+        assert.equal(registerDiscoveredPeers(vaultA, found).length, 0)
+        assert.equal(
+          registerDiscoveredPeers(vaultA, [
+            { ...found[0]!, urls: [`http://localhost:${serverB.port}`] }
+          ]).length,
+          0
+        )
+        assert.equal(vaultA.listPeers().length, 1)
+
+        vaultB.storeMemory({
+          projectId: 'den',
+          category: 'convention',
+          content: 'Discovered peers sync with the shared global token.'
+        })
+        const summary = await syncAllPeers(vaultA)
+        assert.equal(summary.errors.length, 0)
+        assert.equal(summary.results[0]?.pulled.memoriesCreated, 1)
+      } finally {
+        await serverB.close()
+      }
+    } finally {
+      vaultA.close()
+      vaultB.close()
+      fs.rmSync(tmpDir, { recursive: true, force: true })
+    }
+  })
+
+  it('resolves the callback URL preferring loopback for local peers and Tailscale for remote ones', () => {
+    const interfaces = {
+      lo0: [{ address: '127.0.0.1', family: 'IPv4', internal: true } as os.NetworkInterfaceInfo],
+      en0: [{ address: '192.168.1.20', family: 'IPv4', internal: false } as os.NetworkInterfaceInfo],
+      utun4: [{ address: '100.101.1.1', family: 'IPv4', internal: false } as os.NetworkInterfaceInfo]
+    }
+    assert.equal(
+      resolveCallbackUrl('http://127.0.0.1:7433', { port: 7432, interfaces }),
+      'http://127.0.0.1:7432'
+    )
+    assert.equal(
+      resolveCallbackUrl('http://100.101.2.2:7432', { port: 7432, interfaces }),
+      'http://100.101.1.1:7432'
+    )
+    assert.equal(
+      resolveCallbackUrl('http://192.168.1.30:7432', {
+        port: 7432,
+        interfaces: { en0: interfaces.en0 }
+      }),
+      'http://192.168.1.20:7432'
+    )
+    assert.equal(
+      resolveCallbackUrl('http://100.101.2.2:7432', {
+        port: 7432,
+        listenHost: '127.0.0.1',
+        interfaces
+      }),
+      undefined
+    )
+    assert.equal(
+      resolveCallbackUrl('http://100.101.2.2:7432', {
+        port: 7432,
+        listenHost: '100.101.1.1',
+        interfaces
+      }),
+      'http://100.101.1.1:7432'
+    )
+    assert.equal(isLoopbackHost('localhost'), true)
+    assert.equal(isLoopbackHost('[::1]'), true)
+    assert.equal(isLoopbackHost('0.0.0.0'), false)
+  })
+
+  it('sends callbackUrl on exchange so the server registers the client peer automatically', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'memoseb-callback-'))
+    const vaultA = new MemoryVault({ dbPath: path.join(tmpDir, 'a.db') })
+    const vaultB = new MemoryVault({ dbPath: path.join(tmpDir, 'b.db') })
+    const token = 'callback-token'
+    try {
+      vaultA.enableNodeMode({ role: 'peer', nodeName: 'Node A', authToken: token })
+      vaultB.enableNodeMode({ role: 'peer', nodeName: 'Node B', authToken: token })
+      const serverA = await startSyncServer(vaultA, { host: '127.0.0.1', port: 0, enableUdpDiscovery: false })
+      const serverB = await startSyncServer(vaultB, { host: '127.0.0.1', port: 0, enableUdpDiscovery: false })
+      try {
+        vaultA.upsertPeer({ role: 'peer', url: `http://127.0.0.1:${serverB.port}` })
+        const callbackA = `http://127.0.0.1:${serverA.port}`
+        const summary = await syncAllPeers(vaultA, {
+          callbackUrl: (peerUrl) => resolveCallbackUrl(peerUrl, { port: serverA.port })
+        })
+        assert.equal(summary.errors.length, 0)
+
+        const inbound = vaultB.listPeers().find((p) => p.url === callbackA)
+        assert.ok(inbound, 'server B registered node A from callbackUrl')
+        assert.equal(inbound.peerNodeId, vaultA.getNodeId())
+        assert.equal(inbound.authToken, null)
+
+        await new Promise((r) => setTimeout(r, 5))
+        vaultA.storeMemory({
+          projectId: 'den',
+          category: 'decision',
+          content: 'Inbound peers are reachable back through their callback URL.'
+        })
+        const reverse = await syncAllPeers(vaultB)
+        assert.equal(reverse.errors.length, 0)
+        assert.equal(reverse.results[0]?.pulled.memoriesCreated, 1)
+      } finally {
+        await serverA.close()
+        await serverB.close()
+      }
+    } finally {
+      vaultA.close()
+      vaultB.close()
+      fs.rmSync(tmpDir, { recursive: true, force: true })
+    }
+  })
+
+  it('refuses unauthenticated access to a peer node bound outside loopback', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'memoseb-token-policy-'))
+    const vault = new MemoryVault({ dbPath: path.join(tmpDir, 'vault.db') })
+    try {
+      vault.enableNodeMode({ role: 'peer' })
+      const exposed = await startSyncServer(vault, {
+        host: '0.0.0.0',
+        port: 0,
+        enableUdpDiscovery: false,
+        token: null
+      })
+      try {
+        const res = await fetch(`http://127.0.0.1:${exposed.port}/api/v1/p2p/status`)
+        assert.equal(res.status, 401)
+        assert.equal(((await res.json()) as any).error, 'TOKEN_REQUIRED')
+      } finally {
+        await exposed.close()
+      }
+
+      const local = await startSyncServer(vault, {
+        host: '127.0.0.1',
+        port: 0,
+        enableUdpDiscovery: false,
+        token: null
+      })
+      try {
+        const res = await fetch(`http://127.0.0.1:${local.port}/api/v1/p2p/status`)
+        assert.equal(res.status, 200)
+      } finally {
+        await local.close()
+      }
+
+      vault.updateNodeConfig({ authToken: 'exposed-token' })
+      const secured = await startSyncServer(vault, {
+        host: '0.0.0.0',
+        port: 0,
+        enableUdpDiscovery: false
+      })
+      try {
+        const res = await fetch(`http://127.0.0.1:${secured.port}/api/v1/p2p/status`, {
+          headers: { Authorization: 'Bearer exposed-token' }
+        })
+        assert.equal(res.status, 200)
+      } finally {
+        await secured.close()
+      }
+    } finally {
+      vault.close()
+      fs.rmSync(tmpDir, { recursive: true, force: true })
+    }
+  })
+
+  it('runs the auto-sync loop on startup, on local writes from other processes and on discovery', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'memoseb-autosync-loop-'))
+    const dbA = path.join(tmpDir, 'a.db')
+    const vaultA = new MemoryVault({ dbPath: dbA })
+    const vaultB = new MemoryVault({ dbPath: path.join(tmpDir, 'b.db') })
+    const vaultC = new MemoryVault({ dbPath: path.join(tmpDir, 'c.db') })
+    const token = 'loop-token'
+    const events: string[] = []
+    try {
+      for (const [v, name] of [[vaultA, 'A'], [vaultB, 'B'], [vaultC, 'C']] as const) {
+        v.enableNodeMode({ role: 'peer', nodeName: `Node ${name}`, authToken: token })
+      }
+      const serverB = await startSyncServer(vaultB, { host: '127.0.0.1', port: 0, enableUdpDiscovery: false })
+      const serverC = await startSyncServer(vaultC, { host: '127.0.0.1', port: 0, enableUdpDiscovery: false })
+      vaultA.upsertPeer({ role: 'peer', url: `http://127.0.0.1:${serverB.port}` })
+      vaultB.storeMemory({ projectId: 'den', category: 'domain', content: 'Present before the loop starts.' })
+
+      let announceC = false
+      const loop = startAutoSyncLoop(vaultA, {
+        intervalMs: 60_000,
+        discoveryIntervalMs: 100,
+        debounceMs: 100,
+        changePollMs: 50,
+        discover: async () =>
+          announceC ? probeP2PNodes(['127.0.0.1'], { port: serverC.port, token }) : [],
+        onEvent: (e) => events.push(e.reason)
+      })
+      try {
+        await waitFor(() => vaultA.recallMemories('loop starts', { projectId: 'den' }).memories.length === 1)
+        assert.ok(events.includes('startup'))
+
+        await new Promise((r) => setTimeout(r, 5))
+        const otherProcess = new MemoryVault({ dbPath: dbA })
+        otherProcess.storeMemory({
+          projectId: 'den',
+          category: 'convention',
+          content: 'Written by another process while serve is running.'
+        })
+        otherProcess.close()
+        await waitFor(() => events.includes('local-write'))
+        assert.equal(vaultB.getStats().memoryCount, 2)
+
+        announceC = true
+        await waitFor(() => vaultA.listPeers().some((p) => p.peerNodeId === vaultC.getNodeId()))
+        await waitFor(() => vaultC.getStats().memoryCount === 2)
+        assert.ok(events.includes('discovery'))
+      } finally {
+        await loop.close()
+        await serverB.close()
+        await serverC.close()
+      }
+      const countAfterClose = events.length
+      await new Promise((r) => setTimeout(r, 300))
+      assert.equal(events.length, countAfterClose, 'no sync runs after close()')
+    } finally {
+      vaultA.close()
+      vaultB.close()
+      vaultC.close()
+      fs.rmSync(tmpDir, { recursive: true, force: true })
+    }
+  })
+
+  it('syncs periodically on the configured interval', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'memoseb-autosync-interval-'))
+    const vaultA = new MemoryVault({ dbPath: path.join(tmpDir, 'a.db') })
+    const vaultB = new MemoryVault({ dbPath: path.join(tmpDir, 'b.db') })
+    const events: string[] = []
+    try {
+      vaultA.enableNodeMode({ role: 'peer', authToken: 'tok', syncIntervalMinutes: 7 })
+      vaultB.enableNodeMode({ role: 'peer', authToken: 'tok' })
+      assert.equal(vaultA.getNodeConfig().syncIntervalMinutes, 7)
+      assert.equal(vaultB.getNodeConfig().syncIntervalMinutes, 5)
+      const serverB = await startSyncServer(vaultB, { host: '127.0.0.1', port: 0, enableUdpDiscovery: false })
+      vaultA.upsertPeer({ role: 'peer', url: `http://127.0.0.1:${serverB.port}` })
+      const loop = startAutoSyncLoop(vaultA, {
+        intervalMs: 200,
+        changePollMs: 60_000,
+        onEvent: (e) => events.push(e.reason)
+      })
+      try {
+        await waitFor(() => events.includes('startup'))
+        await new Promise((r) => setTimeout(r, 5))
+        vaultB.storeMemory({ projectId: 'den', category: 'decision', content: 'Pulled by the periodic interval.' })
+        await waitFor(() => vaultA.recallMemories('periodic interval', { projectId: 'den' }).memories.length === 1)
+        assert.ok(events.includes('interval'))
+      } finally {
+        await loop.close()
+        await serverB.close()
+      }
+    } finally {
+      vaultA.close()
+      vaultB.close()
+      fs.rmSync(tmpDir, { recursive: true, force: true })
+    }
+  })
+
+  it('debounces bursts of changes and skips the loop when autoSync is disabled', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'memoseb-autosync-debounce-'))
+    const vault = new MemoryVault({ dbPath: path.join(tmpDir, 'a.db') })
+    const vaultB = new MemoryVault({ dbPath: path.join(tmpDir, 'b.db') })
+    const reasons: string[] = []
+    try {
+      vault.enableNodeMode({ role: 'peer', authToken: 'tok' })
+      vaultB.enableNodeMode({ role: 'peer', authToken: 'tok' })
+      const serverB = await startSyncServer(vaultB, { host: '127.0.0.1', port: 0, enableUdpDiscovery: false })
+      vault.upsertPeer({ role: 'peer', url: `http://127.0.0.1:${serverB.port}` })
+      const loop = startAutoSyncLoop(vault, {
+        intervalMs: 60_000,
+        debounceMs: 150,
+        changePollMs: 60_000,
+        onEvent: (e) => reasons.push(e.reason)
+      })
+      try {
+        await waitFor(() => reasons.includes('startup'))
+        for (let i = 0; i < 5; i++) loop.notifyChange('remote-import')
+        await waitFor(() => reasons.includes('remote-import'))
+        await new Promise((r) => setTimeout(r, 300))
+        assert.equal(reasons.filter((r) => r === 'remote-import').length, 1)
+
+        vault.updateNodeConfig({ autoSync: false })
+        await loop.syncNow('manual')
+        assert.equal(reasons.includes('manual'), false)
+      } finally {
+        await loop.close()
+        await serverB.close()
+      }
+    } finally {
+      vault.close()
+      vaultB.close()
       fs.rmSync(tmpDir, { recursive: true, force: true })
     }
   })

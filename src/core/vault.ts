@@ -15,6 +15,7 @@ import { detectProject, slugifyProjectId } from './project-detector.ts'
 import {
   isGroupPermissionMode,
   isMemoryCategory,
+  DEFAULT_SYNC_INTERVAL_MINUTES,
   isUnassignedGroupPolicy,
   normalizeNodeRole,
   normalizePeerRole,
@@ -850,6 +851,23 @@ export class MemoryVault {
     const unassignedGroupPolicy: UnassignedGroupPolicy =
       rawUnassigned === 'all' ? 'all' : 'none'
 
+    const rawInterval = Number(
+      meta.get('node.sync_interval_min') ??
+        this.runtime.env.MEMOSEB_SYNC_INTERVAL_MIN ??
+        process.env.MEMOSEB_SYNC_INTERVAL_MIN
+    )
+    const syncIntervalMinutes =
+      Number.isFinite(rawInterval) && rawInterval > 0
+        ? rawInterval
+        : DEFAULT_SYNC_INTERVAL_MINUTES
+
+    const rawTailscale = meta.get('node.tailscale_discovery')
+    const tailscaleDiscovery =
+      rawTailscale !== undefined ? rawTailscale === 'true' : true
+    const rawTailscaleBin = meta.get('node.tailscale_bin')?.trim()
+    const tailscaleBin =
+      rawTailscaleBin && rawTailscaleBin.length > 0 ? rawTailscaleBin : null
+
     return {
       nodeId,
       nodeName,
@@ -860,7 +878,10 @@ export class MemoryVault {
       authToken,
       autoSync,
       lanDiscovery,
-      unassignedGroupPolicy
+      unassignedGroupPolicy,
+      syncIntervalMinutes,
+      tailscaleDiscovery,
+      tailscaleBin
     }
   }
 
@@ -905,6 +926,25 @@ export class MemoryVault {
     if (patch.lanDiscovery !== undefined) {
       upsert.run('node.lan_discovery', String(patch.lanDiscovery), now)
     }
+    if (patch.syncIntervalMinutes !== undefined) {
+      if (
+        !Number.isFinite(patch.syncIntervalMinutes) ||
+        patch.syncIntervalMinutes <= 0
+      ) {
+        throw new Error('syncIntervalMinutes must be a positive number.')
+      }
+      upsert.run('node.sync_interval_min', String(patch.syncIntervalMinutes), now)
+    }
+    if (patch.tailscaleDiscovery !== undefined) {
+      upsert.run('node.tailscale_discovery', String(patch.tailscaleDiscovery), now)
+    }
+    if (patch.tailscaleBin !== undefined) {
+      if (patch.tailscaleBin === null || patch.tailscaleBin.trim() === '') {
+        del.run('node.tailscale_bin')
+      } else {
+        upsert.run('node.tailscale_bin', patch.tailscaleBin.trim(), now)
+      }
+    }
     if (patch.unassignedGroupPolicy !== undefined) {
       const policyVal: UnassignedGroupPolicy =
         patch.unassignedGroupPolicy === 'all' ? 'all' : 'none'
@@ -929,8 +969,20 @@ export class MemoryVault {
     authToken?: string | null
     autoSync?: boolean
     lanDiscovery?: boolean
+    syncIntervalMinutes?: number
+    tailscaleDiscovery?: boolean
+    tailscaleBin?: string | null
   }): NodeConfiguration {
     return this.updateNodeConfig({
+      ...(options.syncIntervalMinutes !== undefined
+        ? { syncIntervalMinutes: options.syncIntervalMinutes }
+        : {}),
+      ...(options.tailscaleDiscovery !== undefined
+        ? { tailscaleDiscovery: options.tailscaleDiscovery }
+        : {}),
+      ...(options.tailscaleBin !== undefined
+        ? { tailscaleBin: options.tailscaleBin }
+        : {}),
       enabled: true,
       role: normalizeNodeRole(options.role),
       ...(options.nodeName !== undefined ? { nodeName: options.nodeName } : {}),
@@ -2256,6 +2308,17 @@ export class MemoryVault {
       vectorCount: Number(vectorRow.cnt),
       totalTokens: Number(memoryRow.tokens)
     }
+  }
+
+  /**
+   * PRAGMA data_version: cambia cuando otra conexión (otro proceso de CLI o MCP)
+   * confirma escrituras en la base. Las escrituras de esta conexión no lo cambian.
+   */
+  getDataVersion(): number {
+    const row = this.db.prepare('PRAGMA data_version').get() as
+      | { data_version: number }
+      | undefined
+    return Number(row?.data_version ?? 0)
   }
 
   close(): void {
