@@ -1396,10 +1396,19 @@ describe('CLI hubseb/v1 Wire Contract, MCP JSON-RPC Server, and Topology Integra
     }>
     assert.equal(addPeerPacket.payload.peer.url, 'http://127.0.0.1:9444')
     assert.equal(addPeerPacket.payload.peer.name, 'peer-node-cli')
-    // Mapped role from SQLite sync_peers row
-    assert.ok(
-      addPeerPacket.payload.peer.role === 'peer' || addPeerPacket.payload.peer.role === 'child'
-    )
+    // Mapped role from SQLite sync_peers row must preserve 'peer'
+    assert.equal(addPeerPacket.payload.peer.role, 'peer')
+
+    const statusAfterAdd = await executeMemoCli(['node', 'status', '--json'], { runtime, dbPath })
+    assert.equal(statusAfterAdd.exitCode, 0)
+    const statusPacket = decodeWire<{
+      peers: Array<{ url: string; role: string }>
+    }>(statusAfterAdd.stdout) as WireSuccess<{
+      peers: Array<{ url: string; role: string }>
+    }>
+    const savedPeer = statusPacket.payload.peers.find((p) => p.url === 'http://127.0.0.1:9444')
+    assert.ok(savedPeer)
+    assert.equal(savedPeer.role, 'peer')
 
     const addPeerTextRes = await executeMemoCli(
       ['node', 'add-peer', 'http://127.0.0.1:9445'],

@@ -247,7 +247,7 @@ function mapRowToPeerRecord(row: RawPeerRow): SyncPeerRecord {
   return {
     id: row.id,
     peerNodeId: row.peer_node_id ?? null,
-    role: row.role === 'parent' ? 'parent' : 'child',
+    role: normalizePeerRole(row.role),
     name: row.name,
     url: row.url,
     authToken: row.auth_token ?? null,

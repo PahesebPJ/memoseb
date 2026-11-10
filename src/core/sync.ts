@@ -1513,7 +1513,7 @@ export async function syncAllPeers(
           peerRole: peer.role,
           token: options?.token !== undefined ? options.token : peer.authToken,
           projectId: options?.projectId,
-          full: false,
+          full: true,
           timeoutMs: options?.timeoutMs
         })
 
