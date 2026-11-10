@@ -482,10 +482,15 @@ describe('Sync Engine: UDP Local Area Network Discovery', () => {
         token: null,
         broadcastAddresses: ['127.0.0.1']
       })
-      // Parent announced requiresAuth: true, but since child didn't verify HMAC, it found the parent
-      assert.equal(withoutToken.length, 1)
-      assert.equal(withoutToken[0]?.nodeId, 'parent-udp-1')
-      assert.equal(withoutToken[0]?.requiresAuth, true)
+      // Con token configurado el responder UDP calla ante sondeos sin authTag válido
+      assert.equal(withoutToken.length, 0)
+      const wrongToken = await discoverLanParents({
+        port: serverHandle.udpPort,
+        timeoutMs: 300,
+        token: 'not-the-secret',
+        broadcastAddresses: ['127.0.0.1']
+      })
+      assert.equal(wrongToken.length, 0)
 
       // 2. Discovery with matching token verifies HMAC authTag
       const withToken = await discoverLanParents({
@@ -1516,11 +1521,13 @@ describe('Sync Engine: Tailscale Discovery, Callback URL, Token Policy and Auto-
         assert.equal(found[0]?.nodeName, 'Node B')
         assert.equal(found[0]?.urls[0], `http://127.0.0.1:${serverB.port}`)
 
-        const registered = registerDiscoveredPeers(vaultA, found)
+        assert.equal(found[0]?.authVerified, true)
+        const registered = registerDiscoveredPeers(vaultA, found, { token })
         assert.equal(registered.length, 1)
         assert.equal(registered[0]?.peerNodeId, vaultB.getNodeId())
         assert.equal(registered[0]?.lastStatus, 'discovered')
-        assert.equal(registerDiscoveredPeers(vaultA, found).length, 0)
+        assert.equal(registered[0]?.authToken, token)
+        assert.equal(registerDiscoveredPeers(vaultA, found, { token }).length, 0)
         assert.equal(
           registerDiscoveredPeers(vaultA, [
             { ...found[0]!, urls: [`http://localhost:${serverB.port}`] }
@@ -1600,7 +1607,7 @@ describe('Sync Engine: Tailscale Discovery, Callback URL, Token Policy and Auto-
       const serverA = await startSyncServer(vaultA, { host: '127.0.0.1', port: 0, enableUdpDiscovery: false })
       const serverB = await startSyncServer(vaultB, { host: '127.0.0.1', port: 0, enableUdpDiscovery: false })
       try {
-        vaultA.upsertPeer({ role: 'peer', url: `http://127.0.0.1:${serverB.port}` })
+        vaultA.upsertPeer({ role: 'peer', url: `http://127.0.0.1:${serverB.port}`, authToken: token })
         const callbackA = `http://127.0.0.1:${serverA.port}`
         const summary = await syncAllPeers(vaultA, {
           callbackUrl: (peerUrl) => resolveCallbackUrl(peerUrl, { port: serverA.port })
@@ -1610,7 +1617,8 @@ describe('Sync Engine: Tailscale Discovery, Callback URL, Token Policy and Auto-
         const inbound = vaultB.listPeers().find((p) => p.url === callbackA)
         assert.ok(inbound, 'server B registered node A from callbackUrl')
         assert.equal(inbound.peerNodeId, vaultA.getNodeId())
-        assert.equal(inbound.authToken, null)
+        // Se guarda el token con el que el cliente se autenticó, no el global por defecto
+        assert.equal(inbound.authToken, token)
 
         await new Promise((r) => setTimeout(r, 5))
         vaultA.storeMemory({
@@ -1698,7 +1706,7 @@ describe('Sync Engine: Tailscale Discovery, Callback URL, Token Policy and Auto-
       }
       const serverB = await startSyncServer(vaultB, { host: '127.0.0.1', port: 0, enableUdpDiscovery: false })
       const serverC = await startSyncServer(vaultC, { host: '127.0.0.1', port: 0, enableUdpDiscovery: false })
-      vaultA.upsertPeer({ role: 'peer', url: `http://127.0.0.1:${serverB.port}` })
+      vaultA.upsertPeer({ role: 'peer', url: `http://127.0.0.1:${serverB.port}`, authToken: token })
       vaultB.storeMemory({ projectId: 'den', category: 'domain', content: 'Present before the loop starts.' })
 
       let announceC = false
@@ -1751,13 +1759,14 @@ describe('Sync Engine: Tailscale Discovery, Callback URL, Token Policy and Auto-
     const vaultA = new MemoryVault({ dbPath: path.join(tmpDir, 'a.db') })
     const vaultB = new MemoryVault({ dbPath: path.join(tmpDir, 'b.db') })
     const events: string[] = []
+    const token = 'tok'
     try {
       vaultA.enableNodeMode({ role: 'peer', authToken: 'tok', syncIntervalMinutes: 7 })
       vaultB.enableNodeMode({ role: 'peer', authToken: 'tok' })
       assert.equal(vaultA.getNodeConfig().syncIntervalMinutes, 7)
       assert.equal(vaultB.getNodeConfig().syncIntervalMinutes, 5)
       const serverB = await startSyncServer(vaultB, { host: '127.0.0.1', port: 0, enableUdpDiscovery: false })
-      vaultA.upsertPeer({ role: 'peer', url: `http://127.0.0.1:${serverB.port}` })
+      vaultA.upsertPeer({ role: 'peer', url: `http://127.0.0.1:${serverB.port}`, authToken: token })
       const loop = startAutoSyncLoop(vaultA, {
         intervalMs: 200,
         changePollMs: 60_000,
@@ -1789,7 +1798,7 @@ describe('Sync Engine: Tailscale Discovery, Callback URL, Token Policy and Auto-
       vault.enableNodeMode({ role: 'peer', authToken: 'tok' })
       vaultB.enableNodeMode({ role: 'peer', authToken: 'tok' })
       const serverB = await startSyncServer(vaultB, { host: '127.0.0.1', port: 0, enableUdpDiscovery: false })
-      vault.upsertPeer({ role: 'peer', url: `http://127.0.0.1:${serverB.port}` })
+      vault.upsertPeer({ role: 'peer', url: `http://127.0.0.1:${serverB.port}`, authToken: 'tok' })
       const loop = startAutoSyncLoop(vault, {
         intervalMs: 60_000,
         debounceMs: 150,

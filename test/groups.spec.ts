@@ -295,6 +295,8 @@ describe('Sync Groups & ACL Permissions: Vault CRUD and Network Enforcement', ()
         permissions: 'readwrite'
       })
       parentVault.addNodeToGroup('grupo-x', childXVault.getNodeId())
+      // La membresía se resuelve por el peer registrado localmente (no por el nodeId declarado)
+      parentVault.upsertPeer({ role: 'child', url: 'http://127.0.0.1:41001', peerNodeId: childXVault.getNodeId() })
 
       parentVault.upsertGroup({
         name: 'grupo-y',
@@ -302,6 +304,8 @@ describe('Sync Groups & ACL Permissions: Vault CRUD and Network Enforcement', ()
         permissions: 'readwrite'
       })
       parentVault.addNodeToGroup('grupo-y', childYVault.getNodeId())
+      // La membresía se resuelve por el peer registrado localmente (no por el nodeId declarado)
+      parentVault.upsertPeer({ role: 'child', url: 'http://127.0.0.1:41002', peerNodeId: childYVault.getNodeId() })
 
       const parentServer = await startSyncServer(parentVault, {
         host: '127.0.0.1',
@@ -381,6 +385,8 @@ describe('Sync Groups & ACL Permissions: Vault CRUD and Network Enforcement', ()
         const childYUrl = `http://127.0.0.1:${childYServer.port}`
 
         // Register children as peers on Father with their endpoints
+        parentVault.removePeer('http://127.0.0.1:41001')
+        parentVault.removePeer('http://127.0.0.1:41002')
         parentVault.upsertPeer({
           role: 'child',
           url: childXUrl,
@@ -465,6 +471,8 @@ describe('Sync Groups & ACL Permissions: Vault CRUD and Network Enforcement', ()
         permissions: 'readonly'
       })
       parentVault.addNodeToGroup('core-readers', childReadonlyVault.getNodeId())
+      // La membresía se resuelve por el peer registrado localmente (no por el nodeId declarado)
+      parentVault.upsertPeer({ role: 'child', url: 'http://127.0.0.1:41003', peerNodeId: childReadonlyVault.getNodeId() })
 
       // Setup writeonly group for telemetry / audit logging
       parentVault.upsertGroup({
@@ -473,6 +481,8 @@ describe('Sync Groups & ACL Permissions: Vault CRUD and Network Enforcement', ()
         permissions: 'writeonly'
       })
       parentVault.addNodeToGroup('audit-writers', childWriteonlyVault.getNodeId())
+      // La membresía se resuelve por el peer registrado localmente (no por el nodeId declarado)
+      parentVault.upsertPeer({ role: 'child', url: 'http://127.0.0.1:41004', peerNodeId: childWriteonlyVault.getNodeId() })
 
       const parentServer = await startSyncServer(parentVault, {
         host: '127.0.0.1',
@@ -637,10 +647,10 @@ describe('Sync Groups & ACL Permissions: Vault CRUD and Network Enforcement', ()
         assert.equal(handshakeRes.status, 'paired')
         assert.deepEqual(handshakeRes.assignedGroups, ['equipo-alpha'])
 
-        // Father has auto-enrolled Child Alpha into equipo-alpha
+        // El token de grupo da acceso, pero el nodeId declarado en el cuerpo no se inscribe
         const groupAfterHandshake = parentVault.getGroup('equipo-alpha')
         assert.ok(groupAfterHandshake)
-        assert.ok(groupAfterHandshake.memberNodeIds.includes(childAlphaVault.getNodeId()))
+        assert.ok(!groupAfterHandshake.memberNodeIds.includes(childAlphaVault.getNodeId()))
 
         // Child Alpha syncs with Father
         const syncRes = await syncWithPeer(childAlphaVault, {
