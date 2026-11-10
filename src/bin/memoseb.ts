@@ -51,7 +51,7 @@ import {
   type PeerSyncResult,
   type SyncSummaryResult,
 } from '../core/sync.ts'
-import { MemoryVault } from '../core/vault.ts'
+import { MemoryVault, resolveVaultDbPath } from '../core/vault.ts'
 import {
   discoverPeers,
   startAutoSyncLoop,
@@ -286,7 +286,7 @@ export async function executeMemoCli(
   } = extractFlags(argv)
   const dbPath = options.dbPath ?? flags.db
   const noAutoSyncLoop = autoSyncFlag === false
-  const serviceContext = (vault: MemoryVault): ServiceContext => {
+  const serviceContext = (vault: Pick<MemoryVault, 'dbPath'>): ServiceContext => {
     const resolvedDb = path.resolve(vault.dbPath)
     return {
       runtime,
@@ -365,10 +365,20 @@ export async function executeMemoCli(
 
   if (command === 'uninstall') {
     const res = await purgeMemoseb({ runtime, hosts: selectedHosts })
+    const service = await uninstallNodeService(
+      serviceContext({ dbPath: resolveVaultDbPath(runtime, dbPath) }),
+    )
     if (jsonMode) {
-      return { exitCode: 0, stdout: serializeWire(wireSuccess('uninstall', res)), stderr: '' }
+      return {
+        exitCode: 0,
+        stdout: serializeWire(wireSuccess('uninstall', { ...res, service })),
+        stderr: '',
+      }
     }
     const lines = [`Detached from hubseb topology: ${res.detachedFromTopology}`]
+    if (service.removed) {
+      lines.push(`Removed memoseb node service (${service.mode ?? service.manager}).`)
+    }
     for (const p of res.purged) {
       lines.push(
         `  [${p.hostId}] removed ${p.removedPaths.length} lock-tracked paths (directivesRemoved=${p.directivesRemoved})`,

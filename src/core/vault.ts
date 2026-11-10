@@ -258,6 +258,20 @@ function mapRowToPeerRecord(row: RawPeerRow): SyncPeerRecord {
   }
 }
 
+/**
+ * Ruta de la bóveda con la misma precedencia que MemoryVault, sin abrir la base.
+ */
+export function resolveVaultDbPath(
+  runtime: SystemRuntime,
+  dbPath?: string
+): string {
+  return (
+    dbPath ??
+    runtime.env.MEMOSEB_DB_PATH ??
+    path.join(runtime.stateRoot, '..', 'memoseb', 'vault.sqlite')
+  )
+}
+
 export class MemoryVault {
   readonly dbPath: string
   private readonly db: DatabaseSync
@@ -270,10 +284,7 @@ export class MemoryVault {
     embedder?: EmbeddingProvider
   }) {
     this.runtime = options?.runtime ?? new SystemRuntime()
-    this.dbPath =
-      options?.dbPath ??
-      this.runtime.env.MEMOSEB_DB_PATH ??
-      path.join(this.runtime.stateRoot, '..', 'memoseb', 'vault.sqlite')
+    this.dbPath = resolveVaultDbPath(this.runtime, options?.dbPath)
     this.db = openVaultDatabase(this.dbPath)
     this.embedder = options?.embedder ?? new LocalFeatureHashEmbedder()
   }

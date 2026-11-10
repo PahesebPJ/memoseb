@@ -1791,6 +1791,26 @@ describe('CLI node service, token policy and auto-sync serve', () => {
 
     const disabledInstall = await executeMemoCli(['node', 'service', 'install'], { runtime, dbPath })
     assert.equal(disabledInstall.exitCode, 2)
+
+    await executeMemoCli(['node', 'enable', '--role', 'peer', '--token', 'tok'], { runtime, dbPath })
+    await executeMemoCli(['node', 'service', 'install'], { runtime, dbPath, serviceUid: 501 })
+    assert.ok(fs.existsSync(plist))
+    runtime.calls.length = 0
+    const purged = await executeMemoCli(['uninstall', '--json'], { runtime, dbPath, serviceUid: 501 })
+    assert.equal(purged.exitCode, 0)
+    const purgedPacket = decodeWire<{ service: { removed: boolean } }>(purged.stdout) as WireSuccess<{
+      service: { removed: boolean }
+    }>
+    assert.equal(purgedPacket.payload.service.removed, true)
+    assert.ok(!fs.existsSync(plist))
+    assert.ok(
+      runtime.calls.some((c) => c.executable === 'launchctl' && c.args[0] === 'bootout')
+    )
+
+    runtime.calls.length = 0
+    const purgedAgain = await executeMemoCli(['uninstall', '--json'], { runtime, dbPath })
+    assert.equal(purgedAgain.exitCode, 0)
+    assert.ok(!runtime.calls.some((c) => c.executable === 'launchctl'))
   })
 
   it('installs a systemd --user unit on Linux and reports a missing user bus as a warning', async () => {

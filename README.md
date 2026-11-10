@@ -63,7 +63,7 @@ memoseb group create | list | add-node | remove-node | delete | default-policy #
 memoseb sync [--url <peer>] [--project <id>] [--full] [--format memoseb|gaze|p2p] # Sincronización bidireccional (Jerárquica o P2P Gaze)
 memoseb mcp                                  # Inicia el servidor MCP JSON-RPC 2.0 por stdio
 memoseb check [--json]                       # Verifica la integridad SHA-256 de las directivas en cada host
-memoseb uninstall [--json]                   # Purga archivos desplegados y desconecta el nodo de hubseb
+memoseb uninstall [--json]                   # Purga archivos desplegados, desconecta el nodo de hubseb y quita el servicio de nodo si está instalado
 memoseb capabilities [--json]                # Muestra capacidades (provides/consumes/signals) para hubseb
 ```
 
@@ -225,7 +225,7 @@ memoseb sync
 ```bash
 memoseb node service install     # launchd (macOS), systemd --user (Linux) o tarea al iniciar sesión (Windows), sin elevación
 memoseb node service status
-memoseb node service uninstall   # también lo quita `memoseb node disable`
+memoseb node service uninstall   # también lo quitan `memoseb node disable` y `memoseb uninstall`
 ```
 
 En Windows la tarea `memoseb-node` corre `memoseb node serve --detach`; si `schtasks` no se deja crear, usa la carpeta Startup del perfil. Para aceptar peers por Tailscale hay que permitir el puerto en el Firewall de Windows (opt-in):
