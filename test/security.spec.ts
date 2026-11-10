@@ -470,6 +470,43 @@ describe('Security hardening of the P2P node', () => {
     assert.equal(vault.getStats().memoryCount, 1)
   })
 
+  it('applies canApply on the client pull too', async () => {
+    const a = open('pull-a')
+    const b = open('pull-b')
+    a.enableNodeMode({ role: 'peer', authToken: 'tok' })
+    b.enableNodeMode({ role: 'peer', authToken: 'tok' })
+    const local = a.storeMemory({ projectId: 'secret', category: 'domain', content: 'A keeps this private.' }).memory
+    b.importSnapshot(a.exportSnapshot())
+    const snap = b.exportSnapshot()
+    const hijack = {
+      ...snap,
+      memories: snap.memories.map((m: any) => ({
+        ...m,
+        projectId: 'open',
+        content: 'Moved out by the remote.',
+        contentHash: computeMemoryContentHash('open', m.category, 'Moved out by the remote.'),
+        updatedAt: new Date(Date.now() + 60_000).toISOString()
+      })),
+      projects: [...snap.projects, { id: 'open', name: 'open', rootPath: 'open', updatedAt: snap.exportedAt }]
+    }
+    const { checksum: _c, ...rest } = hijack
+    b.importSnapshot({ ...rest, checksum: computeSnapshotChecksum(rest as any) })
+    const handle = await startSyncServer(b, { host: '127.0.0.1', port: 0, enableUdpDiscovery: false })
+    try {
+      const url = `http://127.0.0.1:${handle.port}`
+      a.upsertPeer({ role: 'peer', url, authToken: 'tok' })
+      a.upsertGroup({ name: 'open-only', projects: ['open'], permissions: 'readwrite' })
+      a.addNodeToGroup('open-only', url)
+      const res = await syncWithPeer(a, { peerUrl: url, peerRole: 'peer', full: true })
+      assert.equal(res.pulled.memoriesUpdated, 0)
+      const kept = a.exportSnapshot().memories.find((m) => m.id === local.id)!
+      assert.equal(kept.projectId, 'secret')
+      assert.equal(kept.content, 'A keeps this private.')
+    } finally {
+      await handle.close()
+    }
+  })
+
   it('validates the Host header and requires JSON on POST', async () => {
     const vault = open('host')
     vault.enableNodeMode({ role: 'peer', authToken: 'tok' })

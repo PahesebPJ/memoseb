@@ -1881,9 +1881,15 @@ export async function syncWithPeer(
       incomingDroppedMemories = droppedMemories
     }
 
+    // Igual que en el servidor: un update o tombstone por id solo toca filas
+    // locales de proyectos que este peer puede escribir
+    const pullRestricted = isAuthorityInitiator && !targetPolicy.unrestricted
     const pulled = vault.importSnapshot(incomingServerDelta, {
       strategy: 'merge',
-      projectId: options.projectId
+      projectId: options.projectId,
+      ...(pullRestricted
+        ? { canApply: (proj: string, cat?: string) => targetPolicy.canPush(proj, cat) }
+        : {})
     })
     if (incomingDroppedMemories > 0) {
       pulled.memoriesSkipped += incomingDroppedMemories
