@@ -253,9 +253,10 @@ El protocolo implementa descubrimiento local sin configuración previa sobre el 
       "magic": "MEMOSEB_DISCOVER_V1",
       "nonce": "c929a738-4f51-41fa-8d48-6a56ecbe319b",
       "timestamp": "2026-11-10T04:00:00.000Z",
-      "authTag": "optional-hmac-sha256-hex"
+      "authTag": "hex(HMAC-SHA256(token, nonce))"
     }
     ```
+- Si el nodo tiene token (global o de grupo), **no responde** a solicitudes sin `authTag` válido.
 - **Respuesta de Anuncio (`MEMOSEB_ANNOUNCE_V1`)**:
   - Unicast directo a la dirección y puerto de origen del datagrama.
   - Carga JSON:
@@ -271,13 +272,21 @@ El protocolo implementa descubrimiento local sin configuración previa sobre el 
       "requiresAuth": true,
       "app": "memoseb",
       "contracts": ["memoseb-snapshot", "p2p-memory-contract"],
-      "authTag": "optional-hmac-sha256-hex"
+      "authTag": "hex(HMAC-SHA256(token, nonce + ':response'))"
     }
     ```
+- El `authTag` de la respuesta usa otro dominio (`nonce + ':response'`) para que no se pueda reflejar el de la solicitud.
+- El cliente ignora `urls`: la URL del nodo es `http://<IP de origen del datagrama>:<port>`.
 
 ### 5.1.1 Descubrimiento unicast por Tailscale
 
-El broadcast UDP no cruza el tailnet. `memoseb node serve` (cada 60 s) y `memoseb node discover` leen `tailscale status --json` y, si `BackendState` es `Running`, sondean `GET http://<primera IPv4 del peer>:<puerto>/api/v1/p2p/status` de cada peer con `Online: true`, con el token del nodo y 2 s de timeout. Un nodo es válido si responde `ok`, anuncia `p2p-memory-contract` y su `nodeId` no es el propio; se registra como peer (`lastStatus: discovered`) y se sincroniza al momento. Sin binario, con error o con otro estado (por ejemplo `NeedsLogin`) no se hace nada y se reintenta en el siguiente ciclo.
+El broadcast UDP no cruza el tailnet. `memoseb node serve` (cada 60 s) y `memoseb node discover` leen `tailscale status --json` y, si `BackendState` es `Running`, sondean cada peer con `Online: true` en su primera IPv4 (2 s de timeout) con un reto, sin enviar el token:
+
+1. `GET /api/v1/p2p/status?nonce=<hex aleatorio>` (también vale el header `X-P2P-Nonce`), sin `Authorization`.
+2. Un servidor con token responde `200` con `authTag = hex(HMAC-SHA256(token, nonce))` en la raíz y en `data`, sin `stats`, `nodeId` ni otros datos. Sin nonce y sin token responde `401`. Un nonce inválido (fuera de `[A-Za-z0-9-]{16,128}`) responde `400`.
+3. Solo si el `authTag` es válido el cliente repite el `GET` con `Authorization: Bearer <token>` y obtiene el status completo.
+
+Un nodo es válido si pasa el reto, responde `ok`, anuncia `p2p-memory-contract` y su `nodeId` no es el propio ni está en la lista de exclusión (`node remove`); se registra como peer con ese token (`lastStatus: discovered`) y se sincroniza al momento. La discovery solo corre con rol `peer` y bajo el mismo mutex que el sync. Sin binario, con error o con otro estado (por ejemplo `NeedsLogin`) no se hace nada y se reintenta en el siguiente ciclo.
 
 Orden de búsqueda del binario: `node.tailscale_bin` (`--tailscale-bin`), `MEMOSEB_TAILSCALE_BIN`, `tailscale`/`tailscale.exe` en el `PATH`, `/opt/homebrew/bin/tailscale`, `/usr/local/bin/tailscale`, `/Applications/Tailscale.app/Contents/MacOS/Tailscale` (macOS), `/usr/bin/tailscale` (Linux) y `C:\Program Files\Tailscale\tailscale.exe` (Windows).
 
@@ -291,11 +300,19 @@ X-Memoseb-Token: <token>
 X-Gaze-Token: <token>
 ```
 
-Un nodo con rol `peer` que escucha fuera de loopback **sin** token configurado responde `401 TOKEN_REQUIRED` a todo (salvo tokens de grupo) y `memoseb node serve` se niega a arrancar. `memoseb node enable --role peer` genera un token si no hay uno. Los peers p2p registrados sin token propio (descubiertos o por `callbackUrl`) usan el token global del nodo.
+Un nodo con rol `peer` que escucha fuera de loopback **sin** token configurado responde `401 TOKEN_REQUIRED` a todo (salvo tokens de grupo) y `memoseb node serve` se niega a arrancar. `memoseb node enable --role peer` genera un token si no hay uno. Cada peer usa solo su propio token: el token global nunca se envía a un peer registrado sin token o con token de grupo.
+
+Además, antes de autenticar:
+
+- El header `Host` debe ser loopback, una IPv4 de Tailscale (`100.64.0.0/10`) o un nombre MagicDNS `*.ts.net` (con rol `parent`/`child` también se aceptan IPs de LAN); si no, `403 INVALID_HOST`.
+- Los `POST` exigen `Content-Type: application/json`; si no, `415 UNSUPPORTED_MEDIA_TYPE`.
+- La membresía de grupos sale del token de grupo o de un peer registrado localmente (por su `callbackUrl` verificada, o por `peerNodeId` cuando la IP de su URL coincide con la de origen), nunca del `nodeId` o `clientName` del cuerpo.
+- En `exchange`, un update o tombstone por `id` solo se aplica si el proyecto de la fila local y el entrante están permitidos para ese peer.
+- Las respuestas que lee el cliente tienen un tope de 25 MB y un plazo total.
 
 ### 5.2.1 `callbackUrl` y auto-sync
 
-`handshake` y `exchange` envían `callbackUrl` con la URL alcanzable del nodo: `http://127.0.0.1:<puerto>` si el peer es loopback; si no, la IPv4 de Tailscale local, o la primera IPv4 de LAN; se omite si el nodo solo escucha en loopback. El servidor registra al cliente con esa URL y puede sincronizar de vuelta.
+`handshake` y `exchange` envían `callbackUrl` con la URL alcanzable del nodo: `http://127.0.0.1:<puerto>` si el peer es loopback; si no, la IPv4 de Tailscale local, o la primera IPv4 de LAN; se omite si el nodo solo escucha en loopback. El servidor la acepta solo si su host es igual a la IP de origen de la petición y es de Tailscale o loopback; si no, la ignora y no registra el peer. Al aceptarla registra al cliente con esa URL y con el token que usó para autenticarse, y puede sincronizar de vuelta.
 
 `memoseb node serve` sincroniza con todos los peers al arrancar, cada `syncIntervalMinutes` (5), tras escrituras locales de otros procesos y tras importaciones remotas que aplicaron cambios (debounce de 10 s, máximo 60 s). El servicio de usuario (`memoseb node service install`) es opcional; `node enable` nunca lo instala.
 
