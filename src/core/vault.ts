@@ -15,7 +15,10 @@ import { detectProject, slugifyProjectId } from './project-detector.ts'
 import {
   isGroupPermissionMode,
   isMemoryCategory,
+  clampSyncInterval,
   DEFAULT_SYNC_INTERVAL_MINUTES,
+  MAX_SYNC_INTERVAL_MINUTES,
+  MIN_SYNC_INTERVAL_MINUTES,
   isUnassignedGroupPolicy,
   normalizeNodeRole,
   normalizePeerRole,
@@ -31,6 +34,7 @@ import {
   type UnassignedGroupPolicy
 } from './schema.ts'
 import {
+  computeMemoryContentHash,
   isP2PContractPayload,
   p2pPayloadToSnapshot,
   snapshotToP2PPayload,
@@ -287,6 +291,59 @@ export class MemoryVault {
     this.dbPath = resolveVaultDbPath(this.runtime, options?.dbPath)
     this.db = openVaultDatabase(this.dbPath)
     this.embedder = options?.embedder ?? new LocalFeatureHashEmbedder()
+    this.migrateContentHashes()
+  }
+
+  /**
+   * Migración única: alinea memories.content_hash con la fórmula del contrato
+   * (sha256(project:category:content.trim())). Las filas cuyo hash nuevo
+   * chocaría con el UNIQUE (project_id, content_hash) se dejan como están.
+   */
+  private migrateContentHashes(): { updated: number; skipped: number } {
+    const key = 'migration.content_hash_v1'
+    const done = this.db
+      .prepare(`SELECT value FROM node_meta WHERE key = ?`)
+      .get(key) as { value: string } | undefined
+    if (done) return { updated: 0, skipped: 0 }
+    let updated = 0
+    let skipped = 0
+    this.db.exec('BEGIN IMMEDIATE;')
+    try {
+      const rows = this.db
+        .prepare(`SELECT id, project_id, category, content, content_hash FROM memories`)
+        .all() as Array<{
+        id: string
+        project_id: string
+        category: string
+        content: string
+        content_hash: string
+      }>
+      const conflict = this.db.prepare(
+        `SELECT id FROM memories WHERE project_id = ? AND content_hash = ? AND id <> ? LIMIT 1`
+      )
+      const update = this.db.prepare(`UPDATE memories SET content_hash = ? WHERE id = ?`)
+      for (const row of rows) {
+        const next = computeMemoryContentHash(row.project_id, row.category, row.content)
+        if (next === row.content_hash) continue
+        if (conflict.get(row.project_id, next, row.id)) {
+          skipped++
+          continue
+        }
+        update.run(next, row.id)
+        updated++
+      }
+      this.db
+        .prepare(
+          `INSERT INTO node_meta (key, value, updated_at) VALUES (?, ?, ?)
+           ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`
+        )
+        .run(key, JSON.stringify({ updated, skipped }), new Date().toISOString())
+      this.db.exec('COMMIT;')
+    } catch (err) {
+      this.db.exec('ROLLBACK;')
+      throw err
+    }
+    return { updated, skipped }
   }
 
   private get runtimeEnvToken(): string | null {
@@ -869,7 +926,7 @@ export class MemoryVault {
     )
     const syncIntervalMinutes =
       Number.isFinite(rawInterval) && rawInterval > 0
-        ? rawInterval
+        ? clampSyncInterval(rawInterval)
         : DEFAULT_SYNC_INTERVAL_MINUTES
 
     const rawTailscale = meta.get('node.tailscale_discovery')
@@ -940,9 +997,12 @@ export class MemoryVault {
     if (patch.syncIntervalMinutes !== undefined) {
       if (
         !Number.isFinite(patch.syncIntervalMinutes) ||
-        patch.syncIntervalMinutes <= 0
+        patch.syncIntervalMinutes < MIN_SYNC_INTERVAL_MINUTES ||
+        patch.syncIntervalMinutes > MAX_SYNC_INTERVAL_MINUTES
       ) {
-        throw new Error('syncIntervalMinutes must be a positive number.')
+        throw new Error(
+          `syncIntervalMinutes must be between ${MIN_SYNC_INTERVAL_MINUTES} and ${MAX_SYNC_INTERVAL_MINUTES}.`
+        )
       }
       upsert.run('node.sync_interval_min', String(patch.syncIntervalMinutes), now)
     }
@@ -1119,9 +1179,22 @@ export class MemoryVault {
     return mapRowToPeerRecord(inserted)
   }
 
-  removePeer(urlOrId: string): boolean {
+  removePeer(urlOrId: string, options?: { exclude?: boolean }): boolean {
     const trimmed = urlOrId.trim()
     const normalizedUrl = trimmed.replace(/\/+$/, '')
+    if (options?.exclude) {
+      const rows = this.db
+        .prepare(
+          `SELECT peer_node_id FROM sync_peers
+           WHERE id = ? OR peer_node_id = ? OR name = ? OR url = ? OR url = ?`
+        )
+        .all(trimmed, trimmed, trimmed, trimmed, normalizedUrl) as Array<{
+        peer_node_id: string | null
+      }>
+      for (const row of rows) {
+        if (row.peer_node_id) this.excludePeer(row.peer_node_id)
+      }
+    }
     const res = this.db
       .prepare(
         `DELETE FROM sync_peers
@@ -1129,6 +1202,42 @@ export class MemoryVault {
       )
       .run(trimmed, trimmed, trimmed, trimmed, normalizedUrl)
     return res.changes > 0
+  }
+
+  /** nodeIds que la discovery no vuelve a registrar (`node remove`). */
+  getExcludedPeerIds(): string[] {
+    const row = this.db
+      .prepare(`SELECT value FROM node_meta WHERE key = 'node.excluded_peers'`)
+      .get() as { value: string } | undefined
+    if (!row) return []
+    try {
+      const parsed = JSON.parse(row.value)
+      return Array.isArray(parsed) ? parsed.filter((v) => typeof v === 'string') : []
+    } catch {
+      return []
+    }
+  }
+
+  excludePeer(nodeId: string): void {
+    this.writeExcludedPeers([...this.getExcludedPeerIds(), nodeId.trim()])
+  }
+
+  includePeer(nodeId: string): void {
+    this.writeExcludedPeers(this.getExcludedPeerIds().filter((id) => id !== nodeId.trim()))
+  }
+
+  private writeExcludedPeers(ids: string[]): void {
+    const unique = Array.from(new Set(ids.filter((id) => id.length > 0)))
+    if (unique.length === 0) {
+      this.db.prepare(`DELETE FROM node_meta WHERE key = 'node.excluded_peers'`).run()
+      return
+    }
+    this.db
+      .prepare(
+        `INSERT INTO node_meta (key, value, updated_at) VALUES ('node.excluded_peers', ?, ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`
+      )
+      .run(JSON.stringify(unique), new Date().toISOString())
   }
 
   listPeers(role?: PeerRole | 'p2p'): SyncPeerRecord[] {
@@ -1892,6 +2001,18 @@ export class MemoryVault {
       ? slugifyProjectId(options.projectId)
       : snapshot.projectFilter
     const includeTombstones = options?.includeTombstones !== false
+    const canApply = options?.canApply
+    const localById = this.db.prepare(
+      `SELECT project_id, category FROM memories WHERE id = ?`
+    )
+    const isAllowed = (id: string, projectId: string, category?: string): boolean => {
+      if (!canApply) return true
+      if (!canApply(projectId, category)) return false
+      const local = localById.get(id) as
+        | { project_id: string; category: string }
+        | undefined
+      return !local || canApply(local.project_id, local.category)
+    }
 
     let projectsImported = 0
     let memoriesCreated = 0
@@ -1963,6 +2084,9 @@ export class MemoryVault {
       if (includeTombstones) {
         for (const tombstone of snapshot.tombstones) {
           if (targetProjectId && tombstone.projectId !== targetProjectId) {
+            continue
+          }
+          if (!isAllowed(tombstone.memoryId, tombstone.projectId)) {
             continue
           }
 
@@ -2037,6 +2161,10 @@ export class MemoryVault {
       // 3. Process memories
       for (const memory of snapshot.memories) {
         if (targetProjectId && memory.projectId !== targetProjectId) {
+          continue
+        }
+        if (!isAllowed(memory.id, memory.projectId, memory.category)) {
+          memoriesSkipped++
           continue
         }
 
