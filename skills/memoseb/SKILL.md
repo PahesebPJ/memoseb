@@ -1,6 +1,6 @@
 ---
 name: memoseb
-description: Gestiona la bóveda de memoria híbrida (vectorial + FTS5) multi-proyecto con presupuesto de tokens mediante memoseb (analyze, context, recall, remember, export, import, node, group, sync, projects, stats, forget) o su servidor MCP.
+description: Gestiona la bóveda de memoria híbrida (vectorial + FTS5) multi-proyecto con presupuesto de tokens mediante memoseb (analyze, context, recall, remember, export, import, node, group, sync, projects, stats, forget) o su servidor MCP, incluyendo soporte P2P descentralizado e interoperabilidad con KikeDeAlba/gaze.
 ---
 
 # Bóveda de Memoria `/memoseb`
@@ -29,13 +29,17 @@ Usa `memoseb` para dotar a los agentes de memoria persistente entre sesiones, ai
      --tags "sqlite,fts5,vectors" \
      --importance 0.9
    ```
-4. **Portabilidad, Sincronización y Control de Acceso (`export`, `import`, `group`, `sync`):**
-   - **Snapshots Portables:** Respalda o transfiere memorias con verificación SHA-256 e importación Last-Write-Wins:
+4. **Portabilidad, Sincronización e Interoperabilidad (`export`, `import`, `node`, `group`, `sync`):**
+   - **Snapshots Portables y Bundles Gaze:** Respalda o transfiere memorias con verificación SHA-256 e importación Last-Write-Wins:
      ```bash
+     # Snapshot nativo de memoseb:
      memoseb export ./snapshots/memoseb-backup.json --project mi-proyecto
-     memoseb import ./snapshots/memoseb-backup.json
+     # Bundle P2P interoperable con KikeDeAlba/gaze:
+     memoseb export ./bundles/gaze-bundle.json --format gaze --project mi-proyecto
+     # Importar cualquier formato (autodetectado con merge LWW o --replace):
+     memoseb import ./bundles/gaze-bundle.json
      ```
-   - **Red Padre ↔ Hijos y Grupos ACL:** Sincroniza conocimiento acumulado gobernando permisos por proyecto y categoría:
+   - **Modo Jerárquico (Padre ↔ Hijos) con Grupos ACL:**
      ```bash
      # En Padre: habilitar servicio y segmentar accesos con grupos de permisos
      memoseb node enable --role parent --port 7432 --token <secreto> && memoseb node serve
@@ -44,9 +48,19 @@ Usa `memoseb` para dotar a los agentes de memoria persistente entre sesiones, ai
 
      # En Hijo (auto-descubrimiento LAN o conexión directa con grupo asignado):
      memoseb node enable --role child --discover --token <token-grupo>
-     # Sincronización bidireccional gobernada por ACL:
      memoseb sync
      ```
+   - **Modo P2P Descentralizado (`peer` / `p2p`) ↔ `KikeDeAlba/gaze`:**
+     Sincroniza conocimiento en malla entre pares simétricos de `memoseb` o grafos de memoria `gaze`:
+     ```bash
+     # Habilitar nodo en rol P2P y servir en segundo plano o daemon:
+     memoseb node enable --role p2p --port 7432 --token <secreto> && memoseb node serve
+     # Emparejar con un peer remoto (memoseb o KikeDeAlba/gaze):
+     memoseb node add-peer http://192.168.1.180:7432 --name gaze-peer --token <secreto>
+     # Sincronizar bidireccionalmente bajo el contrato Gaze P2P:
+     memoseb sync --format gaze
+     ```
+     Consulta la especificación técnica completa en [`docs/GAZE_P2P_CONTRACT.md`](docs/GAZE_P2P_CONTRACT.md).
 
 ## 2. Análisis e Indexación de Proyectos (Flujo Dual)
 
@@ -78,9 +92,9 @@ Cuando necesites indexar un repositorio nuevo o el usuario pida analizar un proy
 - `memoseb projects`: Lista todos los proyectos registrados en la bóveda y su conteo de recuerdos / tokens.
 - `memoseb stats`: Muestra métricas globales de la bóveda (memorias totales, tokens, vectores).
 - `memoseb forget <id>`: Elimina un recuerdo obsoleto o incorrecto por su ID (MCP: `memory_forget`).
-- `memoseb export [file] [--project <id>]`: Exporta un snapshot portable JSON con checksum SHA-256 (MCP: `memory_export`).
-- `memoseb import <file> [--replace] [--project <id>]`: Importa un snapshot JSON con resolución Last-Write-Wins o `--replace`, regenerando FTS5 y vectores (MCP: `memory_import`).
-- `memoseb node (status|enable|disable|discover|set-parent|add-child|remove|serve)`: Gestiona el ciclo de vida del nodo de red (servidor HTTP, descubrimiento LAN UDP y administración de peers).
+- `memoseb export [file] [--format memoseb|gaze|p2p] [--project <id>]`: Exporta un snapshot nativo o bundle P2P/Gaze con checksum SHA-256 (MCP: `memory_export`).
+- `memoseb import <file> [--replace] [--project <id>]`: Importa snapshot nativo o bundle Gaze/P2P autodetectado con resolución Last-Write-Wins o `--replace`, regenerando FTS5 y vectores (MCP: `memory_import`).
+- `memoseb node (status|enable|disable|discover|set-parent|add-child|add-peer|remove|serve)`: Gestiona el ciclo de vida del nodo de red (servidor HTTP, descubrimiento LAN UDP `:7432` y administración de pares jerárquicos o P2P).
 - `memoseb group (list|create|add-node|remove-node|delete|default-policy)`: Administra grupos de permisos y reglas ACL de sincronización por proyecto, categoría y modo (`readwrite`, `readonly`, `writeonly`) (MCP: `memory_group`).
-- `memoseb sync [--url <peer>] [--project <id>] [--full]`: Sincronización bidireccional de deltas y tombstones con nodos configurados (MCP: `memory_sync`).
+- `memoseb sync [--url <peer>] [--project <id>] [--full] [--format memoseb|gaze|p2p]`: Sincronización bidireccional de deltas y tombstones con nodos configurados o pares Gaze (MCP: `memory_sync`).
 - `memoseb mcp`: Inicia el servidor MCP sobre `stdio` (JSON-RPC 2.0) exponiendo `memory_store`, `memory_recall`, `memory_briefing`, `memory_forget`, `memory_analyze`, `memory_export`, `memory_import`, `memory_sync` y `memory_group`.
