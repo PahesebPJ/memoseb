@@ -1,5 +1,6 @@
+import os from 'node:os'
 import type { SystemRuntime } from 'hubseb'
-import { DEFAULT_SYNC_INTERVAL_MINUTES } from './schema.ts'
+import { DEFAULT_SYNC_INTERVAL_MINUTES, type NodeConfiguration } from './schema.ts'
 import {
   discoverLanNodes,
   discoverTailnetNodes,
@@ -10,7 +11,7 @@ import {
   type SyncCapableVault,
   type SyncSummaryResult
 } from './sync.ts'
-import { probeTailscale, type TailscaleProbeResult } from './tailscale.ts'
+import { isTailscaleIpv4, probeTailscale, type TailscaleProbeResult } from './tailscale.ts'
 
 export type AutoSyncReason =
   | 'startup'
@@ -75,10 +76,13 @@ export function startAutoSyncLoop(
   }
 
   let closed = false
-  let running: Promise<void> | null = null
+  const abort = new AbortController()
+  let running: Promise<unknown> | null = null
   let pendingReason: AutoSyncReason | null = null
   let debounceTimer: NodeJS.Timeout | null = null
   let firstChangeAt: number | null = null
+  // data_version solo cambia por commits de otras conexiones: los propios
+  // imports del bucle no lo mueven, así que no hace falta reasignarlo.
   let lastDataVersion = safeDataVersion(vault)
 
   const autoSyncActive = () => {
@@ -86,31 +90,42 @@ export function startAutoSyncLoop(
     return config.enabled && config.autoSync
   }
 
+  // Mutex único: sync y discovery nunca corren a la vez
+  const exclusive = async <T>(task: () => Promise<T>): Promise<T> => {
+    while (running) await running.catch(() => undefined)
+    const current = task()
+    running = current
+    try {
+      return await current
+    } finally {
+      if (running === current) running = null
+    }
+  }
+
   const runSync = async (reason: AutoSyncReason): Promise<void> => {
     if (closed) return
     if (running) {
+      // Se coalesce: corre al liberarse el mutex quien llegue primero
       pendingReason = reason
-      return running
+      while (running) await running.catch(() => undefined)
+      if (!pendingReason || closed) return
+      const next = pendingReason
+      pendingReason = null
+      return runSync(next)
     }
-    running = (async () => {
+    await exclusive(async () => {
       try {
         if (!autoSyncActive() || vault.listPeers().length === 0) return
         const summary = await syncAllPeers(vault, {
           timeoutMs: options.timeoutMs,
-          callbackUrl: options.callbackUrl
+          callbackUrl: options.callbackUrl,
+          signal: abort.signal
         })
         emit({ reason, summary })
       } catch (err: any) {
         emit({ reason, error: err?.message ?? String(err) })
-      } finally {
-        lastDataVersion = safeDataVersion(vault)
       }
-    })()
-    try {
-      await running
-    } finally {
-      running = null
-    }
+    })
     if (pendingReason && !closed) {
       const next = pendingReason
       pendingReason = null
@@ -119,35 +134,42 @@ export function startAutoSyncLoop(
   }
 
   const runDiscovery = async (): Promise<string[]> => {
-    if (closed || !options.discover || !vault.getNodeConfig().enabled) return []
-    let nodes: DiscoveredLanNode[] = []
-    try {
-      nodes = await options.discover()
-    } catch (err: any) {
-      emit({ reason: 'discovery', error: err?.message ?? String(err) })
+    const config = vault.getNodeConfig()
+    if (closed || !options.discover || !config.enabled || config.role !== 'peer') {
       return []
     }
-    if (closed) return []
-    const registered = registerDiscoveredPeers(vault, nodes)
-    if (registered.length === 0) return []
-    const urls = registered.map((p) => p.url)
-    emit({ reason: 'discovery', discovered: urls })
-    if (autoSyncActive()) {
-      for (const peer of registered) {
-        try {
-          await syncWithPeer(vault, {
-            peerUrl: peer.url,
-            peerRole: 'peer',
-            timeoutMs: options.timeoutMs,
-            callbackUrl: options.callbackUrl?.(peer.url)
-          })
-        } catch (err: any) {
-          emit({ reason: 'discovery', error: err?.message ?? String(err) })
+    return exclusive(async () => {
+      let nodes: DiscoveredLanNode[] = []
+      try {
+        nodes = await options.discover!()
+      } catch (err: any) {
+        emit({ reason: 'discovery', error: err?.message ?? String(err) })
+        return []
+      }
+      if (closed) return []
+      const registered = registerDiscoveredPeers(vault, nodes, {
+        token: vault.getNodeConfig().authToken
+      })
+      if (registered.length === 0) return []
+      const urls = registered.map((p) => p.url)
+      emit({ reason: 'discovery', discovered: urls })
+      if (autoSyncActive()) {
+        for (const peer of registered) {
+          if (closed) break
+          try {
+            await syncWithPeer(vault, {
+              peerUrl: peer.url,
+              peerRole: 'peer',
+              timeoutMs: options.timeoutMs,
+              callbackUrl: options.callbackUrl?.(peer.url)
+            })
+          } catch (err: any) {
+            emit({ reason: 'discovery', error: err?.message ?? String(err) })
+          }
         }
       }
-      lastDataVersion = safeDataVersion(vault)
-    }
-    return urls
+      return urls
+    })
   }
 
   const notifyChange = (reason: 'local-write' | 'remote-import' = 'local-write') => {
@@ -178,7 +200,7 @@ export function startAutoSyncLoop(
   discoveryTimer?.unref?.()
 
   const changeTimer = setInterval(() => {
-    if (closed || running) return
+    if (closed) return
     const current = safeDataVersion(vault)
     if (current !== lastDataVersion) {
       lastDataVersion = current
@@ -198,13 +220,14 @@ export function startAutoSyncLoop(
     discoverNow: runDiscovery,
     close: async () => {
       closed = true
+      abort.abort()
       clearInterval(intervalTimer)
       clearInterval(changeTimer)
       if (discoveryTimer) clearInterval(discoveryTimer)
       if (debounceTimer) clearTimeout(debounceTimer)
       pendingReason = null
       await startup.catch(() => undefined)
-      if (running) await (running as Promise<void>).catch(() => undefined)
+      while (running) await running.catch(() => undefined)
     }
   }
 }
@@ -274,4 +297,31 @@ export async function discoverPeers(
     if (!byId.has(node.nodeId)) byId.set(node.nodeId, node)
   }
   return { nodes: Array.from(byId.values()), lan, tailnet, tailscale: tailscaleState }
+}
+
+/**
+ * Hosts de escucha de un nodo peer con listenHost comodín y Tailscale activo:
+ * sus IPv4 de Tailscale presentes en las interfaces locales más 127.0.0.1.
+ * Devuelve [] si no aplica (se usa el listenHost configurado).
+ */
+export async function resolvePeerBindHosts(
+  runtime: Pick<SystemRuntime, 'platform' | 'env' | 'execProcess'>,
+  config: Pick<NodeConfiguration, 'role' | 'listenHost' | 'tailscaleBin'>,
+  options?: {
+    probeTailscale?: typeof probeTailscale
+    interfaces?: NodeJS.Dict<os.NetworkInterfaceInfo[]>
+  }
+): Promise<string[]> {
+  const host = config.listenHost?.trim() || '0.0.0.0'
+  if (config.role !== 'peer' || (host !== '0.0.0.0' && host !== '::')) return []
+  const probe = await (options?.probeTailscale ?? probeTailscale)(runtime, {
+    binary: config.tailscaleBin ?? null
+  })
+  if (probe.state !== 'running') return []
+  const local = new Set<string>()
+  for (const list of Object.values(options?.interfaces ?? os.networkInterfaces())) {
+    for (const info of list ?? []) local.add(info.address)
+  }
+  const ips = probe.status.selfIps.filter((ip) => isTailscaleIpv4(ip) && local.has(ip))
+  return ips.length > 0 ? [...ips, '127.0.0.1'] : []
 }
