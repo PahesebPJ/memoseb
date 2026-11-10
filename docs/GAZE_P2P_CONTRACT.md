@@ -226,7 +226,11 @@ Para garantizar fidelidad completa entre ambos ecosistemas:
    - `gaze:source:<source>`
    - `gaze:source_ref:<ref>`
    - `gaze:until:<timestamp>`
-   - `gaze:edge:<dst>:<kind>[:<weight>]` (o `gaze:edge:<src>-><dst>:<kind>[:<weight>]`)
+   - `gaze:edge:<dst>:<kind>[:<weight>]` (o `gaze:edge:<src>-><dst>:<kind>[:<weight>]` cuando el `src` de la arista no es el propio nodo)
+   - Las aristas de `edges[]` de nivel superior del payload se fusionan en las etiquetas del nodo `src` (`sourceId` o `src`) si ese nodo viaja en el mismo payload; si no, se ignoran. `edges: null` se acepta y cuenta como `[]` en el checksum.
+
+4. **`contentHash`**:
+   - Al importar, `memoseb` siempre usa `sha256("<projectId>:<category>:<content.trim()>")`, la misma fórmula de `storeMemory` y la que exporta gaze. Un `contentHash` ausente o calculado con otra fórmula se recalcula, para que el emparejamiento por `(project_id, content_hash)` funcione entre ambos.
 
 3. **Relevancia e Importancia**:
    - `MemoryRecord.importance >= 0.85` ↔ `GazeNodeV1.pinned = true`.
@@ -271,6 +275,12 @@ El protocolo implementa descubrimiento local sin configuración previa sobre el 
     }
     ```
 
+### 5.1.1 Descubrimiento unicast por Tailscale
+
+El broadcast UDP no cruza el tailnet. `memoseb node serve` (cada 60 s) y `memoseb node discover` leen `tailscale status --json` y, si `BackendState` es `Running`, sondean `GET http://<primera IPv4 del peer>:<puerto>/api/v1/p2p/status` de cada peer con `Online: true`, con el token del nodo y 2 s de timeout. Un nodo es válido si responde `ok`, anuncia `p2p-memory-contract` y su `nodeId` no es el propio; se registra como peer (`lastStatus: discovered`) y se sincroniza al momento. Sin binario, con error o con otro estado (por ejemplo `NeedsLogin`) no se hace nada y se reintenta en el siguiente ciclo.
+
+Orden de búsqueda del binario: `node.tailscale_bin` (`--tailscale-bin`), `MEMOSEB_TAILSCALE_BIN`, `tailscale`/`tailscale.exe` en el `PATH`, `/opt/homebrew/bin/tailscale`, `/usr/local/bin/tailscale`, `/Applications/Tailscale.app/Contents/MacOS/Tailscale` (macOS), `/usr/bin/tailscale` (Linux) y `C:\Program Files\Tailscale\tailscale.exe` (Windows).
+
 ### 5.2 Autenticación y Cabeceras HTTP Aceptadas
 
 El servidor de red de `memoseb` valida tokens con comparación en tiempo constante (`crypto.timingSafeEqual`) contra el token global o tokens dedicados de grupo. Acepta cualquiera de las siguientes cabeceras:
@@ -280,6 +290,14 @@ Authorization: Bearer <token>
 X-Memoseb-Token: <token>
 X-Gaze-Token: <token>
 ```
+
+Un nodo con rol `peer` que escucha fuera de loopback **sin** token configurado responde `401 TOKEN_REQUIRED` a todo (salvo tokens de grupo) y `memoseb node serve` se niega a arrancar. `memoseb node enable --role peer` genera un token si no hay uno. Los peers p2p registrados sin token propio (descubiertos o por `callbackUrl`) usan el token global del nodo.
+
+### 5.2.1 `callbackUrl` y auto-sync
+
+`handshake` y `exchange` envían `callbackUrl` con la URL alcanzable del nodo: `http://127.0.0.1:<puerto>` si el peer es loopback; si no, la IPv4 de Tailscale local, o la primera IPv4 de LAN; se omite si el nodo solo escucha en loopback. El servidor registra al cliente con esa URL y puede sincronizar de vuelta.
+
+`memoseb node serve` sincroniza con todos los peers al arrancar, cada `syncIntervalMinutes` (5), tras escrituras locales de otros procesos y tras importaciones remotas que aplicaron cambios (debounce de 10 s, máximo 60 s). El servicio de usuario (`memoseb node service install`) es opcional; `node enable` nunca lo instala.
 
 ### 5.3 Endpoints HTTP P2P y Fallback Transparente
 

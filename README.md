@@ -58,7 +58,7 @@ memoseb forget <id> [--json]                 # Elimina una memoria obsoleta por 
 memoseb stats [--json]                       # Muestra métricas globales de la bóveda (proyectos, vectores, tokens)
 memoseb export [file] [--format memoseb|gaze|p2p] [--project <id>] # Exporta a snapshot nativo o bundle P2P/Gaze con checksum SHA-256
 memoseb import <file> [--replace] [--project <id>] # Importa snapshot nativo o bundle Gaze/P2P con merge LWW o --replace
-memoseb node status | enable | disable | discover | set-parent | add-child | add-peer | remove | serve # Red Jerárquica (Padre/Hijo) o P2P Descentralizada
+memoseb node status | enable | disable | discover | set-parent | add-child | add-peer | remove | serve | service # Red Jerárquica (Padre/Hijo) o P2P Descentralizada
 memoseb group create | list | add-node | remove-node | delete | default-policy # Control de acceso y grupos de permisos (ACL)
 memoseb sync [--url <peer>] [--project <id>] [--full] [--format memoseb|gaze|p2p] # Sincronización bidireccional (Jerárquica o P2P Gaze)
 memoseb mcp                                  # Inicia el servidor MCP JSON-RPC 2.0 por stdio
@@ -201,10 +201,10 @@ sequenceDiagram
 # 1. Habilitar el nodo en rol P2P (p2p es alias directo de peer)
 memoseb node enable --role p2p --port 7432 --token "mi-token-secreto"
 
-# 2. Iniciar el servicio HTTP y respondedor UDP en primer plano
+# 2. Iniciar el servicio HTTP con auto-sync (o, opcional, como servicio: memoseb node service install)
 memoseb node serve
 
-# 3. Emparejar con un nodo peer de memoseb o un agente KikeDeAlba/gaze
+# 3. Emparejar con un nodo peer de memoseb o un agente KikeDeAlba/gaze (o dejar que Tailscale lo descubra)
 memoseb node add-peer http://192.168.1.180:7432 --name "gaze-peer" --token "mi-token-secreto"
 
 # 4. Sincronizar bidireccionalmente usando el contrato Gaze P2P
@@ -212,6 +212,28 @@ memoseb sync --format gaze
 
 # 5. O sincronizar todos los peers registrados
 memoseb sync
+```
+
+#### Auto-sync, descubrimiento por Tailscale y servicio opcional
+
+- **`memoseb node serve` sincroniza solo**: al arrancar, cada `--interval` minutos (por omisión 5, se guarda con `node enable --interval N`), tras escrituras de otros procesos (CLI, MCP) detectadas con `PRAGMA data_version`, tras importaciones remotas que aplicaron cambios y en cuanto descubre un peer nuevo. `--no-auto-sync` lo desactiva. Fuera de `serve`, `remember` y `forget` siguen disparando el auto-sync de siempre.
+- **Descubrimiento unicast por Tailscale**: además del broadcast UDP de la LAN, `serve` y `node discover` leen `tailscale status --json` (binario de `--tailscale-bin`, `MEMOSEB_TAILSCALE_BIN`, `PATH`, `/opt/homebrew/bin`, `/usr/local/bin`, `/Applications/Tailscale.app/Contents/MacOS/Tailscale`; en Windows `tailscale.exe` en el `PATH` y `C:\Program Files\Tailscale\tailscale.exe`), sondean `GET /api/v1/p2p/status` de cada peer en línea con el token y registran los válidos. Sin Tailscale o con un estado distinto de `Running` no hace nada. `--no-tailscale` lo apaga.
+- **`callbackUrl`**: cada intercambio manda la URL por la que el otro nodo puede devolvernos la llamada (IP de Tailscale preferida, loopback si el peer es local), así el servidor nos registra solo.
+- **Token obligatorio en `peer`**: `node enable --role peer|p2p` sin token genera uno (64 hex) y lo muestra una sola vez; usa el mismo en todos los nodos. `node serve` se niega a servir un nodo `peer` fuera de loopback sin token y el servidor responde `401 TOKEN_REQUIRED`. Los roles `parent`/`child` no cambian.
+- **El servicio en segundo plano es opcional y explícito**: `node enable` **no** instala servicios, tareas programadas, entradas de Startup ni reglas de firewall. Para dejar `serve` corriendo al iniciar sesión:
+
+```bash
+memoseb node service install     # launchd (macOS), systemd --user (Linux) o tarea al iniciar sesión (Windows), sin elevación
+memoseb node service status
+memoseb node service uninstall   # también lo quita `memoseb node disable`
+```
+
+En Windows la tarea `memoseb-node` corre `memoseb node serve --detach`; si `schtasks` no se deja crear, usa la carpeta Startup del perfil. Para aceptar peers por Tailscale hay que permitir el puerto en el Firewall de Windows (opt-in):
+
+```powershell
+# Imprime el comando; --apply lo ejecuta pidiendo elevación (UAC)
+memoseb node service firewall [--apply]
+New-NetFirewallRule -DisplayName memoseb-node -Direction Inbound -Action Allow -Protocol TCP -LocalPort 7432 -RemoteAddress 100.64.0.0/10 -Profile Any
 ```
 
 #### Modo B: Configuración Jerárquica (Padre ↔ Hijos)
