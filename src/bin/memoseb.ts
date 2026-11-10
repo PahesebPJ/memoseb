@@ -20,6 +20,8 @@ import {
   isGroupPermissionMode,
   isMemoryCategory,
   isUnassignedGroupPolicy,
+  MAX_SYNC_INTERVAL_MINUTES,
+  MIN_SYNC_INTERVAL_MINUTES,
   normalizeNodeRole,
   normalizePeerRole,
   parseNodeRoleInput,
@@ -54,6 +56,7 @@ import {
 import { MemoryVault, resolveVaultDbPath } from '../core/vault.ts'
 import {
   discoverPeers,
+  resolvePeerBindHosts,
   startAutoSyncLoop,
   type AutoSyncLoopHandle,
 } from '../core/auto-sync.ts'
@@ -63,6 +66,7 @@ import {
   nodeServiceStatus,
   removeServePidFile,
   resolveServiceCommand,
+  serviceNames,
   uninstallNodeService,
   windowsFirewallRule,
   writeServePidFile,
@@ -95,16 +99,63 @@ export interface ExecuteMemoCliOptions {
   serviceEntry?: string
   serviceUid?: number
   killProcess?: (pid: number) => void
+  readStdin?: () => Promise<string>
 }
 
 const CLI_ENTRY = fileURLToPath(import.meta.url)
 
-function peerCallbackUrl(vault: MemoryVault, peerUrl: string): string | undefined {
+const REDACTED = '[redacted]'
+
+/** Copia profunda que oculta authToken (nodo y peers) en la salida --json. */
+export function redactTokens<T>(value: T): T {
+  if (Array.isArray(value)) return value.map((v) => redactTokens(v)) as unknown as T
+  if (value && typeof value === 'object') {
+    const out: Record<string, unknown> = {}
+    for (const [key, v] of Object.entries(value as Record<string, unknown>)) {
+      out[key] = key === 'authToken' && typeof v === 'string' && v.length > 0 ? REDACTED : redactTokens(v)
+    }
+    return out as T
+  }
+  return value
+}
+
+function parseIntervalFlag(
+  raw: string | undefined,
+): { ok: true; minutes?: number } | { ok: false; message: string } {
+  if (raw === undefined) return { ok: true }
+  const minutes = Number(raw)
+  if (
+    raw.trim() === '' ||
+    !Number.isFinite(minutes) ||
+    minutes < MIN_SYNC_INTERVAL_MINUTES ||
+    minutes > MAX_SYNC_INTERVAL_MINUTES
+  ) {
+    return {
+      ok: false,
+      message: `Invalid --interval "${raw}": expected minutes between ${MIN_SYNC_INTERVAL_MINUTES} and ${MAX_SYNC_INTERVAL_MINUTES}.`,
+    }
+  }
+  return { ok: true, minutes }
+}
+
+async function readProcessStdin(): Promise<string> {
+  const chunks: Buffer[] = []
+  for await (const chunk of process.stdin) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))
+  }
+  return Buffer.concat(chunks).toString('utf-8')
+}
+
+function peerCallbackUrl(
+  vault: MemoryVault,
+  peerUrl: string,
+  listen?: { port: number; listenHost: string },
+): string | undefined {
   const config = vault.getNodeConfig()
   if (config.role !== 'peer') return undefined
   return resolveCallbackUrl(peerUrl, {
-    port: config.listenPort,
-    listenHost: config.listenHost,
+    port: listen?.port ?? config.listenPort,
+    listenHost: listen?.listenHost ?? config.listenHost,
   })
 }
 
@@ -112,6 +163,10 @@ function describeService(report: ServiceReport): string {
   if (!report.supported) return 'unsupported on this platform'
   if (!report.installed) return 'not installed'
   return `installed (${report.mode ?? report.manager}${report.running ? ', running' : ''}) ${report.unit ?? ''}`.trim()
+}
+
+function command0(positional: readonly string[]): string {
+  return positional[0] ?? 'help'
 }
 
 function parseHostsOption(args: readonly string[]): HostId[] | undefined {
@@ -162,7 +217,14 @@ const VALUE_FLAGS = new Set([
   '--tailscale-bin',
 ])
 
-const SWITCH_FLAGS = new Set(['--detach', '--firewall', '--apply', '--no-tailscale', '--tailscale'])
+const SWITCH_FLAGS = new Set([
+  '--detach',
+  '--firewall',
+  '--apply',
+  '--no-tailscale',
+  '--tailscale',
+  '--token-stdin',
+])
 
 function extractFlags(argv: readonly string[]): {
   positional: string[]
@@ -286,11 +348,26 @@ export async function executeMemoCli(
   } = extractFlags(argv)
   const dbPath = options.dbPath ?? flags.db
   const noAutoSyncLoop = autoSyncFlag === false
+  if (switches.has('token-stdin')) {
+    const fromStdin = (await (options.readStdin ?? readProcessStdin)()).trim()
+    if (!fromStdin) {
+      const message = 'No token received on stdin (--token-stdin).'
+      return jsonMode
+        ? {
+            exitCode: 2,
+            stdout: serializeWire(wireFailure(command0(positional), 'MISSING_TOKEN', message)),
+            stderr: '',
+          }
+        : { exitCode: 2, stdout: '', stderr: `${message}\n` }
+    }
+    flags.token = fromStdin
+  }
   const serviceContext = (vault: Pick<MemoryVault, 'dbPath'>): ServiceContext => {
     const resolvedDb = path.resolve(vault.dbPath)
     return {
       runtime,
       dataDir: path.dirname(resolvedDb),
+      dbPath: resolvedDb,
       command: resolveServiceCommand({
         execPath: process.execPath,
         execArgv: process.execArgv,
@@ -927,6 +1004,18 @@ export async function executeMemoCli(
 
   if (command === 'node') {
     const subcommand = positional[1] ?? 'status'
+    const wireNode = (payload: Record<string, unknown>) =>
+      wireSuccess('node', redactTokens(payload))
+    const intervalFlag = parseIntervalFlag(flags.interval)
+    if (!intervalFlag.ok) {
+      return jsonMode
+        ? {
+            exitCode: 2,
+            stdout: serializeWire(wireFailure('node', 'INVALID_INTERVAL', intervalFlag.message)),
+            stderr: '',
+          }
+        : { exitCode: 2, stdout: '', stderr: `${intervalFlag.message}\n` }
+    }
     const vault = new MemoryVault({ dbPath, runtime })
     try {
       if (subcommand === 'status') {
@@ -938,7 +1027,7 @@ export async function executeMemoCli(
         if (jsonMode) {
           return {
             exitCode: 0,
-            stdout: serializeWire(wireSuccess('node', { config, peers, lanUrls, groups, service })),
+            stdout: serializeWire(wireNode({ config, peers, lanUrls, groups, service })),
             stderr: '',
           }
         }
@@ -1041,10 +1130,7 @@ export async function executeMemoCli(
           authToken: flags.token !== undefined ? flags.token : undefined,
           autoSync: autoSyncFlag !== undefined ? autoSyncFlag : undefined,
           lanDiscovery: noLanFlag ? false : undefined,
-          syncIntervalMinutes:
-            flags.interval !== undefined && Number(flags.interval) > 0
-              ? Number(flags.interval)
-              : undefined,
+          syncIntervalMinutes: intervalFlag.minutes,
           tailscaleDiscovery: switches.has('no-tailscale')
             ? false
             : switches.has('tailscale')
@@ -1201,13 +1287,16 @@ export async function executeMemoCli(
           return {
             exitCode: 0,
             stdout: serializeWire(
-              wireSuccess('node', {
+              wireNode({
                 config,
                 peers,
-                ...(generatedToken ? { generatedToken } : {}),
+                tokenGenerated: Boolean(generatedToken),
               }),
             ),
-            stderr: '',
+            // El token generado se muestra una sola vez y en texto, nunca en el JSON
+            stderr: generatedToken
+              ? `Generated sync token (shown once; use the same token on every node): ${generatedToken}\n`
+              : '',
           }
         }
         const enableLines = [
@@ -1234,7 +1323,7 @@ export async function executeMemoCli(
         if (jsonMode) {
           return {
             exitCode: 0,
-            stdout: serializeWire(wireSuccess('node', { config, peers, service })),
+            stdout: serializeWire(wireNode({ config, peers, service })),
             stderr: '',
           }
         }
@@ -1250,7 +1339,8 @@ export async function executeMemoCli(
         const action = positional[2] ?? 'status'
         const ctx = serviceContext(vault)
         const firewallPort = vault.getNodeConfig().listenPort
-        const firewall = windowsFirewallRule(firewallPort)
+        const firewallName = serviceNames(ctx.dbPath).firewallRule
+        const firewall = windowsFirewallRule(firewallPort, firewallName)
         const applyFirewall = async (): Promise<{
           applied: boolean
           command: string
@@ -1263,7 +1353,10 @@ export async function executeMemoCli(
               error: 'The Windows Firewall rule is not needed on this platform.',
             }
           }
-          const res = await applyWindowsFirewallRule(runtime, firewallPort)
+          const res = await applyWindowsFirewallRule(runtime, firewallPort, {
+            name: firewallName,
+            dataDir: ctx.dataDir,
+          })
           return { applied: res.ok, command: res.command, ...(res.error ? { error: res.error } : {}) }
         }
 
@@ -1301,7 +1394,7 @@ export async function executeMemoCli(
             return {
               exitCode: installExit,
               stdout: serializeWire(
-                wireSuccess('node', {
+                wireNode({
                   service,
                   ...(firewallResult ? { firewall: firewallResult } : {}),
                 }),
@@ -1315,7 +1408,7 @@ export async function executeMemoCli(
           if (firewallResult) {
             lines.push(
               firewallResult.applied
-                ? '  Windows Firewall rule memoseb-node created.'
+                ? `  Windows Firewall rule ${firewallName} created.`
                 : `  Firewall rule not created (${firewallResult.error ?? 'cancelled'}). Run in an elevated PowerShell: ${firewallResult.command}`,
             )
           } else if (runtime.platform === 'win32') {
@@ -1329,7 +1422,7 @@ export async function executeMemoCli(
         if (action === 'uninstall' || action === 'remove') {
           const service = await uninstallNodeService(ctx)
           if (jsonMode) {
-            return { exitCode: 0, stdout: serializeWire(wireSuccess('node', { service })), stderr: '' }
+            return { exitCode: 0, stdout: serializeWire(wireNode({ service })), stderr: '' }
           }
           return {
             exitCode: 0,
@@ -1347,7 +1440,7 @@ export async function executeMemoCli(
             if (jsonMode) {
               return {
                 exitCode: firewallExit,
-                stdout: serializeWire(wireSuccess('node', { firewall: result })),
+                stdout: serializeWire(wireNode({ firewall: result })),
                 stderr: '',
               }
             }
@@ -1363,7 +1456,7 @@ export async function executeMemoCli(
             return {
               exitCode: 0,
               stdout: serializeWire(
-                wireSuccess('node', {
+                wireNode({
                   firewall: { applied: false, command: firewall.powershell, netsh: firewall.netshArgs },
                 }),
               ),
@@ -1380,7 +1473,7 @@ export async function executeMemoCli(
         if (action === 'status') {
           const service = nodeServiceStatus(ctx)
           if (jsonMode) {
-            return { exitCode: 0, stdout: serializeWire(wireSuccess('node', { service })), stderr: '' }
+            return { exitCode: 0, stdout: serializeWire(wireNode({ service })), stderr: '' }
           }
           return {
             exitCode: 0,
@@ -1425,7 +1518,7 @@ export async function executeMemoCli(
           return {
             exitCode: 0,
             stdout: serializeWire(
-              wireSuccess('node', {
+              wireNode({
                 nodes,
                 parents: nodes,
                 tailscale: tailnet?.tailscale ?? 'disabled',
@@ -1507,10 +1600,11 @@ export async function executeMemoCli(
           })
         }
         const peer = vault.listPeers().find((p) => p.url === normalizedUrl)
+        if (peer?.peerNodeId) vault.includePeer(peer.peerNodeId)
         if (jsonMode) {
           return {
             exitCode: 0,
-            stdout: serializeWire(wireSuccess('node', { peer, config: vault.getNodeConfig() })),
+            stdout: serializeWire(wireNode({ peer, config: vault.getNodeConfig() })),
             stderr: '',
           }
         }
@@ -1591,10 +1685,11 @@ export async function executeMemoCli(
             }
           }
         }
+        if (peer?.peerNodeId) vault.includePeer(peer.peerNodeId)
         if (jsonMode) {
           return {
             exitCode: 0,
-            stdout: serializeWire(wireSuccess('node', { peer, config: vault.getNodeConfig() })),
+            stdout: serializeWire(wireNode({ peer, config: vault.getNodeConfig() })),
             stderr: '',
           }
         }
@@ -1683,10 +1778,11 @@ export async function executeMemoCli(
             }
           }
         }
+        if (peer?.peerNodeId) vault.includePeer(peer.peerNodeId)
         if (jsonMode) {
           return {
             exitCode: 0,
-            stdout: serializeWire(wireSuccess('node', { peer, config: vault.getNodeConfig() })),
+            stdout: serializeWire(wireNode({ peer, config: vault.getNodeConfig() })),
             stderr: '',
           }
         }
@@ -1720,11 +1816,12 @@ export async function executeMemoCli(
             stderr: 'Target peer URL or ID is required. Usage: memoseb node remove <url-or-id>\n',
           }
         }
-        const removed = vault.removePeer(target)
+        // Un peer quitado a mano no vuelve por la discovery hasta re-agregarlo
+        const removed = vault.removePeer(target, { exclude: true })
         if (jsonMode) {
           return {
             exitCode: 0,
-            stdout: serializeWire(wireSuccess('node', { target, removed })),
+            stdout: serializeWire(wireNode({ target, removed })),
             stderr: '',
           }
         }
@@ -1735,7 +1832,28 @@ export async function executeMemoCli(
         }
       }
 
+      const serveTokenFailure = (): CliResult | null => {
+        const cfg = vault.getNodeConfig()
+        const role = cfg.enabled ? cfg.role : (flags.role ?? cfg.role)
+        const host = flags.host ?? cfg.listenHost
+        const token = flags.token ?? cfg.authToken
+        if (role !== 'peer' || token || isLoopbackHost(host)) return null
+        const message = `Refusing to serve peer node on ${host} without a sync token.`
+        const hint =
+          'Run "memoseb node enable --role peer" (generates a token), pass --token <t> / --token-stdin / MEMOSEB_SYNC_TOKEN, or bind to 127.0.0.1 with --host.'
+        if (jsonMode) {
+          return {
+            exitCode: 2,
+            stdout: serializeWire(wireFailure('node', 'TOKEN_REQUIRED', message, hint)),
+            stderr: '',
+          }
+        }
+        return { exitCode: 2, stdout: '', stderr: `${message} ${hint}\n` }
+      }
+
       if (subcommand === 'serve' && switches.has('detach')) {
+        const tokenFailure = serveTokenFailure()
+        if (tokenFailure) return tokenFailure
         const dataDir = path.dirname(path.resolve(vault.dbPath))
         fs.mkdirSync(dataDir, { recursive: true })
         const logFile = path.join(dataDir, 'node-serve.log')
@@ -1759,7 +1877,7 @@ export async function executeMemoCli(
           return {
             exitCode: 0,
             stdout: serializeWire(
-              wireSuccess('node', { detached: true, pid: child.pid ?? null, logFile }),
+              wireNode({ detached: true, pid: child.pid ?? null, logFile }),
             ),
             stderr: '',
           }
@@ -1788,26 +1906,31 @@ export async function executeMemoCli(
             lanDiscovery: noLanFlag ? false : undefined,
           })
         }
+        const tokenFailure = serveTokenFailure()
+        if (tokenFailure) return tokenFailure
         const serveConfig = vault.getNodeConfig()
-        const serveHost = flags.host ?? serveConfig.listenHost
-        const serveToken = flags.token ?? serveConfig.authToken
-        if (serveConfig.role === 'peer' && !serveToken && !isLoopbackHost(serveHost)) {
-          const message = `Refusing to serve peer node on ${serveHost} without a sync token.`
-          const hint =
-            'Run "memoseb node enable --role peer" (generates a token) or pass --token <t>, or bind to 127.0.0.1 with --host.'
-          if (jsonMode) {
-            return {
-              exitCode: 2,
-              stdout: serializeWire(wireFailure('node', 'TOKEN_REQUIRED', message, hint)),
-              stderr: '',
-            }
+
+        if (serveConfig.role === 'peer') {
+          const tokenless = vault.listPeers().filter((p) => !p.authToken)
+          if (tokenless.length > 0) {
+            process.stderr.write(
+              `memoseb: ${tokenless.length} peer(s) have no sync token and will be rejected: ${tokenless
+                .map((p) => p.url)
+                .join(', ')}. Re-add them with "memoseb node add-peer <url> --token <t>" using the token printed by "memoseb node enable --role peer" on that node.\n`,
+            )
           }
-          return { exitCode: 2, stdout: '', stderr: `${message} ${hint}\n` }
+        }
+
+        // Rol peer con Tailscale activo: escuchar en la IP de Tailscale y loopback, no en 0.0.0.0
+        let bindHosts: string[] = []
+        if (serveConfig.role === 'peer' && flags.host === undefined) {
+          bindHosts = await resolvePeerBindHosts(runtime, serveConfig)
         }
 
         let loop: AutoSyncLoopHandle | null = null
         const handle = await startSyncServer(vault, {
-          host: flags.host,
+          host: bindHosts[0] ?? flags.host,
+          additionalHosts: bindHosts.slice(1),
           port: flags.port !== undefined ? Number(flags.port) : undefined,
           token: flags.token,
           enableUdpDiscovery: !noLanFlag,
@@ -1821,16 +1944,17 @@ export async function executeMemoCli(
         if (!noAutoSyncLoop) {
           loop = startAutoSyncLoop(vault, {
             intervalMs:
-              flags.interval !== undefined && Number(flags.interval) > 0
-                ? Number(flags.interval) * 60_000
-                : undefined,
+              intervalFlag.minutes !== undefined ? intervalFlag.minutes * 60_000 : undefined,
             discover: () =>
               discoverPeers(vault, runtime, {
                 port: handle.port,
                 lan: !noLanFlag && vault.getNodeConfig().lanDiscovery,
               }).then((r) => r.nodes),
             callbackUrl: (peerUrl) =>
-              resolveCallbackUrl(peerUrl, { port: handle.port, listenHost: handle.host }),
+              peerCallbackUrl(vault, peerUrl, {
+                port: handle.port,
+                listenHost: handle.hosts.length > 1 ? '0.0.0.0' : handle.host,
+              }),
             onEvent: (event) => {
               if (event.error) {
                 process.stderr.write(`memoseb auto-sync [${event.reason}] error: ${event.error}\n`)
@@ -1859,12 +1983,13 @@ export async function executeMemoCli(
         if (jsonMode) {
           process.stdout.write(
             serializeWire(
-              wireSuccess('node', {
+              wireNode({
                 serving: true,
                 url: primaryUrl,
                 urls: handle.urls,
                 port: handle.port,
                 host: handle.host,
+                hosts: handle.hosts,
                 role: vault.getNodeConfig().role,
               }),
             ) + '\n',
@@ -2275,7 +2400,7 @@ export async function executeMemoCli(
           return {
             exitCode: 0,
             stdout: serializeWire(
-              wireSuccess('group', { unassignedGroupPolicy: config.unassignedGroupPolicy, config }),
+              wireSuccess('group', redactTokens({ unassignedGroupPolicy: config.unassignedGroupPolicy, config })),
             ),
             stderr: '',
           }
@@ -2480,6 +2605,7 @@ export async function executeMemoCli(
       '  memoseb node <status|enable|disable|...>     Manage peer-to-peer network node & sync service',
       '  memoseb node serve [--detach]                Serve the node with the auto-sync loop (LAN + Tailscale discovery)',
       '  memoseb node service <install|uninstall|status|firewall> Opt-in background service (launchd/systemd --user/schtasks)',
+      '  memoseb node enable --role peer [--token <t> | --token-stdin] [--interval 1-1440]  Token also via MEMOSEB_SYNC_TOKEN',
       '  memoseb group <list|create|add-node|delete|...> Manage peer permission groups and ACLs',
       '  memoseb sync [--url <peer>] [--full] [--json] Synchronize memories with peers',
       '  memoseb mcp                                  Start stdio JSON-RPC 2.0 MCP server',
