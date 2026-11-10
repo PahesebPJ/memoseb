@@ -8,7 +8,13 @@ import os from 'node:os'
 import path from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { afterEach, beforeEach, describe, it } from 'node:test'
-import { discoverPeers, resolvePeerBindHosts, startAutoSyncLoop } from '../src/core/auto-sync.ts'
+import {
+  discoverPeers,
+  refreshPeerBindHosts,
+  resolvePeerBindHosts,
+  resolveServeBindPlan,
+  startAutoSyncLoop
+} from '../src/core/auto-sync.ts'
 import { computeMemoryContentHash } from '../src/core/p2p-contract.ts'
 import { renderSystemdUnit, renderWindowsLauncher } from '../src/core/service.ts'
 import { openVaultDatabase } from '../src/core/schema.ts'
@@ -591,6 +597,59 @@ describe('Security hardening of the P2P node', () => {
       [],
       'an IP not present locally is never bound'
     )
+  })
+
+  it('binds a peer to loopback while Tailscale is down and opens the Tailscale IP when it appears', async () => {
+    const runtime = { platform: 'linux' as const, env: {}, execProcess: async () => ({ exitCode: 0, stdout: '', stderr: '' }) }
+    const interfaces = {
+      tailscale0: [{ address: '100.101.1.1', family: 'IPv4', internal: false } as os.NetworkInterfaceInfo]
+    }
+    let tailscaleUp = false
+    const probe = async () =>
+      (tailscaleUp
+        ? { state: 'running', binary: 'tailscale', status: { backendState: 'Running', selfIps: ['100.101.1.1'], peers: [] } }
+        : { state: 'not-running', backendState: 'Stopped' }) as any
+    const config = { role: 'peer' as const, listenHost: '0.0.0.0', tailscaleBin: null }
+
+    const plan = await resolveServeBindPlan(runtime, config, undefined, { probeTailscale: probe, interfaces })
+    assert.deepEqual(plan, { auto: true, hosts: ['127.0.0.1'] }, 'never 0.0.0.0 while Tailscale is down')
+    assert.deepEqual(await resolveServeBindPlan(runtime, config, '0.0.0.0', { probeTailscale: probe, interfaces }), {
+      auto: false,
+      hosts: []
+    })
+
+    const opened: string[] = []
+    const handle = {
+      hosts: ['127.0.0.1'],
+      addListenHost: async (host: string) => {
+        opened.push(host)
+        handle.hosts.push(host)
+        return true
+      }
+    }
+    assert.deepEqual(await refreshPeerBindHosts(runtime, config, handle, { probeTailscale: probe, interfaces }), [])
+    tailscaleUp = true
+    assert.deepEqual(await refreshPeerBindHosts(runtime, config, handle, { probeTailscale: probe, interfaces }), [
+      '100.101.1.1'
+    ])
+    assert.deepEqual(await refreshPeerBindHosts(runtime, config, handle, { probeTailscale: probe, interfaces }), [])
+    assert.deepEqual(opened, ['100.101.1.1'])
+
+    const vault = open('bind-live')
+    vault.enableNodeMode({ role: 'peer', authToken: 'tok' })
+    const server = await startSyncServer(vault, { host: '127.0.0.1', port: 0, enableUdpDiscovery: false })
+    try {
+      assert.equal(await server.addListenHost('127.0.0.1'), false, 'an already bound host is not reopened')
+      if (await server.addListenHost('::1')) {
+        assert.ok(server.hosts.includes('::1'))
+        const res = await fetch(`http://[::1]:${server.port}/api/v1/p2p/status`, {
+          headers: { Authorization: 'Bearer tok' }
+        })
+        assert.equal(res.status, 200)
+      }
+    } finally {
+      await server.close()
+    }
   })
 
   it('runs discovery only for role peer, under the same mutex as sync, and stops between peers on close', async () => {

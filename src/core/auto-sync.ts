@@ -306,6 +306,39 @@ export async function discoverPeers(
 }
 
 /**
+ * Plan de bind de `serve` para un peer sin --host y con listenHost comodín:
+ * IP de Tailscale + loopback si Tailscale corre; si no, solo loopback (nunca
+ * 0.0.0.0). `auto` indica que la discovery debe reevaluarlo en cada ciclo.
+ */
+export async function resolveServeBindPlan(
+  runtime: Pick<SystemRuntime, 'platform' | 'env' | 'execProcess'>,
+  config: Pick<NodeConfiguration, 'role' | 'listenHost' | 'tailscaleBin'>,
+  explicitHost: string | undefined,
+  options?: Parameters<typeof resolvePeerBindHosts>[2]
+): Promise<{ auto: boolean; hosts: string[] }> {
+  const host = config.listenHost?.trim() || '0.0.0.0'
+  const auto =
+    config.role === 'peer' && explicitHost === undefined && (host === '0.0.0.0' || host === '::')
+  if (!auto) return { auto: false, hosts: [] }
+  const tailnet = await resolvePeerBindHosts(runtime, config, options)
+  return { auto: true, hosts: tailnet.length > 0 ? tailnet : ['127.0.0.1'] }
+}
+
+/** Abre en el servidor las IPs de Tailscale que hayan aparecido desde el arranque. */
+export async function refreshPeerBindHosts(
+  runtime: Pick<SystemRuntime, 'platform' | 'env' | 'execProcess'>,
+  config: Pick<NodeConfiguration, 'role' | 'listenHost' | 'tailscaleBin'>,
+  handle: { hosts: readonly string[]; addListenHost: (host: string) => Promise<boolean> },
+  options?: Parameters<typeof resolvePeerBindHosts>[2]
+): Promise<string[]> {
+  const added: string[] = []
+  for (const host of await resolvePeerBindHosts(runtime, config, options)) {
+    if (!handle.hosts.includes(host) && (await handle.addListenHost(host))) added.push(host)
+  }
+  return added
+}
+
+/**
  * Hosts de escucha de un nodo peer con listenHost comodín y Tailscale activo:
  * sus IPv4 de Tailscale presentes en las interfaces locales más 127.0.0.1.
  * Devuelve [] si no aplica (se usa el listenHost configurado).

@@ -56,7 +56,8 @@ import {
 import { MemoryVault, resolveVaultDbPath } from '../core/vault.ts'
 import {
   discoverPeers,
-  resolvePeerBindHosts,
+  refreshPeerBindHosts,
+  resolveServeBindPlan,
   startAutoSyncLoop,
   type AutoSyncLoopHandle,
 } from '../core/auto-sync.ts'
@@ -1952,11 +1953,10 @@ export async function executeMemoCli(
           }
         }
 
-        // Rol peer con Tailscale activo: escuchar en la IP de Tailscale y loopback, no en 0.0.0.0
-        let bindHosts: string[] = []
-        if (serveConfig.role === 'peer' && flags.host === undefined) {
-          bindHosts = await resolvePeerBindHosts(runtime, serveConfig)
-        }
+        // Rol peer sin --host: IP de Tailscale + loopback, o solo loopback si Tailscale
+        // no corre todavía; nunca 0.0.0.0. La discovery reabre la IP al aparecer.
+        const bindPlan = await resolveServeBindPlan(runtime, serveConfig, flags.host)
+        const bindHosts = bindPlan.hosts
 
         let loop: AutoSyncLoopHandle | null = null
         const handle = await startSyncServer(vault, {
@@ -1977,12 +1977,19 @@ export async function executeMemoCli(
             intervalMs:
               intervalFlag.minutes !== undefined ? intervalFlag.minutes * 60_000 : undefined,
             token: effectiveToken,
-            discover: () =>
-              discoverPeers(vault, runtime, {
+            discover: async () => {
+              if (bindPlan.auto) {
+                const opened = await refreshPeerBindHosts(runtime, vault.getNodeConfig(), handle)
+                if (opened.length > 0) {
+                  process.stderr.write(`memoseb node serve now also listening on ${opened.join(', ')}\n`)
+                }
+              }
+              return discoverPeers(vault, runtime, {
                 port: handle.port,
                 lan: !noLanFlag && vault.getNodeConfig().lanDiscovery,
                 token: effectiveToken,
-              }).then((r) => r.nodes),
+              }).then((r) => r.nodes)
+            },
             callbackUrl: (peerUrl) =>
               peerCallbackUrl(vault, peerUrl, {
                 port: handle.port,

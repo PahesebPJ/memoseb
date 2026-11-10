@@ -173,6 +173,8 @@ export interface SyncServerHandle {
   port: number
   udpPort: number | null
   urls: string[]
+  /** Abre otro host en el mismo puerto (p. ej. la IP de Tailscale al aparecer). */
+  addListenHost: (host: string) => Promise<boolean>
   close: () => Promise<void>
 }
 
@@ -1444,14 +1446,28 @@ export async function startSyncServer(
   const actualHttpPort = addr.port
 
   const extraServers: http.Server[] = []
+  let closed = false
+  const listenExtra = async (host: string): Promise<void> => {
+    const extra = http.createServer((req, res) => server.emit('request', req, res))
+    await new Promise<void>((resolve, reject) => {
+      extra.once('error', reject)
+      extra.listen(actualHttpPort, host, () => resolve())
+    })
+    extraServers.push(extra)
+  }
+  const addListenHost = async (host: string): Promise<boolean> => {
+    if (closed || listenHosts.includes(host)) return false
+    try {
+      await listenExtra(host)
+    } catch {
+      return false
+    }
+    listenHosts.push(host)
+    return true
+  }
   try {
     for (const host of listenHosts.slice(1)) {
-      const extra = http.createServer((req, res) => server.emit('request', req, res))
-      await new Promise<void>((resolve, reject) => {
-        extra.once('error', reject)
-        extra.listen(actualHttpPort, host, () => resolve())
-      })
-      extraServers.push(extra)
+      await listenExtra(host)
     }
   } catch (err) {
     for (const extra of extraServers) extra.close()
@@ -1578,7 +1594,9 @@ export async function startSyncServer(
     port: actualHttpPort,
     udpPort: actualUdpPort,
     urls,
+    addListenHost,
     close: async () => {
+      closed = true
       for (const srv of [server, ...extraServers]) {
         if (typeof srv.closeAllConnections === 'function') {
           srv.closeAllConnections()
