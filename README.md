@@ -161,7 +161,7 @@ Cuando trabajas en equipo, con múltiples estaciones de trabajo, entornos de pru
 
 ### Arquitectura de Red y Protocolo P2P
 
-- **Descubrimiento UDP LAN (`:7432`)**: Paquetes `MEMOSEB_DISCOVER_V1` y `MEMOSEB_ANNOUNCE_V1` con autenticación opcional HMAC-SHA256 (`authTag`).
+- **Descubrimiento UDP LAN (`:7432`)**: Paquetes `MEMOSEB_DISCOVER_V1` y `MEMOSEB_ANNOUNCE_V1` con HMAC-SHA256 ligado a `ip:puerto` (`authTag`/`authTags`); sin token no se registra a nadie.
 - **Endpoints REST Canónicos y Fallback Automático**: Rutas P2P dedicadas (`/api/v1/p2p/status`, `/api/v1/p2p/handshake`, `/api/v1/p2p/exchange`) que encapsulan la carga en sobres estándar `P2PContractEnvelopeV1` (compatibles con `KikeDeAlba/kit`), con fallback transparente a `/api/v1/sync/*`.
 - **Cabeceras de Autenticación Flexibles**: Valida indistintamente `Authorization: Bearer <token>`, `X-Memoseb-Token: <token>` o `X-Gaze-Token: <token>` con comparación en tiempo constante.
 - **Resolución Determinista**: Ambos modos resuelven conflictos mediante **Last-Write-Wins (LWW)** basándose en marcas de tiempo ISO-8601 (`updatedAt`) y hash SHA-256 (`contentHash`), propagando `tombstones` criptográficos para borrados definitivos.
@@ -217,12 +217,15 @@ memoseb sync
 #### Auto-sync, descubrimiento por Tailscale y servicio opcional
 
 - **`memoseb node serve` sincroniza solo**: al arrancar, cada `--interval` minutos (por omisión 5, se guarda con `node enable --interval N`), tras escrituras de otros procesos (CLI, MCP) detectadas con `PRAGMA data_version`, tras importaciones remotas que aplicaron cambios y en cuanto descubre un peer nuevo. `--no-auto-sync` lo desactiva. Fuera de `serve`, `remember` y `forget` siguen disparando el auto-sync de siempre.
-- **Descubrimiento unicast por Tailscale**: además del broadcast UDP de la LAN, `serve` y `node discover` leen `tailscale status --json` (binario de `--tailscale-bin`, `MEMOSEB_TAILSCALE_BIN`, `PATH`, `/opt/homebrew/bin`, `/usr/local/bin`, `/Applications/Tailscale.app/Contents/MacOS/Tailscale`; en Windows `tailscale.exe` en el `PATH` y `C:\Program Files\Tailscale\tailscale.exe`), sondean `GET /api/v1/p2p/status?nonce=<hex>` de cada peer en línea **sin enviar el token** y solo si el peer responde `authTag = HMAC-SHA256(token, nonce)` válido se le manda el token y se registra. Sin Tailscale o con un estado distinto de `Running` no hace nada. `--no-tailscale` lo apaga. Un peer quitado con `node remove` no vuelve por la discovery hasta que se agregue a mano (`node add-peer`).
+- **Descubrimiento unicast por Tailscale**: además del broadcast UDP de la LAN, `serve` y `node discover` leen `tailscale status --json` (binario de `--tailscale-bin`, `MEMOSEB_TAILSCALE_BIN`, `PATH`, `/opt/homebrew/bin`, `/usr/local/bin`, `/Applications/Tailscale.app/Contents/MacOS/Tailscale`; en Windows `tailscale.exe` en el `PATH` y `C:\Program Files\Tailscale\tailscale.exe`), sondean `GET /api/v1/p2p/status?nonce=<hex>` de cada peer en línea **sin enviar el token** y solo si el peer responde `authTag = HMAC-SHA256(token, nonce + "|" + host + ":" + port)` válido (ligado a la IP y el puerto sondeados) se le manda el token y se registra. Sin token no se descubre a nadie. Sin Tailscale o con un estado distinto de `Running` no hace nada. `--no-tailscale` lo apaga. Un peer quitado con `node remove` no vuelve por la discovery hasta que se agregue a mano (`node add-peer`).
 - **`callbackUrl`**: cada intercambio manda la URL por la que el otro nodo puede devolvernos la llamada (IP de Tailscale preferida, loopback si el peer es local). El servidor solo la acepta si su host es la IP de origen de la petición y es de Tailscale (`100.64.0.0/10`) o loopback; entonces registra al cliente con el token con el que se autenticó.
-- **Bind en Tailscale**: con rol `peer`, `listenHost` comodín y Tailscale en `Running`, `serve` escucha en la IP de Tailscale y en `127.0.0.1`, no en `0.0.0.0`. `--host` lo fuerza.
+- **Bind en Tailscale**: con rol `peer`, sin `--host` y `listenHost` comodín, `serve` nunca escucha en `0.0.0.0`: con Tailscale en `Running` usa la IP de Tailscale y `127.0.0.1`; si Tailscale no corre, solo `127.0.0.1`, y cada ciclo de discovery (60 s) abre la IP de Tailscale en cuanto aparece. Para servir en la LAN sin Tailscale usa `--host 0.0.0.0`.
+- **LAN sin Tailscale**: un peer de la LAN ya no se registra solo por `callbackUrl` (solo se aceptan IPs de Tailscale o loopback); agrégalo con `memoseb node add-peer <url> --token <t>`.
 - **Defensas HTTP**: el header `Host` debe ser loopback, una IP de Tailscale o `*.ts.net` (403 `INVALID_HOST`); los `POST` exigen `Content-Type: application/json` (415); las respuestas tienen tope de 25 MB y plazo total. El responder UDP no contesta sin `authTag` válido si el nodo tiene token, y las URLs de la LAN salen de la IP de origen del datagrama, nunca del anuncio.
 - **Token obligatorio en `peer`**: `node enable --role peer|p2p` sin token genera uno (64 hex) y lo muestra una sola vez, en texto (con `--json` va a stderr). Usa el mismo en todos los nodos. El token también se puede pasar con `MEMOSEB_SYNC_TOKEN` o `--token-stdin` en vez de `--token`. La salida `--json` de `node status`/`node enable` muestra `authToken: "[redacted]"`. `node serve` (también `--detach`) se niega a servir un nodo `peer` fuera de loopback sin token y el servidor responde `401 TOKEN_REQUIRED`. Un peer recibe solo su propio token: el token global ya no se envía a peers registrados sin token. La bóveda queda con permisos `0600` en macOS/Linux.
 - **`--interval`** acepta de 1 a 1440 minutos; un valor no numérico o fuera de rango se rechaza.
+- **Tokens de grupo**: `groupToken` aparece como `[redacted]` en toda salida `--json`; `group create --token` lo muestra una vez, en texto.
+- **`serve --detach`** pasa el token al proceso hijo por `MEMOSEB_SYNC_TOKEN` (nunca en su línea de comandos) y solo informa «started» cuando el hijo arrancó.
 - **El servicio en segundo plano es opcional y explícito**: `node enable` **no** instala servicios, tareas programadas, entradas de Startup ni reglas de firewall. Para dejar `serve` corriendo al iniciar sesión:
 
 ```bash
@@ -231,7 +234,7 @@ memoseb node service status
 memoseb node service uninstall   # también lo quitan `memoseb node disable` y `memoseb uninstall`
 ```
 
-El servicio va ligado a la bóveda: su nombre lleva un sufijo con el hash de la ruta de `--db` (`io.github.pahesebpj.memoseb.node.<hash>`, `memoseb-node-<hash>.service`, tarea `memoseb-node-<hash>`), y `disable`/`uninstall` solo quitan el de su `--db`.
+El servicio va ligado a la bóveda: su nombre y sus archivos (`node-serve-<hash>.log`, `node-serve-<hash>.pid`, `node-service-<hash>.json`, `node-firewall-<hash>.json`) llevan un sufijo con el hash de la ruta de `--db` (`io.github.pahesebpj.memoseb.node.<hash>`, `memoseb-node-<hash>.service`, tarea `memoseb-node-<hash>`), y `disable`/`uninstall` solo quitan lo de su `--db`. Antes de detener el pid registrado se comprueba que sea un `memoseb node serve`.
 
 En Windows la tarea `memoseb-node-<hash>` corre `memoseb node serve --detach`; si `schtasks` no se deja crear, usa la carpeta Startup del perfil. Para aceptar peers por Tailscale hay que permitir el puerto en el Firewall de Windows (opt-in):
 
@@ -248,7 +251,8 @@ Si la regla la creó `--apply`, `memoseb node service uninstall` y `memoseb unin
 - Los peers registrados antes **sin token propio** ya no reciben el token global y serán rechazados: `node serve` avisa al arrancar. Vuelve a agregarlos con `memoseb node add-peer <url> --token <t>` usando el token que `memoseb node enable --role peer` mostró en ese nodo.
 - La primera vez que se abre la bóveda, `memories.content_hash` se recalcula con la fórmula del contrato (`sha256(project:category:content.trim())`); las filas que chocarían con otra se dejan como estaban.
 - El servicio instalado con la versión anterior (sin sufijo) no se reconoce: quítalo con `launchctl bootout gui/$(id -u)/io.github.pahesebpj.memoseb.node`, `systemctl --user disable --now memoseb-node.service` o `schtasks /Delete /TN memoseb-node /F`, y vuelve a instalarlo.
-- Los nodos gaze deben responder el reto `nonce`/`authTag` en `GET /api/v1/p2p/status` para ser descubiertos por Tailscale.
+- Los nodos gaze deben responder el reto `nonce`/`authTag` (fórmula ligada a `host:port`) en `GET /api/v1/p2p/status` para ser descubiertos por Tailscale.
+- Los miembros de grupo agregados por `nodeId` o nombre antes de registrar el peer ya no lo identifican: vuelve a agregarlos con `memoseb group add-node <grupo> <url-del-peer>`.
 
 #### Modo B: Configuración Jerárquica (Padre ↔ Hijos)
 
@@ -265,7 +269,7 @@ memoseb node serve
 ```
 
 > [!NOTE]
-> `memoseb node serve` escucha en `0.0.0.0:7432` por defecto y responde a sondeos de descubrimiento UDP en la LAN. Si deseas limitar el servicio solo a HTTP sin descubrimiento UDP, añade `--no-lan`.
+> `memoseb node serve` escucha en `0.0.0.0:7432` por defecto (salvo con rol `peer`, que usa Tailscale + loopback, ver arriba) y responde a sondeos de descubrimiento UDP en la LAN. Si deseas limitar el servicio solo a HTTP sin descubrimiento UDP, añade `--no-lan`.
 
 ##### 2. Configurar el Nodo Hijo
 

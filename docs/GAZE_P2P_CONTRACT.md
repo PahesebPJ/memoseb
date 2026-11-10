@@ -253,10 +253,11 @@ El protocolo implementa descubrimiento local sin configuración previa sobre el 
       "magic": "MEMOSEB_DISCOVER_V1",
       "nonce": "c929a738-4f51-41fa-8d48-6a56ecbe319b",
       "timestamp": "2026-11-10T04:00:00.000Z",
-      "authTag": "hex(HMAC-SHA256(token, nonce))"
+      "authTag": "hex(HMAC-SHA256(token, 'udp|' + nonce + '|' + ipDestino + ':' + puertoUdp))"
     }
     ```
-- Si el nodo tiene token (global o de grupo), **no responde** a solicitudes sin `authTag` válido.
+- Se envía un datagrama por destino, cada uno con el tag ligado a su `ip:puerto` de destino (por ejemplo `255.255.255.255:7432` o `127.0.0.1:7432`).
+- Si el nodo tiene token (global o de grupo), **no responde** a solicitudes sin un `authTag` válido para alguno de sus destinos posibles (sus IPv4 locales, sus direcciones de broadcast, `255.255.255.255` y `127.0.0.1`).
 - **Respuesta de Anuncio (`MEMOSEB_ANNOUNCE_V1`)**:
   - Unicast directo a la dirección y puerto de origen del datagrama.
   - Carga JSON:
@@ -272,10 +273,12 @@ El protocolo implementa descubrimiento local sin configuración previa sobre el 
       "requiresAuth": true,
       "app": "memoseb",
       "contracts": ["memoseb-snapshot", "p2p-memory-contract"],
-      "authTag": "hex(HMAC-SHA256(token, nonce + ':response'))"
+      "authTags": {
+        "192.168.1.150": "hex(HMAC-SHA256(token, 'udp|response|' + nonce + '|' + 192.168.1.150 + ':' + puertoUdp))"
+      }
     }
     ```
-- El `authTag` de la respuesta usa otro dominio (`nonce + ':response'`) para que no se pueda reflejar el de la solicitud.
+- `authTags` lleva un tag por cada IPv4 local desde la que puede salir el datagrama; el cliente verifica el de `rinfo.address:rinfo.port`. Un anuncio reenviado desde otra IP no verifica, y los dominios `udp|` y `udp|response|` impiden reflejar el tag de la solicitud o reutilizar uno HTTP.
 - El cliente ignora `urls`: la URL del nodo es `http://<IP de origen del datagrama>:<port>`.
 
 ### 5.1.1 Descubrimiento unicast por Tailscale
@@ -283,10 +286,17 @@ El protocolo implementa descubrimiento local sin configuración previa sobre el 
 El broadcast UDP no cruza el tailnet. `memoseb node serve` (cada 60 s) y `memoseb node discover` leen `tailscale status --json` y, si `BackendState` es `Running`, sondean cada peer con `Online: true` en su primera IPv4 (2 s de timeout) con un reto, sin enviar el token:
 
 1. `GET /api/v1/p2p/status?nonce=<hex aleatorio>` (también vale el header `X-P2P-Nonce`), sin `Authorization`.
-2. Un servidor con token responde `200` con `authTag = hex(HMAC-SHA256(token, nonce))` en la raíz y en `data`, sin `stats`, `nodeId` ni otros datos. Sin nonce y sin token responde `401`. Un nonce inválido (fuera de `[A-Za-z0-9-]{16,128}`) responde `400`.
-3. Solo si el `authTag` es válido el cliente repite el `GET` con `Authorization: Bearer <token>` y obtiene el status completo.
+2. Un servidor con token responde `200` con el tag ligado al endpoint, en la raíz y en `data`, sin `stats`, `nodeId` ni otros datos:
 
-Un nodo es válido si pasa el reto, responde `ok`, anuncia `p2p-memory-contract` y su `nodeId` no es el propio ni está en la lista de exclusión (`node remove`); se registra como peer con ese token (`lastStatus: discovered`) y se sincroniza al momento. La discovery solo corre con rol `peer` y bajo el mismo mutex que el sync. Sin binario, con error o con otro estado (por ejemplo `NeedsLogin`) no se hace nada y se reintenta en el siguiente ciclo.
+   ```text
+   authTag = hex(HMAC-SHA256(token, nonce + "|" + host + ":" + port))
+   ```
+
+   `host:port` es la dirección que marcó el cliente. El servidor la toma de `req.socket.localAddress:localPort` y normaliza `::ffff:a.b.c.d` a `a.b.c.d`; el cliente usa la IP y el puerto que sondeó. Un nodo que reenvía el reto a otro (relay) obtiene un tag ligado a otra dirección y no verifica. gaze usa la misma fórmula.
+3. Sin nonce y sin token responde `401`. Un nonce inválido (fuera de `[A-Za-z0-9-]{16,128}`) responde `400`.
+4. Solo si el `authTag` es válido el cliente repite el `GET` con `Authorization: Bearer <token>`; ese segundo sondeo sigue siendo necesario porque el reto anónimo no revela `nodeId`, `nodeName` ni `stats`.
+
+Sin token no se sondea ni se registra a nadie. El token es el efectivo de `serve` (incluido un `--token` no persistido). Un nodo es válido si pasa el reto, responde `ok`, anuncia `p2p-memory-contract` y su `nodeId` no es el propio ni está en la lista de exclusión (`node remove`); se registra como peer con ese token (`lastStatus: discovered`) y se sincroniza al momento. La discovery solo corre con rol `peer` y bajo el mismo mutex que el sync. Sin binario, con error o con otro estado (por ejemplo `NeedsLogin`) no se hace nada y se reintenta en el siguiente ciclo.
 
 Orden de búsqueda del binario: `node.tailscale_bin` (`--tailscale-bin`), `MEMOSEB_TAILSCALE_BIN`, `tailscale`/`tailscale.exe` en el `PATH`, `/opt/homebrew/bin/tailscale`, `/usr/local/bin/tailscale`, `/Applications/Tailscale.app/Contents/MacOS/Tailscale` (macOS), `/usr/bin/tailscale` (Linux) y `C:\Program Files\Tailscale\tailscale.exe` (Windows).
 
@@ -306,7 +316,8 @@ Además, antes de autenticar:
 
 - El header `Host` debe ser loopback, una IPv4 de Tailscale (`100.64.0.0/10`) o un nombre MagicDNS `*.ts.net` (con rol `parent`/`child` también se aceptan IPs de LAN); si no, `403 INVALID_HOST`.
 - Los `POST` exigen `Content-Type: application/json`; si no, `415 UNSUPPORTED_MEDIA_TYPE`.
-- La membresía de grupos sale del token de grupo o de un peer registrado localmente (por su `callbackUrl` verificada, o por `peerNodeId` cuando la IP de su URL coincide con la de origen), nunca del `nodeId` o `clientName` del cuerpo.
+- La membresía de grupos sale del token de grupo o de la identidad local del peer registrado (su id, su URL o la IP de esa URL), nunca de su nombre ni del `nodeId`/`clientName` declarados en un handshake o en el cuerpo. El servidor encuentra al peer por su `callbackUrl` verificada, o por `peerNodeId` solo cuando la IP de su URL coincide con la de origen. `group add-node` sobre un peer registrado guarda su id y su URL.
+- El cliente también aplica esta regla al importar lo que trae (`pull`): un update o tombstone por `id` no toca filas locales de proyectos que el peer no puede escribir.
 - En `exchange`, un update o tombstone por `id` solo se aplica si el proyecto de la fila local y el entrante están permitidos para ese peer.
 - Las respuestas que lee el cliente tienen un tope de 25 MB y un plazo total.
 
