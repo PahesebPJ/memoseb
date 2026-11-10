@@ -4,16 +4,29 @@ import http from 'node:http'
 import https from 'node:https'
 import type { AddressInfo } from 'node:net'
 import os from 'node:os'
-import type {
-  EffectivePeerPermissions,
-  GroupPermissionMode,
-  MemoryCategory,
-  NodeConfiguration,
-  NodeRole,
-  PeerRole,
-  SyncGroupRecord,
-  SyncPeerRecord
+import {
+  normalizeNodeRole,
+  normalizePeerRole,
+  parseNodeRoleInput,
+  parsePeerRoleInput,
+  type EffectivePeerPermissions,
+  type GroupPermissionMode,
+  type MemoryCategory,
+  type NodeConfiguration,
+  type NodeRole,
+  type PeerRole,
+  type SyncGroupRecord,
+  type SyncPeerRecord
 } from './schema.ts'
+import {
+  isP2PContractPayload,
+  p2pPayloadToSnapshot,
+  snapshotToP2PPayload,
+  unwrapP2PEnvelope,
+  wrapP2PEnvelope,
+  type P2PContractEnvelopeV1,
+  type P2PSyncPayloadV1
+} from './p2p-contract.ts'
 import {
   filterSnapshotByPermissions,
   type ExportedProject,
@@ -40,7 +53,7 @@ export interface SyncCapableVault {
     patch: Partial<Omit<NodeConfiguration, 'nodeId'>>
   ): NodeConfiguration
   enableNodeMode(options: {
-    role: 'parent' | 'child'
+    role: PeerRole | 'p2p'
     nodeName?: string
     listenHost?: string
     listenPort?: number
@@ -50,7 +63,7 @@ export interface SyncCapableVault {
   }): NodeConfiguration
   disableNodeMode(options?: { purgePeers?: boolean }): NodeConfiguration
   upsertPeer(input: {
-    role: 'parent' | 'child'
+    role: PeerRole | 'p2p'
     url: string
     name?: string
     peerNodeId?: string | null
@@ -59,7 +72,7 @@ export interface SyncCapableVault {
     lastStatus?: string | null
   }): SyncPeerRecord
   removePeer(urlOrId: string): boolean
-  listPeers(role?: 'parent' | 'child'): SyncPeerRecord[]
+  listPeers(role?: PeerRole | 'p2p'): SyncPeerRecord[]
   updatePeerSyncState(
     urlOrId: string,
     state: {
@@ -107,15 +120,19 @@ export interface SyncCapableVault {
   }): EffectivePeerPermissions
 }
 
-export interface DiscoveredParentNode {
+export interface DiscoveredLanNode {
   nodeId: string
   nodeName: string
-  role: 'parent'
+  role: 'parent' | 'peer'
   port: number
   urls: string[]
   address: string
   requiresAuth: boolean
+  app?: string
+  contracts?: string[]
 }
+
+export type DiscoveredParentNode = DiscoveredLanNode
 
 export interface DiscoverPacket {
   magic: typeof DISCOVERY_MAGIC_REQUEST
@@ -129,10 +146,12 @@ export interface AnnouncePacket {
   nonce: string
   nodeId: string
   nodeName: string
-  role: 'parent'
+  role: 'parent' | 'peer'
   port: number
   urls: string[]
   requiresAuth: boolean
+  app?: string
+  contracts?: string[]
   authTag?: string
 }
 
@@ -148,7 +167,7 @@ export interface HandshakeResult {
   peerUrl: string
   peerNodeId: string
   peerName: string
-  peerRole: 'parent' | 'child'
+  peerRole: PeerRole
   status: string
   timestamp: string
   peer: SyncPeerRecord
@@ -159,7 +178,7 @@ export interface PeerSyncResult {
   peerUrl: string
   peerNodeId: string
   peerName: string
-  peerRole: 'parent' | 'child'
+  peerRole: PeerRole
   pushed: SnapshotImportResult
   pulled: SnapshotImportResult
   syncedAt: string
@@ -344,15 +363,17 @@ async function sendJsonRequest<T>(
   return parsedBody as T
 }
 
-export async function discoverLanParents(options?: {
+export async function discoverLanNodes(options?: {
   port?: number
   timeoutMs?: number
   token?: string | null
   broadcastAddresses?: string[]
-}): Promise<DiscoveredParentNode[]> {
+  roleFilter?: 'parent' | 'peer' | 'any'
+}): Promise<DiscoveredLanNode[]> {
   const targetPort = options?.port ?? 7432
   const timeoutMs = options?.timeoutMs ?? 600
   const token = options?.token ?? null
+  const roleFilter = options?.roleFilter ?? 'any'
   const broadcastAddresses = options?.broadcastAddresses ?? [
     '255.255.255.255',
     '127.0.0.1'
@@ -374,7 +395,7 @@ export async function discoverLanParents(options?: {
   }
 
   const payload = Buffer.from(JSON.stringify(discoverPacket))
-  const discovered = new Map<string, DiscoveredParentNode>()
+  const discovered = new Map<string, DiscoveredLanNode>()
 
   return new Promise((resolve) => {
     const socket = dgram.createSocket({ type: 'udp4', reuseAddr: true })
@@ -404,7 +425,10 @@ export async function discoverLanParents(options?: {
         if (raw.nonce !== nonce) {
           return
         }
-        if (raw.role !== 'parent' || !raw.nodeId) {
+        if ((raw.role !== 'parent' && raw.role !== 'peer') || !raw.nodeId) {
+          return
+        }
+        if (roleFilter !== 'any' && raw.role !== roleFilter) {
           return
         }
         if (token) {
@@ -426,12 +450,16 @@ export async function discoverLanParents(options?: {
         if (!discovered.has(raw.nodeId)) {
           discovered.set(raw.nodeId, {
             nodeId: String(raw.nodeId),
-            nodeName: String(raw.nodeName || 'Parent Node'),
-            role: 'parent',
+            nodeName: String(
+              raw.nodeName || (raw.role === 'peer' ? 'Peer Node' : 'Parent Node')
+            ),
+            role: raw.role as 'parent' | 'peer',
             port,
             urls,
             address: rinfo.address,
-            requiresAuth: Boolean(raw.requiresAuth)
+            requiresAuth: Boolean(raw.requiresAuth),
+            app: typeof raw.app === 'string' ? raw.app : undefined,
+            contracts: Array.isArray(raw.contracts) ? raw.contracts : undefined
           })
         }
       } catch {
@@ -454,6 +482,8 @@ export async function discoverLanParents(options?: {
     })
   })
 }
+
+export const discoverLanParents = discoverLanNodes
 
 export async function startSyncServer(
   vault: SyncCapableVault,
@@ -507,6 +537,9 @@ export async function startSyncServer(
       if (!providedToken && typeof req.headers['x-memoseb-token'] === 'string') {
         providedToken = req.headers['x-memoseb-token'].trim()
       }
+      if (!providedToken && typeof req.headers['x-gaze-token'] === 'string') {
+        providedToken = req.headers['x-gaze-token'].trim()
+      }
 
       let matchedGroup: SyncGroupRecord | null = null
       if (providedToken && vault.findGroupByToken) {
@@ -529,17 +562,32 @@ export async function startSyncServer(
       )
       const pathname = parsedUrl.pathname
 
-      // Endpoint: GET /api/v1/sync/status
-      if (req.method === 'GET' && pathname === '/api/v1/sync/status') {
-        sendJson(200, {
+      // Endpoint: GET /api/v1/sync/status or GET /api/v1/p2p/status
+      if (
+        req.method === 'GET' &&
+        (pathname === '/api/v1/sync/status' || pathname === '/api/v1/p2p/status')
+      ) {
+        const statusData = {
           ok: true,
           nodeId: currentConfig.nodeId,
           nodeName: currentConfig.nodeName,
           enabled: currentConfig.enabled,
           role: currentConfig.role,
           stats: vault.getStats(),
-          timestamp: new Date().toISOString()
-        })
+          timestamp: new Date().toISOString(),
+          supportedContracts: ['memoseb-snapshot', 'p2p-memory-contract']
+        }
+        if (pathname === '/api/v1/p2p/status') {
+          sendJson(200, {
+            ...statusData,
+            schemaVersion: 1,
+            command: 'status',
+            generatedAt: statusData.timestamp,
+            data: statusData
+          })
+        } else {
+          sendJson(200, statusData)
+        }
         return
       }
 
@@ -581,15 +629,32 @@ export async function startSyncServer(
           return
         }
 
-        // Endpoint: POST /api/v1/sync/handshake
-        if (pathname === '/api/v1/sync/handshake') {
+        // Endpoint: POST /api/v1/sync/handshake or POST /api/v1/p2p/handshake
+        if (
+          pathname === '/api/v1/sync/handshake' ||
+          pathname === '/api/v1/p2p/handshake'
+        ) {
+          const isP2PRoute = pathname === '/api/v1/p2p/handshake'
+          const isEnvelope =
+            body &&
+            typeof body === 'object' &&
+            body.schemaVersion === 1 &&
+            body.data
+          const data = isEnvelope ? body.data : body
+
           const {
             nodeId,
             nodeName,
-            role: clientRole,
             callbackUrl,
             groups
-          } = body
+          } = data
+
+          const rawRole = data.role
+          let clientRole = parsePeerRoleInput(rawRole)
+          if (!clientRole && isP2PRoute) {
+            clientRole = 'peer'
+          }
+
           if (!nodeId || !clientRole) {
             sendJson(400, {
               ok: false,
@@ -611,7 +676,9 @@ export async function startSyncServer(
           if (
             safeCallbackUrl &&
             ((currentConfig.role === 'parent' && clientRole === 'child') ||
-              (currentConfig.role === 'child' && clientRole === 'parent'))
+              (currentConfig.role === 'child' && clientRole === 'parent') ||
+              currentConfig.role === 'peer' ||
+              clientRole === 'peer')
           ) {
             vault.upsertPeer({
               role: clientRole,
@@ -674,37 +741,79 @@ export async function startSyncServer(
                 canPull: () => true
               }
 
-          sendJson(200, {
+          const timestamp = new Date().toISOString()
+          const handshakeData = {
             ok: true,
             nodeId: currentConfig.nodeId,
             nodeName: currentConfig.nodeName,
             role: currentConfig.role,
             assignedGroups: policy.groups,
             stats: vault.getStats(),
-            timestamp: new Date().toISOString()
-          })
+            timestamp,
+            supportedContracts: ['memoseb-snapshot', 'p2p-memory-contract']
+          }
+
+          if (isP2PRoute || isEnvelope) {
+            sendJson(200, {
+              ...handshakeData,
+              schemaVersion: 1,
+              command: 'handshake',
+              generatedAt: timestamp,
+              data: handshakeData
+            })
+          } else {
+            sendJson(200, handshakeData)
+          }
           return
         }
 
-        // Endpoint: POST /api/v1/sync/exchange
-        if (pathname === '/api/v1/sync/exchange') {
+        // Endpoint: POST /api/v1/sync/exchange or POST /api/v1/p2p/exchange
+        if (
+          pathname === '/api/v1/sync/exchange' ||
+          pathname === '/api/v1/p2p/exchange'
+        ) {
+          const isP2PRoute = pathname === '/api/v1/p2p/exchange'
+          const isEnvelope =
+            body &&
+            typeof body === 'object' &&
+            body.schemaVersion === 1 &&
+            body.data
+          const data = isEnvelope ? body.data : body
+
           const {
             clientNodeId,
             clientName,
-            clientRole,
+            clientRole: rawClientRole,
             callbackUrl,
             since,
             projectId,
-            delta
-          } = body
+            delta: rawDelta,
+            contract,
+            format
+          } = data
 
-          if (!delta) {
+          if (!rawDelta) {
             sendJson(400, {
               ok: false,
               error: 'BAD_REQUEST',
               message: 'Missing delta in exchange request.'
             })
             return
+          }
+
+          const clientRole: PeerRole = parsePeerRoleInput(rawClientRole) ?? 'peer'
+          const isIncomingP2PDelta =
+            isP2PContractPayload(rawDelta) ||
+            (typeof rawDelta === 'object' &&
+              rawDelta !== null &&
+              (rawDelta.format === 'p2p-memory-contract' ||
+                (rawDelta.schemaVersion === 1 && rawDelta.data)))
+
+          let delta: VaultSnapshotV1
+          if (isIncomingP2PDelta) {
+            delta = p2pPayloadToSnapshot(rawDelta)
+          } else {
+            delta = rawDelta as VaultSnapshotV1
           }
 
           let safeCallbackUrl: string | undefined
@@ -758,10 +867,10 @@ export async function startSyncServer(
           if (
             !policy.unrestricted &&
             delta &&
-            Array.isArray((delta as VaultSnapshotV1).memories)
+            Array.isArray(delta.memories)
           ) {
             const { filtered, droppedMemories } = filterSnapshotByPermissions(
-              delta as VaultSnapshotV1,
+              delta,
               (proj, cat) => policy.canPush(proj, cat)
             )
             incomingDelta = filtered
@@ -798,7 +907,7 @@ export async function startSyncServer(
 
           if (safeCallbackUrl) {
             vault.upsertPeer({
-              role: clientRole ?? 'child',
+              role: clientRole,
               url: safeCallbackUrl,
               name: clientName || 'Peer',
               peerNodeId: clientNodeId ?? null,
@@ -807,16 +916,44 @@ export async function startSyncServer(
             })
           }
 
-          sendJson(200, {
+          const wantsP2P =
+            isP2PRoute ||
+            isEnvelope ||
+            contract === 'p2p-memory-contract' ||
+            format === 'p2p' ||
+            format === 'gaze' ||
+            isIncomingP2PDelta
+
+          let responseDelta: any = serverDelta
+          if (wantsP2P) {
+            responseDelta = snapshotToP2PPayload(serverDelta as VaultSnapshotV1, {
+              app: 'memoseb',
+              originNodeName: currentConfig.nodeName
+            })
+          }
+
+          const exchangeData = {
             ok: true,
             serverNodeId: currentConfig.nodeId,
             serverName: currentConfig.nodeName,
             serverRole: currentConfig.role,
             serverTimestamp,
             appliedOnServer,
-            serverDelta,
+            serverDelta: responseDelta,
             effectiveGroups: policy.groups
-          })
+          }
+
+          if (wantsP2P || isEnvelope) {
+            sendJson(200, {
+              ...exchangeData,
+              schemaVersion: 1,
+              command: 'exchange',
+              generatedAt: serverTimestamp,
+              data: exchangeData
+            })
+          } else {
+            sendJson(200, exchangeData)
+          }
           return
         }
       }
@@ -859,7 +996,7 @@ export async function startSyncServer(
     udpSocket.on('message', (msg, rinfo) => {
       try {
         const cfg = vault.getNodeConfig()
-        if (!cfg.enabled || cfg.role !== 'parent') {
+        if (!cfg.enabled || (cfg.role !== 'parent' && cfg.role !== 'peer')) {
           return
         }
         const data = JSON.parse(msg.toString('utf-8'))
@@ -915,10 +1052,12 @@ export async function startSyncServer(
           nonce,
           nodeId: cfg.nodeId,
           nodeName: cfg.nodeName,
-          role: 'parent',
+          role: cfg.role as 'parent' | 'peer',
           port: actualHttpPort,
           urls: getLocalLanUrls(actualHttpPort),
           requiresAuth: hasAuth,
+          app: 'memoseb',
+          contracts: ['memoseb-snapshot', 'p2p-memory-contract'],
           ...(hasAuth && signingToken
             ? {
                 authTag: crypto
@@ -981,7 +1120,7 @@ export async function performPeerHandshake(
   vault: SyncCapableVault,
   options: {
     peerUrl: string
-    peerRole: 'parent' | 'child'
+    peerRole: PeerRole | 'p2p'
     token?: string | null
     callbackUrl?: string
     groups?: readonly string[]
@@ -990,15 +1129,17 @@ export async function performPeerHandshake(
 ): Promise<HandshakeResult> {
   const normalizedUrl = normalizePeerUrl(options.peerUrl)
   const config = vault.getNodeConfig()
-  const myRole: 'parent' | 'child' =
+  const normalizedPeerRole = normalizePeerRole(options.peerRole)
+  const myRole: PeerRole =
     config.role === 'standalone'
-      ? options.peerRole === 'parent'
+      ? normalizedPeerRole === 'parent'
         ? 'child'
-        : 'parent'
-      : (config.role as 'parent' | 'child')
+        : normalizedPeerRole === 'child'
+          ? 'parent'
+          : 'peer'
+      : (config.role as PeerRole)
 
-  const targetUrl = `${normalizedUrl}/api/v1/sync/handshake`
-  const body = {
+  const bodyData = {
     nodeId: config.nodeId,
     nodeName: config.nodeName,
     role: myRole,
@@ -1006,40 +1147,66 @@ export async function performPeerHandshake(
     groups: options.groups
   }
 
-  const res = await sendJsonRequest<{
-    ok: boolean
-    nodeId: string
-    nodeName: string
-    role: string
-    assignedGroups?: string[]
-    stats?: any
-    timestamp?: string
-  }>(targetUrl, {
-    method: 'POST',
-    token: options.token ?? null,
-    body,
-    timeoutMs: options.timeoutMs ?? 5000
-  })
+  const p2pEnvelope = wrapP2PEnvelope('handshake', bodyData)
+  const isPeer = normalizedPeerRole === 'peer' || config.role === 'peer'
 
-  const timestamp = res.timestamp ?? new Date().toISOString()
+  let res: any
+  if (isPeer) {
+    try {
+      res = await sendJsonRequest<any>(`${normalizedUrl}/api/v1/p2p/handshake`, {
+        method: 'POST',
+        token: options.token ?? null,
+        body: {
+          ...p2pEnvelope,
+          ...bodyData
+        },
+        timeoutMs: options.timeoutMs ?? 5000
+      })
+    } catch (err: any) {
+      if (err?.statusCode === 404) {
+        res = await sendJsonRequest<any>(`${normalizedUrl}/api/v1/sync/handshake`, {
+          method: 'POST',
+          token: options.token ?? null,
+          body: bodyData,
+          timeoutMs: options.timeoutMs ?? 5000
+        })
+      } else {
+        throw err
+      }
+    }
+  } else {
+    res = await sendJsonRequest<any>(`${normalizedUrl}/api/v1/sync/handshake`, {
+      method: 'POST',
+      token: options.token ?? null,
+      body: bodyData,
+      timeoutMs: options.timeoutMs ?? 5000
+    })
+  }
+
+  const unwrappedRes = unwrapP2PEnvelope(res) as any
+  const timestamp =
+    unwrappedRes.timestamp ?? res.timestamp ?? new Date().toISOString()
+  const peerNodeId = unwrappedRes.nodeId ?? res.nodeId
+  const peerNodeName = (unwrappedRes.nodeName ?? res.nodeName) || 'Peer'
+
   const peerRecord = vault.upsertPeer({
-    role: options.peerRole,
+    role: normalizedPeerRole,
     url: normalizedUrl,
-    name: res.nodeName || 'Peer',
-    peerNodeId: res.nodeId,
+    name: peerNodeName,
+    peerNodeId,
     authToken: options.token ?? null,
     lastStatus: 'paired'
   })
 
   return {
     peerUrl: normalizedUrl,
-    peerNodeId: res.nodeId,
-    peerName: res.nodeName || 'Peer',
-    peerRole: options.peerRole,
+    peerNodeId,
+    peerName: peerNodeName,
+    peerRole: normalizedPeerRole,
     status: 'paired',
     timestamp,
     peer: peerRecord,
-    assignedGroups: res.assignedGroups
+    assignedGroups: unwrappedRes.assignedGroups ?? res.assignedGroups
   }
 }
 
@@ -1047,12 +1214,13 @@ export async function syncWithPeer(
   vault: SyncCapableVault,
   options: {
     peerUrl: string
-    peerRole?: 'parent' | 'child'
+    peerRole?: PeerRole | 'p2p'
     token?: string | null
     projectId?: string
     full?: boolean
     forceWhenDisabled?: boolean
     timeoutMs?: number
+    contract?: 'memoseb' | 'p2p' | 'gaze'
   }
 ): Promise<PeerSyncResult> {
   const config = vault.getNodeConfig()
@@ -1075,7 +1243,9 @@ export async function syncWithPeer(
     options.token !== undefined
       ? options.token
       : (existingPeer?.authToken ?? null)
-  const peerRole = options.peerRole ?? existingPeer?.role ?? 'parent'
+  const peerRole = normalizePeerRole(
+    options.peerRole ?? existingPeer?.role ?? 'parent'
+  )
   const since = options.full ? undefined : (existingPeer?.lastSyncAt ?? undefined)
 
   try {
@@ -1084,9 +1254,10 @@ export async function syncWithPeer(
       projectId: options.projectId
     })
 
-    const isParentInitiator = config.role === 'parent'
-    const childPolicy: EffectivePeerPermissions =
-      isParentInitiator && vault.evaluatePeerPermissions
+    const isAuthorityInitiator =
+      config.role === 'parent' || config.role === 'peer'
+    const targetPolicy: EffectivePeerPermissions =
+      isAuthorityInitiator && vault.evaluatePeerPermissions
         ? vault.evaluatePeerPermissions({
             peerId: existingPeer?.id ?? null,
             peerNodeId: existingPeer?.peerNodeId ?? null,
@@ -1101,63 +1272,125 @@ export async function syncWithPeer(
           }
 
     if (
-      isParentInitiator &&
-      !childPolicy.unrestricted &&
+      isAuthorityInitiator &&
+      !targetPolicy.unrestricted &&
       localDelta &&
       Array.isArray((localDelta as VaultSnapshotV1).memories)
     ) {
       const { filtered } = filterSnapshotByPermissions(
         localDelta as VaultSnapshotV1,
-        (proj, cat) => childPolicy.canPull(proj, cat)
+        (proj, cat) => targetPolicy.canPull(proj, cat)
       )
       localDelta = filtered
     }
 
-    const myRole: 'parent' | 'child' =
+    const myRole: PeerRole =
       config.role === 'standalone'
         ? peerRole === 'parent'
           ? 'child'
-          : 'parent'
-        : (config.role as 'parent' | 'child')
+          : peerRole === 'child'
+            ? 'parent'
+            : 'peer'
+        : (config.role as PeerRole)
 
-    const targetUrl = `${normalizedUrl}/api/v1/sync/exchange`
-    const exchangeBody = {
+    const wantsP2P =
+      options.contract === 'p2p' ||
+      options.contract === 'gaze' ||
+      peerRole === 'peer' ||
+      config.role === 'peer'
+
+    let payloadToSend: any = localDelta
+    if (wantsP2P && localDelta) {
+      payloadToSend = snapshotToP2PPayload(localDelta as VaultSnapshotV1, {
+        app: 'memoseb',
+        originNodeName: config.nodeName
+      })
+    }
+
+    const exchangeData = {
       clientNodeId: config.nodeId,
       clientName: config.nodeName,
       clientRole: myRole,
       callbackUrl: undefined,
       since: since ?? null,
       projectId: options.projectId ?? null,
-      delta: localDelta
+      delta: payloadToSend,
+      contract: wantsP2P ? 'p2p-memory-contract' : 'memoseb-snapshot',
+      format: wantsP2P ? 'p2p' : 'memoseb'
     }
 
-    const res = await sendJsonRequest<{
-      ok: boolean
-      serverNodeId: string
-      serverName: string
-      serverRole: 'parent' | 'child'
-      serverTimestamp: string
-      appliedOnServer: SnapshotImportResult
-      serverDelta: VaultSnapshotV1
-      effectiveGroups?: string[]
-    }>(targetUrl, {
-      method: 'POST',
-      token: effectiveToken,
-      body: exchangeBody,
-      timeoutMs: options.timeoutMs ?? 15000
-    })
+    let res: any
+    if (wantsP2P) {
+      try {
+        const envelope = wrapP2PEnvelope('exchange', exchangeData)
+        res = await sendJsonRequest<any>(`${normalizedUrl}/api/v1/p2p/exchange`, {
+          method: 'POST',
+          token: effectiveToken,
+          body: {
+            ...envelope,
+            ...exchangeData
+          },
+          timeoutMs: options.timeoutMs ?? 15000
+        })
+      } catch (err: any) {
+        if (err?.statusCode === 404) {
+          res = await sendJsonRequest<any>(
+            `${normalizedUrl}/api/v1/sync/exchange`,
+            {
+              method: 'POST',
+              token: effectiveToken,
+              body: exchangeData,
+              timeoutMs: options.timeoutMs ?? 15000
+            }
+          )
+        } else {
+          throw err
+        }
+      }
+    } else {
+      res = await sendJsonRequest<any>(
+        `${normalizedUrl}/api/v1/sync/exchange`,
+        {
+          method: 'POST',
+          token: effectiveToken,
+          body: exchangeData,
+          timeoutMs: options.timeoutMs ?? 15000
+        }
+      )
+    }
 
-    let incomingServerDelta = res.serverDelta
+    const resData = unwrapP2PEnvelope(res) as any
+    const rawServerDelta = resData.serverDelta ?? res.serverDelta
+    const serverTimestamp =
+      resData.serverTimestamp ?? res.serverTimestamp ?? new Date().toISOString()
+    const serverNodeId = resData.serverNodeId ?? res.serverNodeId
+    const serverName = resData.serverName ?? res.serverName
+    const effectiveGroups = resData.effectiveGroups ?? res.effectiveGroups
+
+    let serverDelta: VaultSnapshotV1
+    if (
+      isP2PContractPayload(rawServerDelta) ||
+      (rawServerDelta &&
+        typeof rawServerDelta === 'object' &&
+        (rawServerDelta.format === 'p2p-memory-contract' ||
+          (rawServerDelta.schemaVersion === 1 && rawServerDelta.data)))
+    ) {
+      serverDelta = p2pPayloadToSnapshot(rawServerDelta)
+    } else {
+      serverDelta = rawServerDelta as VaultSnapshotV1
+    }
+
+    let incomingServerDelta = serverDelta
     let incomingDroppedMemories = 0
     if (
-      isParentInitiator &&
-      !childPolicy.unrestricted &&
-      res.serverDelta &&
-      Array.isArray(res.serverDelta.memories)
+      isAuthorityInitiator &&
+      !targetPolicy.unrestricted &&
+      serverDelta &&
+      Array.isArray(serverDelta.memories)
     ) {
       const { filtered, droppedMemories } = filterSnapshotByPermissions(
-        res.serverDelta,
-        (proj, cat) => childPolicy.canPush(proj, cat)
+        serverDelta,
+        (proj, cat) => targetPolicy.canPush(proj, cat)
       )
       incomingServerDelta = filtered
       incomingDroppedMemories = droppedMemories
@@ -1173,32 +1406,32 @@ export async function syncWithPeer(
 
     if (existingPeer) {
       vault.updatePeerSyncState(existingPeer.id, {
-        lastSyncAt: res.serverTimestamp,
+        lastSyncAt: serverTimestamp,
         lastStatus: 'ok',
-        peerNodeId: res.serverNodeId,
-        name: res.serverName
+        peerNodeId: serverNodeId,
+        name: serverName
       })
     } else {
       vault.upsertPeer({
         role: peerRole,
         url: normalizedUrl,
-        name: res.serverName,
-        peerNodeId: res.serverNodeId,
+        name: serverName,
+        peerNodeId: serverNodeId,
         authToken: effectiveToken,
-        lastSyncAt: res.serverTimestamp,
+        lastSyncAt: serverTimestamp,
         lastStatus: 'ok'
       })
     }
 
     return {
       peerUrl: normalizedUrl,
-      peerNodeId: res.serverNodeId,
-      peerName: res.serverName,
+      peerNodeId: serverNodeId,
+      peerName: serverName,
       peerRole,
-      pushed: res.appliedOnServer,
+      pushed: resData.appliedOnServer ?? res.appliedOnServer,
       pulled,
-      syncedAt: res.serverTimestamp,
-      effectiveGroups: res.effectiveGroups
+      syncedAt: serverTimestamp,
+      effectiveGroups
     }
   } catch (err: any) {
     if (existingPeer) {
@@ -1237,6 +1470,8 @@ export async function syncAllPeers(
     )
   } else if (config.role === 'parent') {
     targetPeers = allPeers.filter((p) => p.role === 'child')
+  } else if (config.role === 'peer') {
+    targetPeers = allPeers
   } else {
     targetPeers = allPeers
   }
@@ -1264,9 +1499,9 @@ export async function syncAllPeers(
     }
   }
 
-  // Pass 2: If role is parent with multiple children, propagate newly received changes
-  // so Child A receives what Child B uploaded during Pass 1
-  if (config.role === 'parent' && targetPeers.length > 1) {
+  // Pass 2: If role is parent or peer with multiple peers, propagate newly received changes
+  // so Peer A receives what Peer B uploaded during Pass 1
+  if ((config.role === 'parent' || config.role === 'peer') && targetPeers.length > 1) {
     for (const peer of targetPeers) {
       const pass1Success = results.some((r) => r.peerUrl === peer.url)
       if (!pass1Success) {

@@ -17,13 +17,24 @@ import {
   isGroupPermissionMode,
   isMemoryCategory,
   isUnassignedGroupPolicy,
+  normalizeNodeRole,
+  normalizePeerRole,
+  parseNodeRoleInput,
+  parsePeerRoleInput,
   type GroupPermissionMode,
   type MemoryCategory,
+  type NodeRole,
+  type PeerRole,
   type SyncGroupRecord,
   type UnassignedGroupPolicy,
 } from '../core/schema.ts'
+import {
+  writeP2PPayloadFile,
+  type P2PSyncPayloadV1,
+} from '../core/p2p-contract.ts'
 import { readSnapshotFile, writeSnapshotFile } from '../core/snapshot.ts'
 import {
+  discoverLanNodes,
   discoverLanParents,
   getLocalLanUrls,
   normalizePeerUrl,
@@ -89,6 +100,9 @@ const VALUE_FLAGS = new Set([
   '--strategy',
   '--role',
   '--parent',
+  '--peer',
+  '--format',
+  '--contract',
   '--url',
   '--name',
   '--token',
@@ -649,20 +663,45 @@ export async function executeMemoCli(
   if (command === 'export') {
     const vault = new MemoryVault({ dbPath, runtime })
     try {
-      const snapshot = vault.exportSnapshot({ projectId: flags.project })
+      const format = flags.format ?? 'memoseb'
+      const isP2P = format === 'p2p' || format === 'gaze'
+      const defaultFileName = isP2P
+        ? 'gaze-bundle.json'
+        : 'memoseb-snapshot.json'
       const targetFile =
-        positional[1] ?? flags.out ?? flags.file ?? path.resolve(cwd, 'memoseb-snapshot.json')
+        positional[1] ?? flags.out ?? flags.file ?? path.resolve(cwd, defaultFileName)
       const resolvedPath = path.resolve(cwd, targetFile)
-      writeSnapshotFile(resolvedPath, snapshot)
+
+      let checksum: string
+      let projectCount: number
+      let memoryCount: number
+      let tombstoneCount: number
+
+      if (isP2P) {
+        const payload = vault.exportP2PPayload({ projectId: flags.project })
+        writeP2PPayloadFile(resolvedPath, payload)
+        checksum = payload.checksum
+        projectCount = payload.projects?.length ?? 0
+        memoryCount = payload.nodes.length
+        tombstoneCount = payload.tombstones.length
+      } else {
+        const snapshot = vault.exportSnapshot({ projectId: flags.project })
+        writeSnapshotFile(resolvedPath, snapshot)
+        checksum = snapshot.checksum
+        projectCount = snapshot.projects.length
+        memoryCount = snapshot.memories.length
+        tombstoneCount = snapshot.tombstones.length
+      }
 
       try {
         const topology = new TopologyStore(runtime)
         await topology.broadcastSignal(BUNDLE_ID, 'memory.exported', {
           filePath: resolvedPath,
-          checksum: snapshot.checksum,
-          projectCount: snapshot.projects.length,
-          memoryCount: snapshot.memories.length,
-          tombstoneCount: snapshot.tombstones.length,
+          checksum,
+          projectCount,
+          memoryCount,
+          tombstoneCount,
+          format: isP2P ? 'p2p-memory-contract' : 'memoseb-snapshot',
         })
       } catch {
         // Ignore topology broadcast errors if hubseb state is read-only
@@ -670,21 +709,23 @@ export async function executeMemoCli(
 
       const payload = {
         filePath: resolvedPath,
-        checksum: snapshot.checksum,
-        projectCount: snapshot.projects.length,
-        memoryCount: snapshot.memories.length,
-        tombstoneCount: snapshot.tombstones.length,
+        checksum,
+        projectCount,
+        memoryCount,
+        tombstoneCount,
+        format: isP2P ? 'p2p' : 'memoseb',
       }
 
       if (jsonMode) {
         return { exitCode: 0, stdout: serializeWire(wireSuccess('export', payload)), stderr: '' }
       }
       const lines = [
-        `Exported memoseb snapshot to ${resolvedPath}:`,
-        `  Checksum:   ${snapshot.checksum}`,
-        `  Projects:   ${snapshot.projects.length}`,
-        `  Memories:   ${snapshot.memories.length}`,
-        `  Tombstones: ${snapshot.tombstones.length}`,
+        `Exported ${isP2P ? 'p2p gaze bundle' : 'memoseb snapshot'} to ${resolvedPath}:`,
+        `  Format:     ${isP2P ? 'p2p-memory-contract' : 'memoseb-snapshot'}`,
+        `  Checksum:   ${checksum}`,
+        `  Projects:   ${projectCount}`,
+        `  Memories:   ${memoryCount}`,
+        `  Tombstones: ${tombstoneCount}`,
       ]
       return { exitCode: 0, stdout: `${lines.join('\n')}\n`, stderr: '' }
     } catch (err) {
@@ -853,10 +894,14 @@ export async function executeMemoCli(
       }
 
       if (subcommand === 'enable') {
-        let role = flags.role as 'parent' | 'child' | undefined
-        if (!role) {
-          if (flags.parent || discoverMode) {
-            role = 'child'
+        let roleInput = flags.role
+        if (!roleInput) {
+          if (flags.parent) {
+            roleInput = 'child'
+          } else if (flags.peer) {
+            roleInput = 'peer'
+          } else if (discoverMode) {
+            roleInput = 'child'
           } else {
             if (jsonMode) {
               return {
@@ -865,8 +910,8 @@ export async function executeMemoCli(
                   wireFailure(
                     'node',
                     'INVALID_ROLE',
-                    'Node role must be "parent" or "child"',
-                    'Usage: memoseb node enable --role parent|child',
+                    'Node role must be "parent", "child", or "peer"',
+                    'Usage: memoseb node enable --role parent|child|peer',
                   ),
                 ),
                 stderr: '',
@@ -876,11 +921,13 @@ export async function executeMemoCli(
               exitCode: 2,
               stdout: '',
               stderr:
-                'Node role must be "parent" or "child". Usage: memoseb node enable --role parent|child\n',
+                'Node role must be "parent", "child", or "peer". Usage: memoseb node enable --role parent|child|peer\n',
             }
           }
         }
-        if (role !== 'parent' && role !== 'child') {
+
+        const role = parseNodeRoleInput(roleInput)
+        if (!role || (role !== 'parent' && role !== 'child' && role !== 'peer')) {
           if (jsonMode) {
             return {
               exitCode: 2,
@@ -888,7 +935,7 @@ export async function executeMemoCli(
                 wireFailure(
                   'node',
                   'INVALID_ROLE',
-                  `Invalid role "${role}". Must be "parent" or "child"`,
+                  `Invalid role "${roleInput}". Must be "parent", "child", or "peer"`,
                 ),
               ),
               stderr: '',
@@ -897,7 +944,7 @@ export async function executeMemoCli(
           return {
             exitCode: 2,
             stdout: '',
-            stderr: `Invalid role "${role}". Must be "parent" or "child".\n`,
+            stderr: `Invalid role "${roleInput}". Must be "parent", "child", or "peer".\n`,
           }
         }
 
@@ -911,15 +958,15 @@ export async function executeMemoCli(
           lanDiscovery: noLanFlag ? false : undefined,
         })
 
-        if (role === 'child') {
-          const groupArg = flags.group ?? flags.groups
-          const requestedGroups = groupArg
-            ? groupArg
-                .split(',')
-                .map((s) => s.trim())
-                .filter(Boolean)
-            : undefined
+        const groupArg = flags.group ?? flags.groups
+        const requestedGroups = groupArg
+          ? groupArg
+              .split(',')
+              .map((s) => s.trim())
+              .filter(Boolean)
+          : undefined
 
+        if (role === 'child') {
           if (discoverMode && !flags.parent) {
             const parents = await discoverLanParents({
               port: Number(flags.port) || undefined,
@@ -993,6 +1040,56 @@ export async function executeMemoCli(
               })
             }
           }
+        } else if (role === 'peer') {
+          if (discoverMode && !flags.peer) {
+            const nodes = await discoverLanNodes({
+              port: Number(flags.port) || undefined,
+              timeoutMs: Number(flags.timeout) || 800,
+              token: flags.token ?? vault.getNodeConfig().authToken ?? undefined,
+            })
+            if (nodes.length > 0) {
+              const first = nodes[0]!
+              const peerUrl = first.urls[0] ?? `http://${first.address}:${first.port}`
+              const normalized = normalizePeerUrl(peerUrl)
+              vault.upsertPeer({
+                role: 'peer',
+                url: normalized,
+                name: first.nodeName,
+                peerNodeId: first.nodeId,
+                authToken: flags.token ?? vault.getNodeConfig().authToken ?? null,
+                lastStatus: 'configured',
+              })
+              try {
+                await performPeerHandshake(vault, {
+                  peerUrl: normalized,
+                  peerRole: 'peer',
+                  token: flags.token ?? vault.getNodeConfig().authToken ?? undefined,
+                  groups: requestedGroups,
+                })
+              } catch {
+                // Tolerated
+              }
+            }
+          } else if (flags.peer) {
+            const normalized = normalizePeerUrl(flags.peer)
+            vault.upsertPeer({
+              role: 'peer',
+              url: normalized,
+              name: flags.name,
+              authToken: flags.token ?? vault.getNodeConfig().authToken ?? null,
+              lastStatus: 'configured',
+            })
+            try {
+              await performPeerHandshake(vault, {
+                peerUrl: normalized,
+                peerRole: 'peer',
+                token: flags.token ?? vault.getNodeConfig().authToken ?? undefined,
+                groups: requestedGroups,
+              })
+            } catch {
+              // Tolerated
+            }
+          }
         }
 
         const config = vault.getNodeConfig()
@@ -1030,7 +1127,7 @@ export async function executeMemoCli(
       }
 
       if (subcommand === 'discover') {
-        const parents = await discoverLanParents({
+        const nodes = await discoverLanNodes({
           port: Number(flags.port) || undefined,
           timeoutMs: Number(flags.timeout) || 1200,
           token: flags.token ?? vault.getNodeConfig().authToken ?? undefined,
@@ -1038,16 +1135,16 @@ export async function executeMemoCli(
         if (jsonMode) {
           return {
             exitCode: 0,
-            stdout: serializeWire(wireSuccess('node', { parents })),
+            stdout: serializeWire(wireSuccess('node', { nodes, parents: nodes })),
             stderr: '',
           }
         }
-        if (parents.length === 0) {
-          return { exitCode: 0, stdout: 'No memoseb parent nodes discovered on LAN.\n', stderr: '' }
+        if (nodes.length === 0) {
+          return { exitCode: 0, stdout: 'No memoseb nodes discovered on LAN.\n', stderr: '' }
         }
-        const lines = [`Discovered ${parents.length} parent nodes on LAN:`]
-        for (const p of parents) {
-          lines.push(`  • ${p.nodeName} (${p.nodeId}) at ${p.urls.join(', ')} [requiresAuth: ${p.requiresAuth}]`)
+        const lines = [`Discovered ${nodes.length} nodes on LAN:`]
+        for (const p of nodes) {
+          lines.push(`  • [${p.role}] ${p.nodeName} (${p.nodeId}) at ${p.urls.join(', ')} [requiresAuth: ${p.requiresAuth}]`)
         }
         return { exitCode: 0, stdout: `${lines.join('\n')}\n`, stderr: '' }
       }
@@ -1209,6 +1306,97 @@ export async function executeMemoCli(
         }
       }
 
+      if (subcommand === 'add-peer' || subcommand === 'connect' || subcommand === 'pair') {
+        const targetUrl = positional[2] ?? flags.url ?? flags.peer
+        if (!targetUrl) {
+          if (jsonMode) {
+            return {
+              exitCode: 2,
+              stdout: serializeWire(
+                wireFailure(
+                  'node',
+                  'MISSING_URL',
+                  'Peer URL is required',
+                  'Usage: memoseb node add-peer <url> [--name <n>] [--token <t>] [--group <g>]',
+                ),
+              ),
+              stderr: '',
+            }
+          }
+          return {
+            exitCode: 2,
+            stdout: '',
+            stderr: 'Peer URL is required. Usage: memoseb node add-peer <url>\n',
+          }
+        }
+        const currentConfig = vault.getNodeConfig()
+        if (!currentConfig.enabled || currentConfig.role === 'standalone') {
+          vault.enableNodeMode({ role: 'peer' })
+        }
+        const normalizedUrl = normalizePeerUrl(targetUrl)
+        vault.upsertPeer({
+          role: 'peer',
+          url: normalizedUrl,
+          name: flags.name,
+          authToken: flags.token ?? vault.getNodeConfig().authToken ?? null,
+          lastStatus: 'configured',
+        })
+        const groupFlag = flags.group ?? flags.groups
+        const requestedGroups = groupFlag
+          ? groupFlag
+              .split(',')
+              .map((s) => s.trim())
+              .filter(Boolean)
+          : undefined
+        try {
+          await performPeerHandshake(vault, {
+            peerUrl: normalizedUrl,
+            peerRole: 'peer',
+            token: flags.token ?? vault.getNodeConfig().authToken ?? undefined,
+            groups: requestedGroups,
+          })
+        } catch {
+          vault.upsertPeer({
+            role: 'peer',
+            url: normalizedUrl,
+            name: flags.name,
+            authToken: flags.token ?? vault.getNodeConfig().authToken ?? null,
+            lastStatus: 'configured',
+          })
+        }
+        const peer = vault.listPeers().find((p) => p.url === normalizedUrl)
+        if (groupFlag && peer) {
+          const groupNames = groupFlag
+            .split(',')
+            .map((s) => s.trim())
+            .filter(Boolean)
+          for (const g of groupNames) {
+            if (!vault.getGroup(g)) {
+              vault.upsertGroup({ name: g })
+            }
+            vault.addNodeToGroup(g, peer.url)
+            if (peer.peerNodeId) {
+              vault.addNodeToGroup(g, peer.peerNodeId)
+            }
+            if (peer.id) {
+              vault.addNodeToGroup(g, peer.id)
+            }
+          }
+        }
+        if (jsonMode) {
+          return {
+            exitCode: 0,
+            stdout: serializeWire(wireSuccess('node', { peer, config: vault.getNodeConfig() })),
+            stderr: '',
+          }
+        }
+        return {
+          exitCode: 0,
+          stdout: `Added peer ${normalizedUrl} (status: ${peer?.lastStatus ?? 'configured'}).\n`,
+          stderr: '',
+        }
+      }
+
       if (subcommand === 'remove') {
         const target = positional[2] ?? flags.url
         if (!target) {
@@ -1249,12 +1437,12 @@ export async function executeMemoCli(
 
       if (subcommand === 'serve') {
         const config = vault.getNodeConfig()
-        const roleToUse: 'parent' | 'child' =
-          flags.role === 'child' || flags.role === 'parent'
-            ? (flags.role as 'parent' | 'child')
-            : config.role === 'child'
-              ? 'child'
-              : 'parent'
+        const roleToUse: PeerRole =
+          flags.role === 'child' || flags.role === 'parent' || flags.role === 'peer' || flags.role === 'p2p'
+            ? normalizePeerRole(flags.role)
+            : config.role === 'standalone'
+              ? 'parent'
+              : (config.role as PeerRole)
         if (!config.enabled) {
           vault.enableNodeMode({
             role: roleToUse,
@@ -1322,7 +1510,7 @@ export async function executeMemoCli(
               'node',
               'UNKNOWN_SUBCOMMAND',
               `Unknown node subcommand "${subcommand}"`,
-              'Usage: memoseb node <status|enable|disable|discover|set-parent|add-child|remove|serve>',
+              'Usage: memoseb node <status|enable|disable|discover|set-parent|add-child|add-peer|remove|serve>',
             ),
           ),
           stderr: '',
@@ -1331,7 +1519,7 @@ export async function executeMemoCli(
       return {
         exitCode: 2,
         stdout: '',
-        stderr: `Unknown node subcommand "${subcommand}". Usage: memoseb node <status|enable|disable|discover|set-parent|add-child|remove|serve>\n`,
+        stderr: `Unknown node subcommand "${subcommand}". Usage: memoseb node <status|enable|disable|discover|set-parent|add-child|add-peer|remove|serve>\n`,
       }
     } finally {
       vault.close()
@@ -1742,6 +1930,12 @@ export async function executeMemoCli(
   if (command === 'sync') {
     const vault = new MemoryVault({ dbPath, runtime })
     try {
+      const contractArg = flags.contract ?? flags.format
+      const contract: 'memoseb' | 'p2p' | 'gaze' | undefined =
+        contractArg === 'p2p' || contractArg === 'gaze'
+          ? (contractArg as 'p2p' | 'gaze')
+          : undefined
+
       let syncResult
       if (flags.url) {
         syncResult = await syncWithPeer(vault, {
@@ -1750,6 +1944,7 @@ export async function executeMemoCli(
           projectId: flags.project,
           full: fullSync,
           forceWhenDisabled: true,
+          contract,
         })
       } else {
         const config = vault.getNodeConfig()
@@ -1762,7 +1957,7 @@ export async function executeMemoCli(
                   'sync',
                   'NODE_DISABLED',
                   'Node networking is disabled',
-                  'Run "memoseb node enable --role parent|child" to enable networking or pass --url <peer-url>',
+                  'Run "memoseb node enable --role parent|child|peer" to enable networking or pass --url <peer-url>',
                 ),
               ),
               stderr: '',
@@ -1772,7 +1967,7 @@ export async function executeMemoCli(
             exitCode: 1,
             stdout: '',
             stderr:
-              'Node networking is disabled. Run "memoseb node enable --role parent|child" or pass --url <peer-url>.\n',
+              'Node networking is disabled. Run "memoseb node enable --role parent|child|peer" or pass --url <peer-url>.\n',
           }
         }
         syncResult = await syncAllPeers(vault, {

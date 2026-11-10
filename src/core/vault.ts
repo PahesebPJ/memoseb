@@ -16,16 +16,26 @@ import {
   isGroupPermissionMode,
   isMemoryCategory,
   isUnassignedGroupPolicy,
+  normalizeNodeRole,
+  normalizePeerRole,
   openVaultDatabase,
   type EffectivePeerPermissions,
   type GroupPermissionMode,
   type MemoryCategory,
   type NodeConfiguration,
   type NodeRole,
+  type PeerRole,
   type SyncGroupRecord,
   type SyncPeerRecord,
   type UnassignedGroupPolicy
 } from './schema.ts'
+import {
+  isP2PContractPayload,
+  p2pPayloadToSnapshot,
+  snapshotToP2PPayload,
+  unwrapP2PEnvelope,
+  type P2PSyncPayloadV1
+} from './p2p-contract.ts'
 import {
   computeSnapshotChecksum,
   verifySnapshot,
@@ -807,8 +817,7 @@ export class MemoryVault {
     const enabled = meta.get('node.enabled') === 'true'
 
     const rawRole = meta.get('node.role')
-    const role: NodeRole =
-      rawRole === 'parent' || rawRole === 'child' ? rawRole : 'standalone'
+    const role: NodeRole = normalizeNodeRole(rawRole)
 
     const rawHost = meta.get('node.listen_host')?.trim()
     const listenHost = rawHost && rawHost.length > 0 ? rawHost : '0.0.0.0'
@@ -875,7 +884,7 @@ export class MemoryVault {
       upsert.run('node.enabled', String(patch.enabled), now)
     }
     if (patch.role !== undefined) {
-      upsert.run('node.role', patch.role, now)
+      upsert.run('node.role', normalizeNodeRole(patch.role), now)
     }
     if (patch.listenHost !== undefined) {
       upsert.run('node.listen_host', patch.listenHost.trim(), now)
@@ -913,7 +922,7 @@ export class MemoryVault {
   }
 
   enableNodeMode(options: {
-    role: 'parent' | 'child'
+    role: PeerRole | 'p2p'
     nodeName?: string
     listenHost?: string
     listenPort?: number
@@ -923,7 +932,7 @@ export class MemoryVault {
   }): NodeConfiguration {
     return this.updateNodeConfig({
       enabled: true,
-      role: options.role,
+      role: normalizeNodeRole(options.role),
       ...(options.nodeName !== undefined ? { nodeName: options.nodeName } : {}),
       ...(options.listenHost !== undefined
         ? { listenHost: options.listenHost }
@@ -953,7 +962,7 @@ export class MemoryVault {
   }
 
   upsertPeer(input: {
-    role: 'parent' | 'child'
+    role: PeerRole | 'p2p'
     url: string
     name?: string
     peerNodeId?: string | null
@@ -962,7 +971,8 @@ export class MemoryVault {
     lastStatus?: string | null
   }): SyncPeerRecord {
     const normalizedUrl = input.url.trim().replace(/\/+$/, '')
-    if (input.role === 'parent') {
+    const normalizedRole = normalizePeerRole(input.role)
+    if (normalizedRole === 'parent') {
       this.db
         .prepare(`DELETE FROM sync_peers WHERE role = 'parent' AND url != ?`)
         .run(normalizedUrl)
@@ -997,7 +1007,7 @@ export class MemoryVault {
            WHERE id = ?`
         )
         .run(
-          input.role,
+          normalizedRole,
           peerName,
           peerNodeId,
           authToken,
@@ -1031,7 +1041,7 @@ export class MemoryVault {
       .run(
         id,
         input.peerNodeId ?? null,
-        input.role,
+        normalizedRole,
         peerName,
         normalizedUrl,
         input.authToken ?? null,
@@ -1058,14 +1068,15 @@ export class MemoryVault {
     return res.changes > 0
   }
 
-  listPeers(role?: 'parent' | 'child'): SyncPeerRecord[] {
+  listPeers(role?: PeerRole | 'p2p'): SyncPeerRecord[] {
     let rows: RawPeerRow[]
     if (role) {
+      const normalizedRole = normalizePeerRole(role)
       rows = this.db
         .prepare(
           `SELECT * FROM sync_peers WHERE role = ? ORDER BY updated_at DESC`
         )
-        .all(role) as unknown as RawPeerRow[]
+        .all(normalizedRole) as unknown as RawPeerRow[]
     } else {
       rows = this.db
         .prepare(`SELECT * FROM sync_peers ORDER BY updated_at DESC`)
@@ -1786,11 +1797,33 @@ export class MemoryVault {
     }
   }
 
-  importSnapshot(
-    rawSnapshot: VaultSnapshotV1,
+  exportP2PPayload(options?: ExportOptions): P2PSyncPayloadV1 {
+    const snapshot = this.exportSnapshot(options)
+    const config = this.getNodeConfig()
+    return snapshotToP2PPayload(snapshot, {
+      originNodeName: config.nodeName
+    })
+  }
+
+  importP2PPayload(
+    payload: P2PSyncPayloadV1 | unknown,
     options?: ImportOptions
   ): ImportResult {
-    const snapshot = verifySnapshot(rawSnapshot)
+    const snapshot = p2pPayloadToSnapshot(payload)
+    return this.importSnapshot(snapshot, options)
+  }
+
+  importSnapshot(
+    rawSnapshot: VaultSnapshotV1 | unknown,
+    options?: ImportOptions
+  ): ImportResult {
+    const unwrapped = unwrapP2PEnvelope(rawSnapshot)
+    let snapshot: VaultSnapshotV1
+    if (isP2PContractPayload(unwrapped)) {
+      snapshot = p2pPayloadToSnapshot(unwrapped)
+    } else {
+      snapshot = verifySnapshot(unwrapped)
+    }
     const strategy = options?.strategy ?? 'merge'
     const targetProjectId = options?.projectId
       ? slugifyProjectId(options.projectId)

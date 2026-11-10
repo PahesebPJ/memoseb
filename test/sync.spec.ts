@@ -5,7 +5,7 @@ import http from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
 import { describe, it } from 'node:test'
-import type { NodeConfiguration, NodeRole, SyncPeerRecord } from '../src/core/schema.ts'
+import type { NodeConfiguration, NodeRole, PeerRole, SyncPeerRecord } from '../src/core/schema.ts'
 import {
   discoverLanParents,
   getLocalLanUrls,
@@ -70,7 +70,7 @@ class MockSyncVault implements SyncCapableVault {
   }
 
   enableNodeMode(options: {
-    role: 'parent' | 'child'
+    role: PeerRole | 'p2p'
     nodeName?: string
     listenHost?: string
     listenPort?: number
@@ -78,10 +78,11 @@ class MockSyncVault implements SyncCapableVault {
     autoSync?: boolean
     lanDiscovery?: boolean
   }): NodeConfiguration {
+    const normalizedRole: NodeRole = options.role === 'p2p' ? 'peer' : options.role
     this.nodeConfig = {
       ...this.nodeConfig,
       enabled: true,
-      role: options.role,
+      role: normalizedRole,
       nodeName: options.nodeName ?? this.nodeConfig.nodeName,
       listenHost: options.listenHost ?? this.nodeConfig.listenHost,
       listenPort: options.listenPort ?? this.nodeConfig.listenPort,
@@ -104,7 +105,7 @@ class MockSyncVault implements SyncCapableVault {
   }
 
   upsertPeer(input: {
-    role: 'parent' | 'child'
+    role: PeerRole | 'p2p'
     url: string
     name?: string
     peerNodeId?: string | null
@@ -116,10 +117,11 @@ class MockSyncVault implements SyncCapableVault {
       (p) => p.url === input.url
     )
     const id = existing?.id ?? crypto.randomUUID()
+    const normalizedRole: PeerRole = input.role === 'p2p' ? 'peer' : input.role
     const record: SyncPeerRecord = {
       id,
       url: input.url,
-      role: input.role,
+      role: normalizedRole,
       name: input.name ?? existing?.name ?? 'Peer',
       peerNodeId: input.peerNodeId ?? existing?.peerNodeId ?? null,
       authToken:
@@ -151,9 +153,10 @@ class MockSyncVault implements SyncCapableVault {
     return false
   }
 
-  listPeers(role?: 'parent' | 'child'): SyncPeerRecord[] {
+  listPeers(role?: PeerRole | 'p2p'): SyncPeerRecord[] {
     const list = Array.from(this.peers.values())
-    return role ? list.filter((p) => p.role === role) : list
+    const normalizedRole = role === 'p2p' ? 'peer' : role
+    return normalizedRole ? list.filter((p) => p.role === normalizedRole) : list
   }
 
   updatePeerSyncState(

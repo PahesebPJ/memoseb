@@ -1,6 +1,11 @@
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
+import {
+  isP2PContractPayload,
+  p2pPayloadToSnapshot,
+  unwrapP2PEnvelope
+} from './p2p-contract.ts'
 import type { MemoryRecord } from './vault.ts'
 
 export interface ExportedProject {
@@ -158,7 +163,11 @@ export function readSnapshotFile(filePath: string): VaultSnapshotV1 {
       `Failed to parse snapshot JSON at ${resolvedPath}: ${(err as Error).message}`
     )
   }
-  return verifySnapshot(parsed)
+  const unwrapped = unwrapP2PEnvelope(parsed)
+  if (isP2PContractPayload(unwrapped)) {
+    return p2pPayloadToSnapshot(unwrapped)
+  }
+  return verifySnapshot(unwrapped)
 }
 
 export function filterSnapshotByPermissions(

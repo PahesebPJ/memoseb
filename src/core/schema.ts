@@ -9,8 +9,8 @@ export type MemoryCategory =
   | 'decision'
   | 'domain'
 
-export type NodeRole = 'standalone' | 'parent' | 'child'
-export type PeerRole = 'parent' | 'child'
+export type NodeRole = 'standalone' | 'parent' | 'child' | 'peer'
+export type PeerRole = 'parent' | 'child' | 'peer'
 export type GroupPermissionMode = 'readwrite' | 'readonly' | 'writeonly'
 export type UnassignedGroupPolicy = 'none' | 'all'
 
@@ -67,6 +67,19 @@ export const MEMORY_CATEGORIES: readonly MemoryCategory[] = [
   'domain'
 ] as const
 
+export const NODE_ROLES: readonly NodeRole[] = [
+  'standalone',
+  'parent',
+  'child',
+  'peer'
+] as const
+
+export const PEER_ROLES: readonly PeerRole[] = [
+  'parent',
+  'child',
+  'peer'
+] as const
+
 export const GROUP_PERMISSION_MODES: readonly GroupPermissionMode[] = [
   'readwrite',
   'readonly',
@@ -77,8 +90,66 @@ export function isMemoryCategory(value: string): value is MemoryCategory {
   return (MEMORY_CATEGORIES as readonly string[]).includes(value)
 }
 
-export function isNodeRole(value: string): value is NodeRole {
-  return value === 'standalone' || value === 'parent' || value === 'child'
+export function isNodeRole(value: unknown): value is NodeRole {
+  return (
+    typeof value === 'string' &&
+    (NODE_ROLES as readonly string[]).includes(value)
+  )
+}
+
+export function isPeerRole(value: unknown): value is PeerRole {
+  return (
+    typeof value === 'string' &&
+    (PEER_ROLES as readonly string[]).includes(value)
+  )
+}
+
+/**
+ * Normaliza cualquier entrada de rol a NodeRole válido.
+ * Acepta 'p2p' como alias insensible a mayúsculas que mapea a 'peer'.
+ */
+export function normalizeNodeRole(value: unknown): NodeRole {
+  if (typeof value !== 'string') return 'standalone'
+  const trimmed = value.trim().toLowerCase()
+  if (trimmed === 'p2p') return 'peer'
+  if (isNodeRole(trimmed)) return trimmed
+  return 'standalone'
+}
+
+/**
+ * Normaliza cualquier entrada de rol de par a PeerRole válido.
+ * Acepta 'p2p' como alias insensible a mayúsculas que mapea a 'peer'.
+ */
+export function normalizePeerRole(value: unknown): PeerRole {
+  if (typeof value !== 'string') return 'peer'
+  const trimmed = value.trim().toLowerCase()
+  if (trimmed === 'p2p') return 'peer'
+  if (isPeerRole(trimmed)) return trimmed
+  return 'peer'
+}
+
+/**
+ * Parsea un input para NodeRole retornando null si la cadena no es válida.
+ * Acepta 'p2p' mapeándolo a 'peer'.
+ */
+export function parseNodeRoleInput(value: unknown): NodeRole | null {
+  if (typeof value !== 'string') return null
+  const trimmed = value.trim().toLowerCase()
+  if (trimmed === 'p2p') return 'peer'
+  if (isNodeRole(trimmed)) return trimmed
+  return null
+}
+
+/**
+ * Parsea un input para PeerRole retornando null si la cadena no es válida.
+ * Acepta 'p2p' mapeándolo a 'peer'.
+ */
+export function parsePeerRoleInput(value: unknown): PeerRole | null {
+  if (typeof value !== 'string') return null
+  const trimmed = value.trim().toLowerCase()
+  if (trimmed === 'p2p') return 'peer'
+  if (isPeerRole(trimmed)) return trimmed
+  return null
 }
 
 export function isGroupPermissionMode(

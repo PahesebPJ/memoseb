@@ -12,6 +12,7 @@ import {
   type MemoryCategory,
 } from '../core/schema.ts'
 import { readSnapshotFile, writeSnapshotFile } from '../core/snapshot.ts'
+import { writeP2PPayloadFile } from '../core/p2p-contract.ts'
 import {
   syncAllPeers,
   syncWithPeer,
@@ -156,7 +157,7 @@ export const MCP_TOOLS = [
   {
     name: 'memory_export',
     description:
-      'Export the memoseb vault (all projects or a single project) to a portable JSON snapshot file.',
+      'Export the memoseb vault (all projects or a single project) to a portable JSON snapshot file or P2P/Gaze bundle.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -169,19 +170,24 @@ export const MCP_TOOLS = [
           type: 'string',
           description: 'Optional project identifier override.',
         },
+        format: {
+          type: 'string',
+          enum: ['memoseb', 'p2p', 'gaze'],
+          description: "Optional export format: 'memoseb' (default) or 'p2p'/'gaze' contract payload.",
+        },
       },
     },
   },
   {
     name: 'memory_import',
     description:
-      'Import a portable memoseb JSON snapshot file into the local vault (merge with Last-Write-Wins or replace).',
+      'Import a portable memoseb JSON snapshot file or P2P/Gaze bundle into the local vault (merge with Last-Write-Wins or replace).',
     inputSchema: {
       type: 'object',
       properties: {
         filePath: {
           type: 'string',
-          description: 'Path to the memoseb snapshot JSON file to import.',
+          description: 'Path to the memoseb snapshot JSON file or P2P/Gaze bundle to import.',
         },
         strategy: {
           type: 'string',
@@ -192,6 +198,11 @@ export const MCP_TOOLS = [
           type: 'string',
           description: 'Optional project identifier override.',
         },
+        format: {
+          type: 'string',
+          enum: ['memoseb', 'p2p', 'gaze'],
+          description: "Optional format hint: 'memoseb', 'p2p', or 'gaze'. Auto-detected if omitted.",
+        },
       },
       required: ['filePath'],
     },
@@ -199,7 +210,7 @@ export const MCP_TOOLS = [
   {
     name: 'memory_sync',
     description:
-      'Synchronize memories bidirectionally with the configured parent node or registered child nodes when node networking is enabled.',
+      'Synchronize memories bidirectionally with the configured parent node or registered child/peer nodes when node networking is enabled.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -214,6 +225,11 @@ export const MCP_TOOLS = [
         full: {
           type: 'boolean',
           description: 'If true, performs a full snapshot sync instead of delta synchronization.',
+        },
+        format: {
+          type: 'string',
+          enum: ['memoseb', 'p2p', 'gaze'],
+          description: "Optional wire contract format: 'memoseb' (default) or 'p2p'/'gaze'.",
         },
       },
     },
@@ -482,9 +498,65 @@ export async function handleMcpRequest(
 
       if (toolName === 'memory_export') {
         const projectId = typeof args.projectId === 'string' ? args.projectId : undefined
-        const snapshot = vault.exportSnapshot({ projectId })
+        const format = typeof args.format === 'string' ? args.format : 'memoseb'
+        const isP2P = format === 'p2p' || format === 'gaze'
         const rawFilePath =
           typeof args.filePath === 'string' && args.filePath.trim() ? args.filePath.trim() : undefined
+
+        if (isP2P) {
+          const payload = vault.exportP2PPayload({ projectId })
+          if (rawFilePath) {
+            const writtenPath = writeP2PPayloadFile(rawFilePath, payload)
+            return {
+              jsonrpc: JSONRPC_VERSION,
+              id,
+              result: {
+                content: [
+                  {
+                    type: 'text',
+                    text: JSON.stringify(
+                      {
+                        filePath: writtenPath,
+                        format: 'p2p-memory-contract',
+                        checksum: payload.checksum,
+                        projectCount: payload.projects?.length ?? 0,
+                        memoryCount: payload.nodes.length,
+                        tombstoneCount: payload.tombstones.length,
+                      },
+                      null,
+                      2,
+                    ),
+                  },
+                ],
+              },
+            }
+          }
+          return {
+            jsonrpc: JSONRPC_VERSION,
+            id,
+            result: {
+              content: [
+                {
+                  type: 'text',
+                  text: JSON.stringify(
+                    {
+                      format: 'p2p-memory-contract',
+                      checksum: payload.checksum,
+                      projectCount: payload.projects?.length ?? 0,
+                      memoryCount: payload.nodes.length,
+                      tombstoneCount: payload.tombstones.length,
+                      payload,
+                    },
+                    null,
+                    2,
+                  ),
+                },
+              ],
+            },
+          }
+        }
+
+        const snapshot = vault.exportSnapshot({ projectId })
         if (rawFilePath) {
           const writtenPath = writeSnapshotFile(rawFilePath, snapshot)
           return {
@@ -497,6 +569,7 @@ export async function handleMcpRequest(
                   text: JSON.stringify(
                     {
                       filePath: writtenPath,
+                      format: 'memoseb-snapshot',
                       checksum: snapshot.checksum,
                       projectCount: snapshot.projects.length,
                       memoryCount: snapshot.memories.length,
@@ -519,6 +592,7 @@ export async function handleMcpRequest(
                 type: 'text',
                 text: JSON.stringify(
                   {
+                    format: 'memoseb-snapshot',
                     checksum: snapshot.checksum,
                     projectCount: snapshot.projects.length,
                     memoryCount: snapshot.memories.length,
@@ -570,12 +644,15 @@ export async function handleMcpRequest(
           typeof args.peerUrl === 'string' && args.peerUrl.trim() ? args.peerUrl.trim() : undefined
         const projectId = typeof args.projectId === 'string' ? args.projectId : undefined
         const full = Boolean(args.full)
+        const format = typeof args.format === 'string' ? args.format : undefined
+        const contract = format === 'p2p' || format === 'gaze' ? 'p2p' : undefined
         if (peerUrl) {
           const syncResult = await syncWithPeer(vault, {
             peerUrl,
             projectId,
             full,
             forceWhenDisabled: true,
+            contract,
           })
           return {
             jsonrpc: JSONRPC_VERSION,

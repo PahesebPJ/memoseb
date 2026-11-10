@@ -1,6 +1,7 @@
 export * from './bin/memoseb.ts'
 export * from './core/analyzer.ts'
 export * from './core/embedder.ts'
+export * from './core/p2p-contract.ts'
 export * from './core/project-detector.ts'
 export * from './core/schema.ts'
 export * from './core/snapshot.ts'
