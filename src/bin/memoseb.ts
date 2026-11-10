@@ -100,6 +100,22 @@ export interface ExecuteMemoCliOptions {
   serviceUid?: number
   killProcess?: (pid: number) => void
   readStdin?: () => Promise<string>
+  spawnProcess?: typeof spawn
+}
+
+/** Argumentos del hijo de `serve --detach`: sin --detach ni el token en la línea de comandos. */
+export function detachedServeArgs(argv: readonly string[]): string[] {
+  const out: string[] = []
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i]!
+    if (a === '--detach' || a === '--token-stdin') continue
+    if (a === '--token') {
+      i++
+      continue
+    }
+    out.push(a)
+  }
+  return out
 }
 
 const CLI_ENTRY = fileURLToPath(import.meta.url)
@@ -1857,22 +1873,34 @@ export async function executeMemoCli(
         const dataDir = path.dirname(path.resolve(vault.dbPath))
         fs.mkdirSync(dataDir, { recursive: true })
         const logFile = path.join(dataDir, 'node-serve.log')
-        const childArgs = argv.filter((a) => a !== '--detach')
+        const childArgs = detachedServeArgs(argv)
         if (!childArgs.includes('--db')) {
           childArgs.push('--db', path.resolve(vault.dbPath))
         }
+        // El token viaja por env, nunca en la línea de comandos del hijo
+        const childEnv = flags.token ? { ...runtime.env, MEMOSEB_SYNC_TOKEN: flags.token } : runtime.env
         const out = fs.openSync(logFile, 'a')
-        const child = spawn(
+        const child = (options.spawnProcess ?? spawn)(
           process.execPath,
           [
             ...process.execArgv.filter((a) => a.startsWith('--experimental-')),
             options.serviceEntry ?? CLI_ENTRY,
             ...childArgs,
           ],
-          { detached: true, windowsHide: true, stdio: ['ignore', out, out], env: runtime.env },
+          { detached: true, windowsHide: true, stdio: ['ignore', out, out], env: childEnv },
         )
-        child.unref()
+        const spawnError = await new Promise<Error | null>((resolve) => {
+          child.once('spawn', () => resolve(null))
+          child.once('error', (err) => resolve(err))
+        })
         fs.closeSync(out)
+        if (spawnError || !child.pid) {
+          const message = `Could not start memoseb node serve in background: ${spawnError?.message ?? 'no pid'}`
+          return jsonMode
+            ? { exitCode: 1, stdout: serializeWire(wireFailure('node', 'SPAWN_FAILED', message)), stderr: '' }
+            : { exitCode: 1, stdout: '', stderr: `${message}\n` }
+        }
+        child.unref()
         if (jsonMode) {
           return {
             exitCode: 0,

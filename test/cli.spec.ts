@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { EventEmitter } from 'node:events'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -1994,6 +1995,47 @@ describe('CLI node service, token policy and auto-sync serve', () => {
     await executeMemoCli(['node', 'disable'], { runtime, dbPath, serviceUid: 501 })
     assert.ok(!fs.existsSync(plistA))
     assert.ok(fs.existsSync(plistB), 'the other vault keeps its service')
+  })
+
+  it('detaches serve with --token-stdin passing the token by env and validates the spawn first', async () => {
+    const runtime = makeRuntime('darwin')
+    await executeMemoCli(['node', 'enable', '--role', 'peer', '--token', 'persisted'], { runtime, dbPath })
+    const calls: { args: string[]; env: NodeJS.ProcessEnv }[] = []
+    const fakeSpawn = (fail: boolean) =>
+      ((_cmd: string, args: string[], opts: { env: NodeJS.ProcessEnv }) => {
+        calls.push({ args, env: opts.env })
+        const child = new EventEmitter() as EventEmitter & { pid?: number; unref: () => void }
+        child.pid = fail ? undefined : 4242
+        child.unref = () => {}
+        setImmediate(() => (fail ? child.emit('error', new Error('EACCES')) : child.emit('spawn')))
+        return child
+      }) as any
+
+    const started = await executeMemoCli(
+      ['node', 'serve', '--detach', '--token-stdin', '--host', '0.0.0.0', '--json'],
+      { runtime, dbPath, readStdin: async () => 'stdin-secret\n', spawnProcess: fakeSpawn(false) }
+    )
+    assert.equal(started.exitCode, 0)
+    assert.ok(started.stdout.includes('"pid":4242'))
+    assert.equal(calls.length, 1)
+    assert.ok(!calls[0]!.args.includes('--token-stdin'))
+    assert.ok(!calls[0]!.args.includes('--detach'))
+    assert.ok(!calls[0]!.args.some((a) => a.includes('stdin-secret')))
+    assert.equal(calls[0]!.env.MEMOSEB_SYNC_TOKEN, 'stdin-secret')
+
+    const withFlag = await executeMemoCli(['node', 'serve', '--detach', '--token', 'flag-secret'], {
+      runtime,
+      dbPath,
+      spawnProcess: fakeSpawn(false)
+    })
+    assert.equal(withFlag.exitCode, 0)
+    assert.ok(!calls[1]!.args.includes('flag-secret'))
+    assert.equal(calls[1]!.env.MEMOSEB_SYNC_TOKEN, 'flag-secret')
+
+    const failed = await executeMemoCli(['node', 'serve', '--detach'], { runtime, dbPath, spawnProcess: fakeSpawn(true) })
+    assert.equal(failed.exitCode, 1)
+    assert.ok(!failed.stdout.includes('started'))
+    assert.ok(failed.stderr.includes('Could not start'))
   })
 
   it('serves with the auto-sync loop and shuts down cleanly on abort', async () => {
