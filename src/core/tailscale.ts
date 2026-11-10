@@ -81,10 +81,12 @@ export function locateTailscaleBinary(
     return isExecutable(explicit) ? explicit : null
   }
 
+  // Las entradas relativas de PATH (".", "bin") resolverían contra el cwd: se ignoran
+  const isAbsolute = runtime.platform === 'win32' ? path.win32.isAbsolute : path.posix.isAbsolute
   const pathDirs = (runtime.env.PATH ?? runtime.env.Path ?? '')
     .split(runtime.platform === 'win32' ? ';' : ':')
-    .map((d) => d.trim())
-    .filter(Boolean)
+    .map((d) => d.trim().replace(/^"(.*)"$/, '$1'))
+    .filter((d) => d.length > 0 && isAbsolute(d) && !(runtime.platform === 'win32' && /^[\\/](?![\\/])/.test(d)))
   const names = runtime.platform === 'win32' ? ['tailscale.exe'] : ['tailscale']
   const join = runtime.platform === 'win32' ? path.win32.join : path.posix.join
   for (const dir of pathDirs) {

@@ -1,3 +1,4 @@
+import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 import type { SystemRuntime } from 'hubseb'
@@ -8,6 +9,31 @@ export const WINDOWS_TASK_NAME = 'memoseb-node'
 export const FIREWALL_RULE_NAME = 'memoseb-node'
 export const TAILNET_CIDR = '100.64.0.0/10'
 const SCHTASKS_TR_LIMIT = 261
+const FIREWALL_MARKER = 'node-firewall.json'
+
+/** Sufijo estable por bóveda: cada --db tiene su propio servicio. */
+export function serviceIdentity(dbPath: string): string {
+  return crypto.createHash('sha256').update(path.resolve(dbPath)).digest('hex').slice(0, 10)
+}
+
+export interface ServiceNames {
+  label: string
+  systemdUnit: string
+  taskName: string
+  launcherName: string
+  firewallRule: string
+}
+
+export function serviceNames(dbPath: string): ServiceNames {
+  const id = serviceIdentity(dbPath)
+  return {
+    label: `${SERVICE_LABEL}.${id}`,
+    systemdUnit: `memoseb-node-${id}.service`,
+    taskName: `${WINDOWS_TASK_NAME}-${id}`,
+    launcherName: `${WINDOWS_TASK_NAME}-${id}.cmd`,
+    firewallRule: `${FIREWALL_RULE_NAME}-${id}`
+  }
+}
 
 export type ServiceManager = 'launchd' | 'systemd' | 'schtasks'
 
@@ -23,6 +49,7 @@ export interface ServiceCommand {
 
 export interface ServicePaths {
   manager: ServiceManager
+  names: ServiceNames
   unitFile: string
   logFile: string
   pidFile: string
@@ -33,6 +60,7 @@ export interface ServicePaths {
 export interface ServiceContext {
   runtime: ServiceRuntime
   dataDir: string
+  dbPath: string
   command?: ServiceCommand
   uid?: number
   killProcess?: (pid: number) => void
@@ -47,7 +75,15 @@ export interface ServiceReport {
   logFile: string | null
   mode?: 'launchd' | 'systemd' | 'schtasks' | 'startup-folder'
   removed?: boolean
+  firewall?: FirewallRemoval
   warnings: string[]
+}
+
+export interface FirewallRemoval {
+  removed: boolean
+  rule: string
+  command: string
+  error?: string
 }
 
 export function serviceManagerFor(platform: NodeJS.Platform): ServiceManager | null {
@@ -63,17 +99,20 @@ export function serviceManagerFor(platform: NodeJS.Platform): ServiceManager | n
  */
 export function resolveServicePaths(
   runtime: Pick<SystemRuntime, 'platform' | 'homeDir' | 'env'>,
-  dataDir: string
+  dataDir: string,
+  dbPath: string = path.join(dataDir, 'vault.sqlite')
 ): ServicePaths | null {
   const manager = serviceManagerFor(runtime.platform)
   if (!manager) return null
   const p = path
+  const names = serviceNames(dbPath)
   const logFile = p.join(dataDir, 'node-serve.log')
   const pidFile = p.join(dataDir, 'node-serve.pid')
   if (manager === 'launchd') {
     return {
       manager,
-      unitFile: p.join(runtime.homeDir, 'Library', 'LaunchAgents', `${SERVICE_LABEL}.plist`),
+      names,
+      unitFile: p.join(runtime.homeDir, 'Library', 'LaunchAgents', `${names.label}.plist`),
       logFile,
       pidFile,
       launcherFile: null,
@@ -85,7 +124,8 @@ export function resolveServicePaths(
       runtime.env.XDG_CONFIG_HOME || p.join(runtime.homeDir, '.config')
     return {
       manager,
-      unitFile: p.join(configHome, 'systemd', 'user', SYSTEMD_UNIT),
+      names,
+      unitFile: p.join(configHome, 'systemd', 'user', names.systemdUnit),
       logFile,
       pidFile,
       launcherFile: null,
@@ -96,10 +136,11 @@ export function resolveServicePaths(
     runtime.env.APPDATA || p.join(runtime.homeDir, 'AppData', 'Roaming')
   return {
     manager,
-    unitFile: WINDOWS_TASK_NAME,
+    names,
+    unitFile: names.taskName,
     logFile,
     pidFile,
-    launcherFile: p.join(dataDir, 'memoseb-node.cmd'),
+    launcherFile: p.join(dataDir, names.launcherName),
     startupFile: p.join(
       appData,
       'Microsoft',
@@ -107,7 +148,7 @@ export function resolveServicePaths(
       'Start Menu',
       'Programs',
       'Startup',
-      'memoseb-node.cmd'
+      names.launcherName
     )
   }
 }
@@ -148,7 +189,11 @@ function xmlEscape(value: string): string {
     .replace(/"/g, '&quot;')
 }
 
-export function renderLaunchdPlist(command: ServiceCommand, logFile: string): string {
+export function renderLaunchdPlist(
+  command: ServiceCommand,
+  logFile: string,
+  label: string = SERVICE_LABEL
+): string {
   const args = [command.executable, ...command.args]
     .map((a) => `    <string>${xmlEscape(a)}</string>`)
     .join('\n')
@@ -157,7 +202,7 @@ export function renderLaunchdPlist(command: ServiceCommand, logFile: string): st
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>${SERVICE_LABEL}</string>
+  <string>${xmlEscape(label)}</string>
   <key>ProgramArguments</key>
   <array>
 ${args}
@@ -189,7 +234,15 @@ function systemdQuote(value: string): string {
   if (/[\u0000-\u001f]/.test(value)) {
     throw new Error(`Cannot write control characters into a systemd unit: ${JSON.stringify(value)}`)
   }
-  return `"${value.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/%/g, '%%')}"`
+  return `"${value
+    .replace(/\\/g, '\\\\')
+    .replace(/"/g, '\\"')
+    .replace(/%/g, '%%')
+    .replace(/\$/g, '$$$$')}"`
+}
+
+function systemdPathEscape(value: string): string {
+  return value.replace(/%/g, '%%').replace(/\$/g, '$$$$')
 }
 
 export function renderSystemdUnit(command: ServiceCommand, logFile: string): string {
@@ -203,8 +256,8 @@ Type=simple
 ExecStart=${exec}
 Restart=on-failure
 RestartSec=10
-StandardOutput=append:${logFile.replace(/%/g, '%%')}
-StandardError=append:${logFile.replace(/%/g, '%%')}
+StandardOutput=append:${systemdPathEscape(logFile)}
+StandardError=append:${systemdPathEscape(logFile)}
 
 [Install]
 WantedBy=default.target
@@ -226,25 +279,32 @@ export function windowsCommandLine(command: ServiceCommand): string {
 }
 
 export function renderWindowsLauncher(command: ServiceCommand): string {
-  return `@echo off\r\n${windowsCommandLine(command)}\r\n`
+  // En un .cmd, % expande variables: se duplica para que la ruta sea literal
+  return `@echo off\r\n${windowsCommandLine(command).replace(/%/g, '%%')}\r\n`
 }
 
 /**
  * Regla de entrada del Firewall de Windows para el puerto del nodo, limitada
  * al rango de Tailscale.
  */
-export function windowsFirewallRule(port: number): {
+export function windowsFirewallRule(
+  port: number,
+  name: string = FIREWALL_RULE_NAME
+): {
   powershell: string
   netshArgs: string[]
 } {
+  if (!/^[A-Za-z0-9-]+$/.test(name)) {
+    throw new Error(`Invalid firewall rule name: ${name}`)
+  }
   return {
-    powershell: `New-NetFirewallRule -DisplayName ${FIREWALL_RULE_NAME} -Direction Inbound -Action Allow -Protocol TCP -LocalPort ${port} -RemoteAddress ${TAILNET_CIDR} -Profile Any`,
+    powershell: `New-NetFirewallRule -DisplayName ${name} -Direction Inbound -Action Allow -Protocol TCP -LocalPort ${port} -RemoteAddress ${TAILNET_CIDR} -Profile Any`,
     netshArgs: [
       'advfirewall',
       'firewall',
       'add',
       'rule',
-      `name=${FIREWALL_RULE_NAME}`,
+      `name=${name}`,
       'dir=in',
       'action=allow',
       'protocol=TCP',
@@ -259,15 +319,11 @@ export function windowsFirewallRule(port: number): {
  * Crea la regla del firewall pidiendo elevación (UAC) con Start-Process -Verb RunAs.
  * El diálogo de UAC es la confirmación; si se rechaza, el llamador imprime el comando.
  */
-export async function applyWindowsFirewallRule(
+async function runElevatedPowershell(
   runtime: ServiceRuntime,
-  port: number
-): Promise<{ ok: boolean; command: string; error?: string }> {
-  const rule = windowsFirewallRule(port)
-  if (runtime.platform !== 'win32') {
-    return { ok: false, command: rule.powershell, error: 'The firewall rule only applies to Windows.' }
-  }
-  const elevated = `Start-Process -FilePath powershell.exe -Verb RunAs -Wait -ArgumentList '-NoProfile','-Command','${rule.powershell}'`
+  command: string
+): Promise<{ ok: boolean; error?: string }> {
+  const elevated = `Start-Process -FilePath powershell.exe -Verb RunAs -Wait -ArgumentList '-NoProfile','-Command','${command}'`
   try {
     const outcome = await runtime.execProcess(
       'powershell.exe',
@@ -277,14 +333,56 @@ export async function applyWindowsFirewallRule(
     if (outcome.exitCode !== 0) {
       return {
         ok: false,
-        command: rule.powershell,
         error: outcome.stderr.trim() || `powershell exited with code ${outcome.exitCode}`
       }
     }
-    return { ok: true, command: rule.powershell }
+    return { ok: true }
   } catch (err: any) {
-    return { ok: false, command: rule.powershell, error: err?.message ?? String(err) }
+    return { ok: false, error: err?.message ?? String(err) }
   }
+}
+
+export async function applyWindowsFirewallRule(
+  runtime: ServiceRuntime,
+  port: number,
+  options?: { name?: string; dataDir?: string }
+): Promise<{ ok: boolean; command: string; error?: string }> {
+  const name = options?.name ?? FIREWALL_RULE_NAME
+  const rule = windowsFirewallRule(port, name)
+  if (runtime.platform !== 'win32') {
+    return { ok: false, command: rule.powershell, error: 'The firewall rule only applies to Windows.' }
+  }
+  const outcome = await runElevatedPowershell(runtime, rule.powershell)
+  if (outcome.ok && options?.dataDir) {
+    // Marca para que uninstall borre solo la regla que creamos
+    fs.mkdirSync(options.dataDir, { recursive: true })
+    fs.writeFileSync(
+      path.join(options.dataDir, FIREWALL_MARKER),
+      JSON.stringify({ rule: name, port }, null, 2),
+      'utf-8'
+    )
+  }
+  return { command: rule.powershell, ...outcome }
+}
+
+/** Borra la regla del firewall solo si memoseb la creó (marca en el dataDir). */
+export async function removeWindowsFirewallRule(
+  runtime: ServiceRuntime,
+  dataDir: string
+): Promise<FirewallRemoval | undefined> {
+  if (runtime.platform !== 'win32') return undefined
+  const marker = path.join(dataDir, FIREWALL_MARKER)
+  let rule: string
+  try {
+    rule = String(JSON.parse(fs.readFileSync(marker, 'utf-8')).rule)
+  } catch {
+    return undefined
+  }
+  if (!/^[A-Za-z0-9-]+$/.test(rule)) return undefined
+  const command = `Remove-NetFirewallRule -DisplayName ${rule}`
+  const outcome = await runElevatedPowershell(runtime, command)
+  if (outcome.ok) fs.rmSync(marker, { force: true })
+  return { removed: outcome.ok, rule, command, ...(outcome.error ? { error: outcome.error } : {}) }
 }
 
 export function writeServePidFile(dataDir: string, pid: number = process.pid): string {
@@ -345,7 +443,7 @@ function currentUid(ctx: ServiceContext): number {
 }
 
 export function nodeServiceStatus(ctx: ServiceContext): ServiceReport {
-  const paths = resolveServicePaths(ctx.runtime, ctx.dataDir)
+  const paths = resolveServicePaths(ctx.runtime, ctx.dataDir, ctx.dbPath)
   if (!paths) {
     return { manager: null, supported: false, installed: false, unit: null, logFile: null, warnings: [] }
   }
@@ -364,7 +462,7 @@ export function nodeServiceStatus(ctx: ServiceContext): ServiceReport {
       supported: true,
       installed: mode !== undefined,
       running,
-      unit: mode === 'startup-folder' ? paths.startupFile : WINDOWS_TASK_NAME,
+      unit: mode === 'startup-folder' ? paths.startupFile : paths.names.taskName,
       logFile: paths.logFile,
       ...(mode ? { mode } : {}),
       warnings: []
@@ -388,7 +486,7 @@ export function nodeServiceStatus(ctx: ServiceContext): ServiceReport {
  * carpeta Startup como alternativa si schtasks no se deja crear). Sin elevación.
  */
 export async function installNodeService(ctx: ServiceContext): Promise<ServiceReport> {
-  const paths = resolveServicePaths(ctx.runtime, ctx.dataDir)
+  const paths = resolveServicePaths(ctx.runtime, ctx.dataDir, ctx.dbPath)
   if (!paths) {
     return {
       manager: null,
@@ -409,8 +507,12 @@ export async function installNodeService(ctx: ServiceContext): Promise<ServiceRe
   if (paths.manager === 'launchd') {
     const domain = `gui/${currentUid(ctx)}`
     fs.mkdirSync(path.dirname(paths.unitFile), { recursive: true })
-    await exec('launchctl', ['bootout', `${domain}/${SERVICE_LABEL}`]).catch(() => null)
-    fs.writeFileSync(paths.unitFile, renderLaunchdPlist(ctx.command, paths.logFile), 'utf-8')
+    await exec('launchctl', ['bootout', `${domain}/${paths.names.label}`]).catch(() => null)
+    fs.writeFileSync(
+      paths.unitFile,
+      renderLaunchdPlist(ctx.command, paths.logFile, paths.names.label),
+      'utf-8'
+    )
     const loaded = await exec('launchctl', ['bootstrap', domain, paths.unitFile])
     if (loaded.exitCode !== 0) {
       throw new Error(
@@ -433,8 +535,8 @@ export async function installNodeService(ctx: ServiceContext): Promise<ServiceRe
     fs.writeFileSync(paths.unitFile, renderSystemdUnit(ctx.command, paths.logFile), 'utf-8')
     for (const args of [
       ['--user', 'daemon-reload'],
-      ['--user', 'enable', SYSTEMD_UNIT],
-      ['--user', 'restart', SYSTEMD_UNIT]
+      ['--user', 'enable', paths.names.systemdUnit],
+      ['--user', 'restart', paths.names.systemdUnit]
     ]) {
       const outcome = await exec('systemctl', args).catch((err: Error) => ({
         exitCode: 1,
@@ -443,7 +545,7 @@ export async function installNodeService(ctx: ServiceContext): Promise<ServiceRe
       }))
       if (outcome.exitCode !== 0) {
         warnings.push(
-          `systemctl ${args.join(' ')} failed: ${outcome.stderr.trim()}. The unit was written to ${paths.unitFile}; activate it from a session with a user bus: systemctl --user enable --now ${SYSTEMD_UNIT}`
+          `systemctl ${args.join(' ')} failed: ${outcome.stderr.trim()}. The unit was written to ${paths.unitFile}; activate it from a session with a user bus: systemctl --user enable --now ${paths.names.systemdUnit}`
         )
         break
       }
@@ -472,7 +574,7 @@ export async function installNodeService(ctx: ServiceContext): Promise<ServiceRe
     '/SC',
     'ONLOGON',
     '/TN',
-    WINDOWS_TASK_NAME,
+    paths.names.taskName,
     '/TR',
     taskRun,
     '/RL',
@@ -481,7 +583,7 @@ export async function installNodeService(ctx: ServiceContext): Promise<ServiceRe
   ]).catch((err: Error) => ({ exitCode: 1, stdout: '', stderr: err.message }))
 
   if (created.exitCode === 0) {
-    const run = await exec('schtasks', ['/Run', '/TN', WINDOWS_TASK_NAME]).catch(
+    const run = await exec('schtasks', ['/Run', '/TN', paths.names.taskName]).catch(
       (err: Error) => ({ exitCode: 1, stdout: '', stderr: err.message })
     )
     if (run.exitCode !== 0) {
@@ -503,14 +605,14 @@ export async function installNodeService(ctx: ServiceContext): Promise<ServiceRe
   }
   fs.writeFileSync(
     winPath.join(ctx.dataDir, 'node-service.json'),
-    JSON.stringify({ mode, task: WINDOWS_TASK_NAME, startupFile: paths.startupFile }, null, 2),
+    JSON.stringify({ mode, task: paths.names.taskName, startupFile: paths.startupFile }, null, 2),
     'utf-8'
   )
   return {
     manager: 'schtasks',
     supported: true,
     installed: true,
-    unit: mode === 'schtasks' ? WINDOWS_TASK_NAME : paths.startupFile,
+    unit: mode === 'schtasks' ? paths.names.taskName : paths.startupFile,
     logFile: paths.logFile,
     mode,
     warnings
@@ -523,19 +625,20 @@ export async function installNodeService(ctx: ServiceContext): Promise<ServiceRe
  */
 export async function uninstallNodeService(ctx: ServiceContext): Promise<ServiceReport> {
   const status = nodeServiceStatus(ctx)
-  const paths = resolveServicePaths(ctx.runtime, ctx.dataDir)
+  const paths = resolveServicePaths(ctx.runtime, ctx.dataDir, ctx.dbPath)
+  const firewall = await removeWindowsFirewallRule(ctx.runtime, ctx.dataDir)
   if (!paths || !status.installed) {
-    return { ...status, removed: false }
+    return { ...status, removed: false, ...(firewall ? { firewall } : {}) }
   }
   const exec = ctx.runtime.execProcess.bind(ctx.runtime)
   const warnings: string[] = []
   const swallow = (err: Error) => ({ exitCode: 1, stdout: '', stderr: err.message })
 
   if (paths.manager === 'launchd') {
-    await exec('launchctl', ['bootout', `gui/${currentUid(ctx)}/${SERVICE_LABEL}`]).catch(swallow)
+    await exec('launchctl', ['bootout', `gui/${currentUid(ctx)}/${paths.names.label}`]).catch(swallow)
     fs.rmSync(paths.unitFile, { force: true })
   } else if (paths.manager === 'systemd') {
-    const disabled = await exec('systemctl', ['--user', 'disable', '--now', SYSTEMD_UNIT]).catch(swallow)
+    const disabled = await exec('systemctl', ['--user', 'disable', '--now', paths.names.systemdUnit]).catch(swallow)
     if (disabled.exitCode !== 0) {
       warnings.push(`systemctl --user disable --now failed: ${disabled.stderr.trim()}`)
     }
@@ -544,8 +647,8 @@ export async function uninstallNodeService(ctx: ServiceContext): Promise<Service
   } else {
     const winPath = path
     if (status.mode === 'schtasks') {
-      await exec('schtasks', ['/End', '/TN', WINDOWS_TASK_NAME]).catch(swallow)
-      const deleted = await exec('schtasks', ['/Delete', '/TN', WINDOWS_TASK_NAME, '/F']).catch(swallow)
+      await exec('schtasks', ['/End', '/TN', paths.names.taskName]).catch(swallow)
+      const deleted = await exec('schtasks', ['/Delete', '/TN', paths.names.taskName, '/F']).catch(swallow)
       if (deleted.exitCode !== 0) {
         warnings.push(`schtasks /Delete failed: ${deleted.stderr.trim()}`)
       }
@@ -564,6 +667,7 @@ export async function uninstallNodeService(ctx: ServiceContext): Promise<Service
     logFile: paths.logFile,
     mode: status.mode,
     removed: true,
+    ...(firewall ? { firewall } : {}),
     warnings
   }
 }
