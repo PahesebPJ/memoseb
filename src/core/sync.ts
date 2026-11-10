@@ -163,7 +163,8 @@ export interface AnnouncePacket {
   requiresAuth: boolean
   app?: string
   contracts?: string[]
-  authTag?: string
+  /** Tag de respuesta por cada IPv4 local desde la que puede salir el datagrama. */
+  authTags?: Record<string, string>
 }
 
 export interface SyncServerHandle {
@@ -376,15 +377,65 @@ export function createChallengeNonce(): string {
   return crypto.randomBytes(24).toString('hex')
 }
 
-/** authTag = hex(HMAC-SHA256(token, nonce)), igual que gaze. */
-export function computeChallengeTag(token: string, nonce: string): string {
-  return crypto.createHmac('sha256', token).update(nonce).digest('hex')
+/** host:port normalizado (sin corchetes, sin ::ffff:, en minúsculas). */
+export function challengeEndpoint(host: string, port: number | string): string {
+  return `${normalizeRemoteAddress(host.replace(/^\[|\]$/g, ''))}:${port}`
 }
 
-export function verifyChallengeTag(token: string, nonce: string, tag: unknown): boolean {
+/**
+ * authTag = hex(HMAC-SHA256(token, nonce + "|" + host + ":" + port)), igual que
+ * gaze. host:port es el endpoint que marcó el cliente, así un relay no sirve.
+ */
+export function computeChallengeTag(token: string, nonce: string, endpoint: string): string {
+  return crypto.createHmac('sha256', token).update(`${nonce}|${endpoint}`).digest('hex')
+}
+
+function tagsEqual(expectedHex: string, tag: unknown): boolean {
   if (typeof tag !== 'string' || !/^[0-9a-f]{64}$/i.test(tag)) return false
-  const expected = Buffer.from(computeChallengeTag(token, nonce), 'hex')
-  return crypto.timingSafeEqual(expected, Buffer.from(tag.toLowerCase(), 'hex'))
+  return crypto.timingSafeEqual(Buffer.from(expectedHex, 'hex'), Buffer.from(tag.toLowerCase(), 'hex'))
+}
+
+export function verifyChallengeTag(
+  token: string,
+  nonce: string,
+  endpoint: string,
+  tag: unknown
+): boolean {
+  return tagsEqual(computeChallengeTag(token, nonce, endpoint), tag)
+}
+
+/** Tag de la petición UDP, ligado al ip:puerto destino y con dominio propio. */
+export function udpRequestTag(token: string, nonce: string, endpoint: string): string {
+  return crypto.createHmac('sha256', token).update(`udp|${nonce}|${endpoint}`).digest('hex')
+}
+
+/** Tag de la respuesta UDP, ligado al ip:puerto desde el que responde el nodo. */
+export function udpResponseTag(token: string, nonce: string, endpoint: string): string {
+  return crypto
+    .createHmac('sha256', token)
+    .update(`udp|response|${nonce}|${endpoint}`)
+    .digest('hex')
+}
+
+/** IPv4 locales y sus direcciones de broadcast: destinos posibles de un sondeo UDP. */
+export function localUdpDestinations(
+  interfaces: NodeJS.Dict<os.NetworkInterfaceInfo[]> = os.networkInterfaces()
+): { local: string[]; destinations: string[] } {
+  const local = new Set<string>(['127.0.0.1'])
+  const destinations = new Set<string>(['127.0.0.1', '255.255.255.255'])
+  for (const list of Object.values(interfaces)) {
+    for (const info of list ?? []) {
+      if (info.family !== 'IPv4' || !info.address) continue
+      local.add(info.address)
+      destinations.add(info.address)
+      const a = info.address.split('.').map(Number)
+      const m = (info.netmask ?? '255.255.255.255').split('.').map(Number)
+      if (a.length === 4 && m.length === 4) {
+        destinations.add(a.map((octet, i) => (octet & m[i]!) | (~m[i]! & 255)).join('.'))
+      }
+    }
+  }
+  return { local: Array.from(local), destinations: Array.from(destinations) }
 }
 
 /** Nonce del reto: query ?nonce= o header X-P2P-Nonce. */
@@ -580,21 +631,17 @@ export async function discoverLanNodes(options?: {
   ]
 
   const nonce = crypto.randomUUID()
-  const discoverPacket: DiscoverPacket = {
-    magic: DISCOVERY_MAGIC_REQUEST,
-    nonce,
-    timestamp: new Date().toISOString(),
-    ...(token
-      ? {
-          authTag: crypto
-            .createHmac('sha256', token)
-            .update(nonce)
-            .digest('hex')
-        }
-      : {})
+  const packetFor = (target: string): Buffer => {
+    const discoverPacket: DiscoverPacket = {
+      magic: DISCOVERY_MAGIC_REQUEST,
+      nonce,
+      timestamp: new Date().toISOString(),
+      ...(token
+        ? { authTag: udpRequestTag(token, nonce, challengeEndpoint(target, targetPort)) }
+        : {})
+    }
+    return Buffer.from(JSON.stringify(discoverPacket))
   }
-
-  const payload = Buffer.from(JSON.stringify(discoverPacket))
   const discovered = new Map<string, DiscoveredLanNode>()
 
   return new Promise((resolve) => {
@@ -632,8 +679,9 @@ export async function discoverLanNodes(options?: {
           return
         }
         if (token) {
-          const expectedTag = udpResponseTag(token, nonce)
-          if (!verifyAuthToken(expectedTag, typeof raw.authTag === 'string' ? raw.authTag : null)) {
+          const source = normalizeRemoteAddress(rinfo.address)
+          const tag = raw.authTags && typeof raw.authTags === 'object' ? raw.authTags[source] : undefined
+          if (!tagsEqual(udpResponseTag(token, nonce, challengeEndpoint(source, rinfo.port)), tag)) {
             return
           }
         }
@@ -673,6 +721,7 @@ export async function discoverLanNodes(options?: {
       }
 
       for (const target of broadcastAddresses) {
+        const payload = packetFor(target)
         socket.send(payload, 0, payload.length, targetPort, target, () => {
           // ignore target errors
         })
@@ -683,10 +732,6 @@ export async function discoverLanNodes(options?: {
 
 export const discoverLanParents = discoverLanNodes
 
-/** La respuesta UDP firma con otro dominio para no poder reflejar el tag de la petición. */
-export function udpResponseTag(token: string, nonce: string): string {
-  return crypto.createHmac('sha256', token).update(`${nonce}:response`).digest('hex')
-}
 
 /**
  * Sondea por HTTP unicast GET /api/v1/p2p/status en cada host. Solo devuelve
@@ -721,7 +766,7 @@ export async function probeP2PNodes(
           { method: 'GET', headers: { 'X-P2P-Nonce': nonce }, timeoutMs }
         )
         const tag = challenge?.authTag ?? challenge?.data?.authTag
-        if (!verifyChallengeTag(token, nonce, tag)) {
+        if (!verifyChallengeTag(token, nonce, challengeEndpoint(host, options.port), tag)) {
           return
         }
       }
@@ -932,13 +977,18 @@ export async function startSyncServer(
         req.method === 'GET' && challengePath === '/api/v1/p2p/status'
           ? readChallengeNonce(req.url, req.headers)
           : null
+      // Endpoint que marcó el cliente, visto desde este socket
+      const localEndpoint = challengeEndpoint(
+        req.socket.localAddress ?? '',
+        req.socket.localPort ?? 0
+      )
       if (challengeNonce !== null && !isValidNonce(challengeNonce)) {
         sendJson(400, { ok: false, error: 'BAD_REQUEST', message: 'Invalid nonce.' })
         return
       }
       if (!isGlobalTokenValid && !matchedGroup && challengeNonce && expectedToken) {
         // Reto de descubrimiento: prueba que conocemos el token sin revelar stats ni datos
-        const authTag = computeChallengeTag(expectedToken, challengeNonce)
+        const authTag = computeChallengeTag(expectedToken, challengeNonce, localEndpoint)
         const challengeData = {
           ok: true,
           challenge: true,
@@ -1026,7 +1076,7 @@ export async function startSyncServer(
           if (challengeNonce && expectedToken) {
             Object.assign(statusData, {
               nonce: challengeNonce,
-              authTag: computeChallengeTag(expectedToken, challengeNonce)
+              authTag: computeChallengeTag(expectedToken, challengeNonce, localEndpoint)
             })
           }
           sendJson(200, {
@@ -1447,17 +1497,18 @@ export async function startSyncServer(
         const hasAuth = availableTokens.length > 0
 
         let matchedToken: string | null = null
-        // Con token configurado no se responde a sondeos sin authTag válido
+        const udpPort = udpSocket?.address().port ?? requestedUdpPort
+        const { local, destinations } = localUdpDestinations()
+        // Con token configurado no se responde a sondeos sin authTag válido para
+        // alguno de nuestros destinos posibles (IP local o broadcast)
         if (hasAuth) {
           if (typeof data.authTag === 'string') {
-            for (const candidate of availableTokens) {
-              const expectedTag = crypto
-                .createHmac('sha256', candidate)
-                .update(nonce)
-                .digest('hex')
-              if (verifyAuthToken(expectedTag, data.authTag)) {
-                matchedToken = candidate
-                break
+            search: for (const candidate of availableTokens) {
+              for (const dest of destinations) {
+                if (tagsEqual(udpRequestTag(candidate, nonce, challengeEndpoint(dest, udpPort)), data.authTag)) {
+                  matchedToken = candidate
+                  break search
+                }
               }
             }
           }
@@ -1484,7 +1535,14 @@ export async function startSyncServer(
           app: 'memoseb',
           contracts: ['memoseb-snapshot', 'p2p-memory-contract'],
           ...(hasAuth && signingToken
-            ? { authTag: udpResponseTag(signingToken, nonce) }
+            ? {
+                authTags: Object.fromEntries(
+                  local.map((ip) => [
+                    ip,
+                    udpResponseTag(signingToken, nonce, challengeEndpoint(ip, udpPort))
+                  ])
+                )
+              }
             : {})
         }
         const outBuf = Buffer.from(JSON.stringify(response))

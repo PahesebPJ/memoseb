@@ -14,6 +14,7 @@ import { renderSystemdUnit, renderWindowsLauncher } from '../src/core/service.ts
 import { computeSnapshotChecksum } from '../src/core/snapshot.ts'
 import {
   acceptCallbackUrl,
+  challengeEndpoint,
   computeChallengeTag,
   DISCOVERY_MAGIC_REQUEST,
   DISCOVERY_MAGIC_RESPONSE,
@@ -25,7 +26,9 @@ import {
   startSyncServer,
   syncAllPeers,
   syncWithPeer,
-  udpResponseTag
+  udpRequestTag,
+  udpResponseTag,
+  verifyChallengeTag
 } from '../src/core/sync.ts'
 import { locateTailscaleBinary } from '../src/core/tailscale.ts'
 import { MemoryVault } from '../src/core/vault.ts'
@@ -87,15 +90,20 @@ describe('Security hardening of the P2P node', () => {
     fs.rmSync(tmpDir, { recursive: true, force: true })
   })
 
-  it('answers the status challenge with HMAC(token, nonce) and no stats when unauthenticated', async () => {
+  it('answers the status challenge with HMAC(token, nonce|host:port) and no stats when unauthenticated', async () => {
     const vault = open('challenge')
     vault.enableNodeMode({ role: 'peer', authToken: 'secret-token' })
     vault.storeMemory({ projectId: 'den', category: 'domain', content: 'Never leaked to anonymous probes.' })
     const server = await startSyncServer(vault, { host: '127.0.0.1', port: 0, enableUdpDiscovery: false })
     try {
       const nonce = crypto.randomBytes(16).toString('hex')
-      const expected = crypto.createHmac('sha256', 'secret-token').update(nonce).digest('hex')
-      assert.equal(computeChallengeTag('secret-token', nonce), expected)
+      const endpoint = `127.0.0.1:${server.port}`
+      const expected = crypto
+        .createHmac('sha256', 'secret-token')
+        .update(`${nonce}|${endpoint}`)
+        .digest('hex')
+      assert.equal(computeChallengeTag('secret-token', nonce, endpoint), expected)
+      assert.equal(challengeEndpoint('::ffff:127.0.0.1', server.port), endpoint)
 
       const viaQuery = await rawRequest(server.port, { path: `/api/v1/p2p/status?nonce=${nonce}` })
       assert.equal(viaQuery.status, 200)
@@ -104,6 +112,13 @@ describe('Security hardening of the P2P node', () => {
       assert.equal(viaQuery.body.stats, undefined)
       assert.equal(viaQuery.body.data.stats, undefined)
       assert.equal(viaQuery.body.nodeId, undefined)
+
+      // Relay: el tag ligado a este endpoint no sirve para otro host
+      assert.equal(
+        verifyChallengeTag('secret-token', nonce, `100.64.0.9:${server.port}`, viaQuery.body.authTag),
+        false
+      )
+      assert.equal(verifyChallengeTag('secret-token', nonce, endpoint, viaQuery.body.authTag), true)
 
       const viaHeader = await rawRequest(server.port, {
         path: '/api/v1/p2p/status',
@@ -217,7 +232,7 @@ describe('Security hardening of the P2P node', () => {
           port: 7432,
           urls: ['http://evil.example:80'],
           requiresAuth: true,
-          authTag: udpResponseTag('lan-token', req.nonce)
+          authTags: { '127.0.0.1': udpResponseTag('lan-token', req.nonce, `127.0.0.1:${port}`) }
         })
       )
       socket.send(reply, rinfo.port, rinfo.address)
@@ -231,9 +246,44 @@ describe('Security hardening of the P2P node', () => {
       })
       assert.equal(nodes.length, 1)
       assert.deepEqual(nodes[0]!.urls, ['http://127.0.0.1:7432'])
-      // El tag de la petición reflejado no sirve como respuesta
-      const reflected = crypto.createHmac('sha256', 'lan-token').update('n').digest('hex')
-      assert.notEqual(udpResponseTag('lan-token', 'n'), reflected)
+      // La petición va ligada al destino y la respuesta a su origen, con dominios distintos
+      assert.notEqual(
+        udpResponseTag('lan-token', 'n', '127.0.0.1:1'),
+        udpRequestTag('lan-token', 'n', '127.0.0.1:1')
+      )
+      assert.notEqual(udpRequestTag('lan-token', 'n', '127.0.0.1:1'), udpRequestTag('lan-token', 'n', '127.0.0.2:1'))
+      assert.notEqual(
+        udpRequestTag('lan-token', 'n', '127.0.0.1:1'),
+        computeChallengeTag('lan-token', 'n', '127.0.0.1:1')
+      )
+    } finally {
+      socket.close()
+    }
+  })
+
+  it('ignores a UDP announce whose tag is bound to another source address', async () => {
+    const socket = dgram.createSocket('udp4')
+    await new Promise<void>((resolve) => socket.bind(0, '127.0.0.1', () => resolve()))
+    const port = socket.address().port
+    socket.on('message', (msg, rinfo) => {
+      const req = JSON.parse(msg.toString('utf-8'))
+      const reply = Buffer.from(
+        JSON.stringify({
+          magic: DISCOVERY_MAGIC_RESPONSE,
+          nonce: req.nonce,
+          nodeId: 'relayed',
+          nodeName: 'R',
+          role: 'peer',
+          port: 7432,
+          requiresAuth: true,
+          authTags: { '127.0.0.1': udpResponseTag('lan-token', req.nonce, `100.64.0.5:${port}`) }
+        })
+      )
+      socket.send(reply, rinfo.port, rinfo.address)
+    })
+    try {
+      const nodes = await discoverLanNodes({ port, timeoutMs: 300, token: 'lan-token', broadcastAddresses: ['127.0.0.1'] })
+      assert.equal(nodes.length, 0)
     } finally {
       socket.close()
     }
