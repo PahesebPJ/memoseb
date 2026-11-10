@@ -1360,4 +1360,251 @@ describe('CLI hubseb/v1 Wire Contract, MCP JSON-RPC Server, and Topology Integra
       vault.close()
     }
   })
+
+  it('manages P2P/Gaze wire contract workflows via CLI and MCP (enable --role p2p, add-peer, export/import gaze, sync --format gaze)', async () => {
+    // 1. CLI memoseb node enable --role p2p (JSON and text)
+    const enableRes = await executeMemoCli(['node', 'enable', '--role', 'p2p', '--json'], {
+      runtime,
+      dbPath
+    })
+    assert.equal(enableRes.exitCode, 0)
+    const enablePacket = decodeWire<{
+      config: { enabled: boolean; role: string }
+    }>(enableRes.stdout) as WireSuccess<{
+      config: { enabled: boolean; role: string }
+    }>
+    assert.equal(enablePacket.payload.config.enabled, true)
+    assert.equal(enablePacket.payload.config.role, 'peer')
+
+    const enableTextRes = await executeMemoCli(['node', 'enable', '--role', 'p2p'], {
+      runtime,
+      dbPath
+    })
+    assert.equal(enableTextRes.exitCode, 0)
+    assert.ok(enableTextRes.stdout.includes('Node mode ENABLED as role=peer'))
+
+    // 2. CLI memoseb node add-peer <url> (JSON and text)
+    const addPeerRes = await executeMemoCli(
+      ['node', 'add-peer', 'http://127.0.0.1:9444', '--name', 'peer-node-cli', '--json'],
+      { runtime, dbPath }
+    )
+    assert.equal(addPeerRes.exitCode, 0)
+    const addPeerPacket = decodeWire<{
+      peer: { url: string; role: string; name: string }
+    }>(addPeerRes.stdout) as WireSuccess<{
+      peer: { url: string; role: string; name: string }
+    }>
+    assert.equal(addPeerPacket.payload.peer.url, 'http://127.0.0.1:9444')
+    assert.equal(addPeerPacket.payload.peer.name, 'peer-node-cli')
+    // Mapped role from SQLite sync_peers row
+    assert.ok(
+      addPeerPacket.payload.peer.role === 'peer' || addPeerPacket.payload.peer.role === 'child'
+    )
+
+    const addPeerTextRes = await executeMemoCli(
+      ['node', 'add-peer', 'http://127.0.0.1:9445'],
+      { runtime, dbPath }
+    )
+    assert.equal(addPeerTextRes.exitCode, 0)
+    assert.ok(addPeerTextRes.stdout.includes('Added peer http://127.0.0.1:9445'))
+
+    // Seed primary vault with memories to export
+    await executeMemoCli(
+      [
+        'remember',
+        'Architecture specification for Gaze interoperability protocol.',
+        '--project',
+        'proj-gaze-cli',
+        '--category',
+        'architecture',
+        '--title',
+        'Gaze Interop Spec',
+        '--json'
+      ],
+      { runtime, dbPath }
+    )
+
+    // 3. CLI memoseb export <file> --format gaze (JSON and text)
+    const gazeFile = path.join(tmpDir, 'exported-gaze.json')
+    const expGazeRes = await executeMemoCli(
+      ['export', gazeFile, '--format', 'gaze', '--project', 'proj-gaze-cli', '--json'],
+      { runtime, dbPath }
+    )
+    assert.equal(expGazeRes.exitCode, 0)
+    const expGazePacket = decodeWire<{
+      filePath: string
+      checksum: string
+      memoryCount: number
+      format: string
+    }>(expGazeRes.stdout) as WireSuccess<{
+      filePath: string
+      checksum: string
+      memoryCount: number
+      format: string
+    }>
+    assert.equal(expGazePacket.payload.format, 'p2p')
+    assert.ok(expGazePacket.payload.checksum)
+    assert.equal(expGazePacket.payload.memoryCount, 1)
+
+    // Verify written file structure matches Gaze P2P contract
+    assert.ok(fs.existsSync(gazeFile))
+    const rawGaze = JSON.parse(fs.readFileSync(gazeFile, 'utf-8'))
+    assert.equal(rawGaze.format, 'p2p-memory-contract')
+    assert.equal(rawGaze.version, 1)
+    assert.ok(Array.isArray(rawGaze.nodes))
+    assert.equal(rawGaze.nodes.length, 1)
+    assert.equal(rawGaze.nodes[0]?.title, 'Gaze Interop Spec')
+
+    // Test text output format for export with --format gaze
+    const gazeTextFile = path.join(tmpDir, 'exported-gaze-text.json')
+    const expGazeTextRes = await executeMemoCli(
+      ['export', gazeTextFile, '--format', 'gaze', '--project', 'proj-gaze-cli'],
+      { runtime, dbPath }
+    )
+    assert.equal(expGazeTextRes.exitCode, 0)
+    assert.ok(expGazeTextRes.stdout.includes('Exported p2p gaze bundle'))
+    assert.ok(expGazeTextRes.stdout.includes('p2p-memory-contract'))
+
+    // 4. CLI memoseb import <file> of a Gaze P2P package into another vault
+    const dbPath2 = path.join(tmpDir, 'vault-imported-gaze.sqlite')
+    const impGazeRes = await executeMemoCli(
+      ['import', gazeFile, '--db', dbPath2, '--json'],
+      { runtime }
+    )
+    assert.equal(impGazeRes.exitCode, 0)
+    const impGazePacket = decodeWire<{
+      strategy: string
+      memoriesCreated: number
+    }>(impGazeRes.stdout) as WireSuccess<{
+      strategy: string
+      memoriesCreated: number
+    }>
+    assert.equal(impGazePacket.payload.strategy, 'merge')
+    assert.equal(impGazePacket.payload.memoriesCreated, 1)
+
+    // Recall from imported vault to confirm memory was restored
+    const recallImported = await executeMemoCli(
+      ['recall', 'Gaze Interop', '--project', 'proj-gaze-cli', '--db', dbPath2, '--json'],
+      { runtime }
+    )
+    assert.equal(recallImported.exitCode, 0)
+    const recallImportedPacket = decodeWire<RecallResult>(
+      recallImported.stdout
+    ) as WireSuccess<RecallResult>
+    assert.equal(recallImportedPacket.payload.memories.length, 1)
+    assert.equal(recallImportedPacket.payload.memories[0]?.title, 'Gaze Interop Spec')
+
+    // 5. CLI memoseb sync --url <url> --format gaze
+    const remoteServerDb = path.join(tmpDir, 'remote-server.sqlite')
+    const remoteVault = new MemoryVault({ dbPath: remoteServerDb, runtime })
+    remoteVault.enableNodeMode({ role: 'peer', listenPort: 0 })
+    remoteVault.storeMemory({
+      projectId: 'proj-sync-gaze',
+      category: 'decision',
+      title: 'Decided on Gaze P2P Wire Protocol',
+      content: 'Consensus on canonical Gaze contract envelope.'
+    })
+
+    const remoteServer = await startSyncServer(remoteVault, {
+      host: '127.0.0.1',
+      port: 0,
+      enableUdpDiscovery: false
+    })
+    const remoteUrl = `http://127.0.0.1:${remoteServer.port}`
+
+    try {
+      const clientDb = path.join(tmpDir, 'client-sync.sqlite')
+      const syncGazeRes = await executeMemoCli(
+        ['sync', '--url', remoteUrl, '--format', 'gaze', '--project', 'proj-sync-gaze', '--json'],
+        { runtime, dbPath: clientDb }
+      )
+      assert.equal(syncGazeRes.exitCode, 0)
+      const syncGazePacket = decodeWire<{
+        pulled: { memoriesCreated: number }
+      }>(syncGazeRes.stdout) as WireSuccess<{
+        pulled: { memoriesCreated: number }
+      }>
+      assert.equal(syncGazePacket.payload.pulled.memoriesCreated, 1)
+
+      // 6. MCP memory_export with format: 'gaze' (in-memory and to file)
+      const mcpVault = new MemoryVault({ dbPath: remoteServerDb, runtime })
+      try {
+        // In-memory MCP memory_export with format: 'gaze'
+        const mcpExportRes = (await handleMcpRequest(mcpVault, {
+          jsonrpc: '2.0',
+          id: 501,
+          method: 'tools/call',
+          params: {
+            name: 'memory_export',
+            arguments: {
+              projectId: 'proj-sync-gaze',
+              format: 'gaze'
+            }
+          }
+        })) as { result: { content: Array<{ type: string; text: string }> } }
+
+        const mcpExpPayload = JSON.parse(mcpExportRes.result.content[0]!.text) as {
+          format: string
+          checksum: string
+          memoryCount: number
+          payload: { format: string; nodes: any[] }
+        }
+        assert.equal(mcpExpPayload.format, 'p2p-memory-contract')
+        assert.equal(mcpExpPayload.payload.format, 'p2p-memory-contract')
+        assert.equal(mcpExpPayload.memoryCount, 1)
+
+        // File-based MCP memory_export with format: 'gaze'
+        const mcpGazeFile = path.join(tmpDir, 'mcp-gaze-bundle.json')
+        const mcpFileExportRes = (await handleMcpRequest(mcpVault, {
+          jsonrpc: '2.0',
+          id: 502,
+          method: 'tools/call',
+          params: {
+            name: 'memory_export',
+            arguments: {
+              filePath: mcpGazeFile,
+              projectId: 'proj-sync-gaze',
+              format: 'gaze'
+            }
+          }
+        })) as { result: { content: Array<{ type: string; text: string }> } }
+
+        assert.ok(fs.existsSync(mcpGazeFile))
+        const mcpSavedGaze = JSON.parse(fs.readFileSync(mcpGazeFile, 'utf-8'))
+        assert.equal(mcpSavedGaze.format, 'p2p-memory-contract')
+
+        // 7. MCP memory_sync with format: 'gaze'
+        const clientVault = new MemoryVault({ dbPath: clientDb, runtime })
+        try {
+          const mcpSyncRes = (await handleMcpRequest(clientVault, {
+            jsonrpc: '2.0',
+            id: 503,
+            method: 'tools/call',
+            params: {
+              name: 'memory_sync',
+              arguments: {
+                peerUrl: remoteUrl,
+                format: 'gaze'
+              }
+            }
+          })) as { result: { content: Array<{ type: string; text: string }> } }
+
+          const mcpSyncPayload = JSON.parse(mcpSyncRes.result.content[0]!.text) as {
+            peerUrl: string
+            pushed: any
+            pulled: any
+          }
+          assert.equal(mcpSyncPayload.peerUrl, remoteUrl)
+          assert.ok(mcpSyncPayload.pulled)
+        } finally {
+          clientVault.close()
+        }
+      } finally {
+        mcpVault.close()
+      }
+    } finally {
+      await remoteServer.close()
+      remoteVault.close()
+    }
+  })
 })

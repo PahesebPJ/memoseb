@@ -7,6 +7,7 @@ import path from 'node:path'
 import { describe, it } from 'node:test'
 import type { NodeConfiguration, NodeRole, PeerRole, SyncPeerRecord } from '../src/core/schema.ts'
 import {
+  discoverLanNodes,
   discoverLanParents,
   getLocalLanUrls,
   normalizePeerUrl,
@@ -23,6 +24,14 @@ import {
   type SyncCapableVault,
   type VaultSnapshotV1
 } from '../src/core/sync.ts'
+import {
+  computeP2PPayloadChecksum,
+  memoryToGazeNode,
+  wrapP2PEnvelope,
+  type GazeNodeV1,
+  type P2PContractEnvelopeV1,
+  type P2PSyncPayloadV1
+} from '../src/core/p2p-contract.ts'
 import { MemoryVault, type VaultStats } from '../src/core/vault.ts'
 
 class MockSyncVault implements SyncCapableVault {
@@ -488,6 +497,74 @@ describe('Sync Engine: UDP Local Area Network Discovery', () => {
       await serverHandle.close()
     }
   })
+
+  it('discovers LAN peer nodes and filters by role using discoverLanNodes and discoverLanParents', async () => {
+    const peerVault = new MockSyncVault({
+      nodeId: 'peer-udp-node',
+      nodeName: 'Peer Discovery Node',
+      role: 'peer',
+      authToken: 'lan-peer-secret'
+    })
+
+    const peerHandle = await startSyncServer(peerVault, {
+      host: '127.0.0.1',
+      port: 0,
+      enableUdpDiscovery: true,
+      udpPort: 0
+    })
+
+    assert.ok(peerHandle.udpPort !== null)
+
+    try {
+      // 1. discoverLanNodes with roleFilter: 'peer' finds the peer node
+      const peerOnly = await discoverLanNodes({
+        port: peerHandle.udpPort,
+        timeoutMs: 350,
+        token: 'lan-peer-secret',
+        roleFilter: 'peer',
+        broadcastAddresses: ['127.0.0.1']
+      })
+      assert.equal(peerOnly.length, 1)
+      assert.equal(peerOnly[0]?.nodeId, 'peer-udp-node')
+      assert.equal(peerOnly[0]?.role, 'peer')
+      assert.ok(peerOnly[0]?.contracts?.includes('p2p-memory-contract'))
+      assert.ok(peerOnly[0]?.contracts?.includes('memoseb-snapshot'))
+
+      // 2. discoverLanNodes with roleFilter: 'parent' rejects the peer node
+      const parentOnly = await discoverLanNodes({
+        port: peerHandle.udpPort,
+        timeoutMs: 350,
+        token: 'lan-peer-secret',
+        roleFilter: 'parent',
+        broadcastAddresses: ['127.0.0.1']
+      })
+      assert.equal(parentOnly.length, 0)
+
+      // 3. discoverLanNodes with roleFilter: 'any' finds the peer node
+      const anyNodes = await discoverLanNodes({
+        port: peerHandle.udpPort,
+        timeoutMs: 350,
+        token: 'lan-peer-secret',
+        roleFilter: 'any',
+        broadcastAddresses: ['127.0.0.1']
+      })
+      assert.equal(anyNodes.length, 1)
+      assert.equal(anyNodes[0]?.nodeId, 'peer-udp-node')
+
+      // 4. discoverLanParents alias supports roleFilter: 'peer'
+      const aliasPeer = await discoverLanParents({
+        port: peerHandle.udpPort,
+        timeoutMs: 350,
+        token: 'lan-peer-secret',
+        roleFilter: 'peer',
+        broadcastAddresses: ['127.0.0.1']
+      })
+      assert.equal(aliasPeer.length, 1)
+      assert.equal(aliasPeer[0]?.nodeId, 'peer-udp-node')
+    } finally {
+      await peerHandle.close()
+    }
+  })
 })
 
 describe('Sync Engine: Handshake and Bidirectional Synchronization', () => {
@@ -823,6 +900,379 @@ describe('Sync Engine: Multi-Child Parent Synchronization with Pass-2 Propagatio
         parentVault.close()
         child1Vault.close()
         child2Vault.close()
+      }
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('Sync Engine: 3-Node P2P Mesh Topology with Pass-2 Propagation', () => {
+  it('propagates memories and tombstones across Peer A <-> Peer B <-> Peer C in 2 passes of syncAllPeers', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'memoseb-p2p-mesh-'))
+    try {
+      const dbPathA = path.join(tmpDir, 'peer-a.sqlite')
+      const dbPathB = path.join(tmpDir, 'peer-b.sqlite')
+      const dbPathC = path.join(tmpDir, 'peer-c.sqlite')
+
+      const vaultA = new MemoryVault({ dbPath: dbPathA })
+      const vaultB = new MemoryVault({ dbPath: dbPathB })
+      const vaultC = new MemoryVault({ dbPath: dbPathC })
+
+      vaultA.enableNodeMode({ role: 'peer', nodeName: 'Peer A Node', listenPort: 0 })
+      vaultB.enableNodeMode({ role: 'peer', nodeName: 'Peer B Relay Node', listenPort: 0 })
+      vaultC.enableNodeMode({ role: 'peer', nodeName: 'Peer C Node', listenPort: 0 })
+
+      // Start HTTP servers for all 3 peers in the mesh
+      const serverA = await startSyncServer(vaultA, {
+        host: '127.0.0.1',
+        port: 0,
+        enableUdpDiscovery: false
+      })
+      const serverUrlA = `http://127.0.0.1:${serverA.port}`
+
+      const serverB = await startSyncServer(vaultB, {
+        host: '127.0.0.1',
+        port: 0,
+        enableUdpDiscovery: false
+      })
+      const serverUrlB = `http://127.0.0.1:${serverB.port}`
+
+      const serverC = await startSyncServer(vaultC, {
+        host: '127.0.0.1',
+        port: 0,
+        enableUdpDiscovery: false
+      })
+      const serverUrlC = `http://127.0.0.1:${serverC.port}`
+
+      try {
+        // Line topology: Peer A <-> Peer B <-> Peer C
+        vaultA.upsertPeer({
+          role: 'peer',
+          url: serverUrlB,
+          name: 'Peer B Relay',
+          peerNodeId: vaultB.getNodeId()
+        })
+
+        vaultB.upsertPeer({
+          role: 'peer',
+          url: serverUrlA,
+          name: 'Peer A',
+          peerNodeId: vaultA.getNodeId()
+        })
+        vaultB.upsertPeer({
+          role: 'peer',
+          url: serverUrlC,
+          name: 'Peer C',
+          peerNodeId: vaultC.getNodeId()
+        })
+
+        vaultC.upsertPeer({
+          role: 'peer',
+          url: serverUrlB,
+          name: 'Peer B Relay',
+          peerNodeId: vaultB.getNodeId()
+        })
+
+        // Seed Peer A with memory A
+        const memA = vaultA.storeMemory({
+          projectId: 'p2p-mesh-project',
+          category: 'architecture',
+          title: 'Decentralized Architecture A',
+          content: 'Peer A contributes decentralized architecture consensus.'
+        })
+
+        // Seed Peer C with memory C
+        const memC = vaultC.storeMemory({
+          projectId: 'p2p-mesh-project',
+          category: 'convention',
+          title: 'Gossip Convention C',
+          content: 'Peer C contributes gossip convention rules.'
+        })
+
+        // Peer B has 0 memories initially
+        assert.equal(
+          vaultB.getProjectBriefing({ projectId: 'p2p-mesh-project' }).memories.length,
+          0
+        )
+
+        // Pass 1: Peer B executes syncAllPeers with Peer A and Peer C
+        const pass1Summary = await syncAllPeers(vaultB, {
+          projectId: 'p2p-mesh-project'
+        })
+        assert.equal(pass1Summary.enabled, true)
+        assert.equal(pass1Summary.errors.length, 0)
+        assert.equal(pass1Summary.results.length, 2)
+
+        // After Pass 1: Peer B and Peer C have both memories
+        const briefingB_Pass1 = vaultB.getProjectBriefing({ projectId: 'p2p-mesh-project' })
+        assert.equal(briefingB_Pass1.memories.length, 2)
+        assert.ok(briefingB_Pass1.memories.some((m) => m.title === 'Decentralized Architecture A'))
+        assert.ok(briefingB_Pass1.memories.some((m) => m.title === 'Gossip Convention C'))
+
+        const briefingC_Pass1 = vaultC.getProjectBriefing({ projectId: 'p2p-mesh-project' })
+        assert.equal(briefingC_Pass1.memories.length, 2)
+        assert.ok(briefingC_Pass1.memories.some((m) => m.title === 'Decentralized Architecture A'))
+        assert.ok(briefingC_Pass1.memories.some((m) => m.title === 'Gossip Convention C'))
+
+        // Pass 2: Peer A executes syncAllPeers with Peer B to receive Peer C's memory
+        const pass2Summary = await syncAllPeers(vaultA, {
+          projectId: 'p2p-mesh-project'
+        })
+        assert.equal(pass2Summary.enabled, true)
+        assert.equal(pass2Summary.errors.length, 0)
+
+        // After Pass 2: Full mesh convergence across all 3 nodes!
+        const briefingA_Pass2 = vaultA.getProjectBriefing({ projectId: 'p2p-mesh-project' })
+        assert.equal(briefingA_Pass2.memories.length, 2)
+        assert.ok(briefingA_Pass2.memories.some((m) => m.title === 'Decentralized Architecture A'))
+        assert.ok(briefingA_Pass2.memories.some((m) => m.title === 'Gossip Convention C'))
+
+        // Now test tombstone propagation: Peer A forgets memory A
+        const forgotten = vaultA.forgetMemory(memA.memory.id)
+        assert.equal(forgotten, true)
+        const briefingA_AfterForget = vaultA.getProjectBriefing({ projectId: 'p2p-mesh-project' })
+        assert.equal(briefingA_AfterForget.memories.length, 1)
+        assert.ok(!briefingA_AfterForget.memories.some((m) => m.title === 'Decentralized Architecture A'))
+
+        // Tombstone Pass 1: Peer B syncs with Peer A (pulls tombstone) and Peer C (pushes tombstone)
+        const tombstonePass1 = await syncAllPeers(vaultB, {
+          projectId: 'p2p-mesh-project'
+        })
+        assert.equal(tombstonePass1.errors.length, 0)
+
+        // Tombstone Pass 2: Peer C syncs with Peer B
+        const tombstonePass2 = await syncAllPeers(vaultC, {
+          projectId: 'p2p-mesh-project'
+        })
+        assert.equal(tombstonePass2.errors.length, 0)
+
+        // Tombstone has propagated to entire mesh in 2 passes: memory A deleted everywhere
+        const briefingB_Final = vaultB.getProjectBriefing({ projectId: 'p2p-mesh-project' })
+        assert.equal(briefingB_Final.memories.length, 1)
+        assert.ok(
+          !briefingB_Final.memories.some((m) => m.title === 'Decentralized Architecture A'),
+          'Peer B deleted memory A via tombstone'
+        )
+
+        const briefingC_Final = vaultC.getProjectBriefing({ projectId: 'p2p-mesh-project' })
+        assert.equal(briefingC_Final.memories.length, 1)
+        assert.ok(
+          !briefingC_Final.memories.some((m) => m.title === 'Decentralized Architecture A'),
+          'Peer C deleted memory A via tombstone propagation'
+        )
+
+        // Memory C remains intact on all 3 nodes
+        assert.ok(briefingA_AfterForget.memories.some((m) => m.title === 'Gossip Convention C'))
+        assert.ok(briefingB_Final.memories.some((m) => m.title === 'Gossip Convention C'))
+        assert.ok(briefingC_Final.memories.some((m) => m.title === 'Gossip Convention C'))
+      } finally {
+        await serverA.close()
+        await serverB.close()
+        await serverC.close()
+        vaultA.close()
+        vaultB.close()
+        vaultC.close()
+      }
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('Sync Engine: Direct HTTP Exchange with Simulated Gaze P2P Client & Group ACL', () => {
+  it('handles /api/v1/p2p/status, handshake and exchange with P2PContractEnvelopeV1, X-Gaze-Token, and sync_groups', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'memoseb-gaze-http-'))
+    try {
+      const dbPath = path.join(tmpDir, 'server-vault.sqlite')
+      const vault = new MemoryVault({ dbPath })
+
+      vault.enableNodeMode({
+        role: 'peer',
+        nodeName: 'Gaze Hub Peer',
+        listenPort: 0,
+        authToken: 'admin-secret'
+      })
+
+      // Configure a sync group dedicated to gaze with ACL restrictions:
+      // Only project 'gaze-project' and category 'decision' or 'domain'
+      const groupToken = 'gaze-client-token-999'
+      vault.upsertGroup({
+        name: 'gaze-analytics-group',
+        projects: ['gaze-project'],
+        categories: ['decision', 'domain'],
+        permissions: 'readwrite',
+        groupToken
+      })
+
+      // Store memories in the server vault:
+      // 1. In 'gaze-project' (should be visible to gaze client)
+      vault.storeMemory({
+        projectId: 'gaze-project',
+        category: 'decision',
+        title: 'Gaze Project Decision',
+        content: 'Server-side decision for Gaze project.'
+      })
+      // 2. In 'forbidden-project' (should NOT be visible to gaze client)
+      vault.storeMemory({
+        projectId: 'forbidden-project',
+        category: 'architecture',
+        title: 'Secret Internal Core',
+        content: 'Server-side confidential architecture.'
+      })
+
+      const serverHandle = await startSyncServer(vault, {
+        host: '127.0.0.1',
+        port: 0,
+        enableUdpDiscovery: false
+      })
+      const serverUrl = `http://127.0.0.1:${serverHandle.port}`
+
+      try {
+        // 1. GET /api/v1/p2p/status requires valid token
+        const unauthStatus = await fetch(`${serverUrl}/api/v1/p2p/status`)
+        assert.equal(unauthStatus.status, 401)
+
+        const wrongTokenStatus = await fetch(`${serverUrl}/api/v1/p2p/status`, {
+          headers: { 'X-Gaze-Token': 'bad-token' }
+        })
+        assert.equal(wrongTokenStatus.status, 401)
+
+        const statusRes = await fetch(`${serverUrl}/api/v1/p2p/status`, {
+          headers: { 'X-Gaze-Token': groupToken }
+        })
+        assert.equal(statusRes.status, 200)
+        const statusJson = (await statusRes.json()) as P2PContractEnvelopeV1<{
+          nodeId: string
+          role: string
+          supportedContracts: string[]
+        }>
+        assert.equal(statusJson.schemaVersion, 1)
+        assert.equal(statusJson.command, 'status')
+        assert.equal(statusJson.ok, true)
+        assert.equal(statusJson.data.role, 'peer')
+        assert.ok(statusJson.data.supportedContracts.includes('p2p-memory-contract'))
+
+        // 2. POST /api/v1/p2p/handshake wrapped in P2PContractEnvelopeV1
+        const handshakeBody = wrapP2PEnvelope('handshake', {
+          nodeId: 'gaze-py-worker-1',
+          nodeName: 'Gaze Python Ingestion',
+          role: 'peer',
+          callbackUrl: 'http://127.0.0.1:9191'
+        })
+
+        const handshakeRes = await fetch(`${serverUrl}/api/v1/p2p/handshake`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Gaze-Token': groupToken
+          },
+          body: JSON.stringify(handshakeBody)
+        })
+        assert.equal(handshakeRes.status, 200)
+        const handshakeJson = (await handshakeRes.json()) as P2PContractEnvelopeV1<{
+          assignedGroups: string[]
+        }>
+        assert.equal(handshakeJson.schemaVersion, 1)
+        assert.equal(handshakeJson.command, 'handshake')
+        assert.equal(handshakeJson.ok, true)
+        assert.ok(handshakeJson.data.assignedGroups.includes('gaze-analytics-group'))
+
+        // 3. POST /api/v1/p2p/exchange with Gaze P2P payload and group ACL filtering
+        const allowedNode: GazeNodeV1 = {
+          id: 'gaze-node-allowed-1',
+          projectId: 'gaze-project',
+          project: 'gaze-project',
+          kind: 'decision',
+          source: 'harvest',
+          title: 'Client Ingested Decision',
+          body: 'Decision ingested from Gaze client pipeline.',
+          createdAt: '2026-11-10T04:00:00.000Z',
+          updatedAt: '2026-11-10T04:00:00.000Z'
+        }
+
+        const forbiddenNode: GazeNodeV1 = {
+          id: 'gaze-node-forbidden-1',
+          projectId: 'forbidden-project',
+          project: 'forbidden-project',
+          kind: 'doc', // maps to 'architecture', not allowed by group
+          source: 'user',
+          title: 'Client Ingested Forbidden Arch',
+          body: 'This should be dropped by group permissions.',
+          createdAt: '2026-11-10T04:00:00.000Z',
+          updatedAt: '2026-11-10T04:00:00.000Z'
+        }
+
+        const baseClientPayload: Omit<P2PSyncPayloadV1, 'checksum'> = {
+          format: 'p2p-memory-contract',
+          version: 1,
+          app: 'gaze',
+          originNodeId: 'gaze-py-worker-1',
+          exportedAt: '2026-11-10T04:00:00.000Z',
+          projectId: 'gaze-project',
+          nodes: [allowedNode, forbiddenNode],
+          tombstones: []
+        }
+        const clientChecksum = computeP2PPayloadChecksum(baseClientPayload)
+        const clientPayload: P2PSyncPayloadV1 = {
+          ...baseClientPayload,
+          checksum: clientChecksum
+        }
+
+        const exchangeEnvelope = wrapP2PEnvelope('exchange', {
+          clientNodeId: 'gaze-py-worker-1',
+          clientName: 'Gaze Python Ingestion',
+          clientRole: 'peer',
+          delta: clientPayload,
+          format: 'gaze'
+        })
+
+        const exchangeRes = await fetch(`${serverUrl}/api/v1/p2p/exchange`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Gaze-Token': groupToken
+          },
+          body: JSON.stringify(exchangeEnvelope)
+        })
+        assert.equal(exchangeRes.status, 200)
+        const exchangeJson = (await exchangeRes.json()) as P2PContractEnvelopeV1<{
+          appliedOnServer: {
+            memoriesCreated: number
+            memoriesSkipped: number
+          }
+          serverDelta: P2PSyncPayloadV1
+          effectiveGroups: string[]
+        }>
+
+        assert.equal(exchangeJson.schemaVersion, 1)
+        assert.equal(exchangeJson.command, 'exchange')
+        assert.equal(exchangeJson.ok, true)
+
+        // Allowed node created, forbidden node dropped
+        assert.equal(exchangeJson.data.appliedOnServer.memoriesCreated, 1)
+        assert.equal(exchangeJson.data.appliedOnServer.memoriesSkipped, 1)
+        assert.ok(exchangeJson.data.effectiveGroups.includes('gaze-analytics-group'))
+
+        // Verify serverDelta in P2P contract format only contains gaze-project memory
+        const serverDelta = exchangeJson.data.serverDelta
+        assert.equal(serverDelta.format, 'p2p-memory-contract')
+        assert.ok(serverDelta.nodes.some((n) => n.title === 'Gaze Project Decision'))
+        assert.ok(!serverDelta.nodes.some((n) => n.title === 'Secret Internal Core'))
+
+        // Verify server vault state
+        const gazeBriefing = vault.getProjectBriefing({ projectId: 'gaze-project' })
+        assert.equal(gazeBriefing.memories.length, 2)
+        assert.ok(gazeBriefing.memories.some((m) => m.title === 'Client Ingested Decision'))
+        assert.ok(gazeBriefing.memories.some((m) => m.title === 'Gaze Project Decision'))
+
+        const forbiddenBriefing = vault.getProjectBriefing({ projectId: 'forbidden-project' })
+        assert.equal(forbiddenBriefing.memories.length, 1)
+        assert.ok(!forbiddenBriefing.memories.some((m) => m.title === 'Client Ingested Forbidden Arch'))
+        assert.ok(forbiddenBriefing.memories.some((m) => m.title === 'Secret Internal Core'))
+      } finally {
+        await serverHandle.close()
+        vault.close()
       }
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true })

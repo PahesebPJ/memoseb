@@ -112,19 +112,24 @@ describe('P2P Contract & Gaze Compatibility Engine', () => {
       'bugfix'
     ]
 
-    for (const category of categories) {
+    for (let i = 0; i < categories.length; i++) {
+      const category = categories[i]!
+      const isHighImportance = i % 2 === 0
+      const importance = isHighImportance ? 0.95 : 0.45
+      const expectedPinned = isHighImportance // >= 0.85
+
       const original: MemoryRecord = {
-        id: `mem-${category}-1`,
+        id: `mem-${category}-${i}`,
         projectId: 'project-test',
         category,
         title: `Test Title for ${category}`,
         content: `Detailed body content for category ${category}.`,
-        tags: ['alpha', 'beta', 'gaze:edge:target-node-99:link:0.8'],
+        tags: ['alpha', 'beta', `tag-${category}`, 'gaze:edge:target-node-99:link:0.8'],
         sourceAgent: 'developer',
-        contentHash: 'hash-abc-123',
-        tokenCount: 42,
-        importance: 0.95,
-        accessCount: 15,
+        contentHash: `hash-abc-${category}-${i}`,
+        tokenCount: 42 + i,
+        importance,
+        accessCount: 15 + i * 3,
         createdAt: '2026-11-10T00:00:00.000Z',
         updatedAt: '2026-11-10T01:00:00.000Z'
       }
@@ -134,11 +139,14 @@ describe('P2P Contract & Gaze Compatibility Engine', () => {
       assert.equal(gazeNode.projectId, original.projectId)
       assert.equal(gazeNode.title, original.title)
       assert.equal(gazeNode.body, original.content)
-      assert.equal(gazeNode.pinned, true)
-      assert.equal(gazeNode.hits, 15)
+      assert.equal(gazeNode.pinned, expectedPinned)
+      assert.equal(gazeNode.hits, original.accessCount)
+      assert.equal(gazeNode.contentHash, original.contentHash)
       assert.ok(Array.isArray(gazeNode.edges))
       assert.equal(gazeNode.edges?.length, 1)
       assert.equal(gazeNode.edges?.[0]?.targetId, 'target-node-99')
+      assert.equal(gazeNode.edges?.[0]?.kind, 'link')
+      assert.equal(gazeNode.edges?.[0]?.weight, 0.8)
 
       const recovered = gazeNodeToMemory(gazeNode, 'project-test')
       assert.equal(recovered.id, original.id)
@@ -147,11 +155,13 @@ describe('P2P Contract & Gaze Compatibility Engine', () => {
       assert.equal(recovered.title, original.title)
       assert.equal(recovered.content, original.content)
       assert.equal(recovered.sourceAgent, original.sourceAgent)
+      assert.equal(recovered.contentHash, original.contentHash)
       assert.equal(recovered.importance, original.importance)
       assert.equal(recovered.accessCount, original.accessCount)
       assert.equal(recovered.tokenCount, original.tokenCount)
       assert.ok(recovered.tags.includes('alpha'))
       assert.ok(recovered.tags.includes('beta'))
+      assert.ok(recovered.tags.includes(`tag-${category}`))
       assert.ok(recovered.tags.some((t) => t.startsWith('gaze:edge:target-node-99:link')))
     }
   })
@@ -192,6 +202,120 @@ describe('P2P Contract & Gaze Compatibility Engine', () => {
     }
   })
 
+  it('converts all 8 native GazeKinds and 8 GazeSources with sourceRef, until and all 4 edge kinds, re-exporting to GazeNodeV1 without loss', () => {
+    // Test each of the 8 GazeKinds paired with each of the 8 GazeSources
+    for (let i = 0; i < GAZE_KINDS.length; i++) {
+      const kind = GAZE_KINDS[i]!
+      const source = GAZE_SOURCES[i]!
+      const nodeId = `gaze-matrix-${kind}-${source}-${i}`
+      const untilDate = `2028-1${i % 2 === 0 ? '1' : '2'}-01T00:00:00.000Z`
+      const sourceRef = `commit-${kind}-sha-${i}abc`
+
+      const originalGazeNode: GazeNodeV1 = {
+        id: nodeId,
+        projectId: 'gaze-matrix-proj',
+        project: 'gaze-matrix-proj',
+        kind,
+        source,
+        sourceRef,
+        title: `Gaze ${kind} from ${source}`,
+        body: `Full body specification for kind ${kind} emitted by source ${source}.`,
+        pinned: i % 2 === 0,
+        until: untilDate,
+        createdAt: '2026-11-10T03:00:00.000Z',
+        updatedAt: '2026-11-10T03:30:00.000Z',
+        hits: 10 + i,
+        contentHash: `hash-${kind}-${source}-${i}`,
+        tags: [`tag-${kind}`, `tag-${source}`, 'custom-annotation'],
+        edges: [
+          {
+            sourceId: nodeId,
+            targetId: `node-link-${i}`,
+            dst: `node-link-${i}`,
+            kind: 'link',
+            weight: 0.85
+          },
+          {
+            sourceId: nodeId,
+            targetId: `node-issue-${i}`,
+            dst: `node-issue-${i}`,
+            kind: 'same-issue',
+            weight: 1.0
+          },
+          {
+            sourceId: nodeId,
+            targetId: `node-entry-${i}`,
+            dst: `node-entry-${i}`,
+            kind: 'same-entry'
+          },
+          {
+            sourceId: nodeId,
+            targetId: `node-similar-${i}`,
+            dst: `node-similar-${i}`,
+            kind: 'similar',
+            weight: 0.65
+          }
+        ]
+      }
+
+      // Step 1: Ingest GazeNode into memoseb MemoryRecord
+      const memRecord = gazeNodeToMemory(originalGazeNode, 'gaze-matrix-proj')
+      assert.equal(memRecord.id, originalGazeNode.id)
+      assert.equal(memRecord.projectId, originalGazeNode.projectId)
+      assert.equal(memRecord.title, originalGazeNode.title)
+      assert.equal(memRecord.content, originalGazeNode.body)
+      assert.equal(memRecord.contentHash, originalGazeNode.contentHash)
+      assert.equal(memRecord.accessCount, originalGazeNode.hits)
+      assert.ok(memRecord.tags.includes(`gaze:kind:${kind}`))
+      assert.ok(memRecord.tags.includes(`gaze:source:${source}`))
+      assert.ok(memRecord.tags.includes(`gaze:source_ref:${sourceRef}`))
+      assert.ok(memRecord.tags.includes(`gaze:until:${untilDate}`))
+      assert.ok(memRecord.tags.includes(`tag-${kind}`))
+      assert.ok(memRecord.tags.includes(`tag-${source}`))
+
+      // Step 2: Re-export from memoseb MemoryRecord back to GazeNodeV1
+      const reexportedNode = memoryToGazeNode(memRecord)
+      assert.equal(reexportedNode.id, originalGazeNode.id)
+      assert.equal(reexportedNode.projectId, originalGazeNode.projectId)
+      assert.equal(reexportedNode.kind, originalGazeNode.kind)
+      assert.equal(reexportedNode.source, originalGazeNode.source)
+      assert.equal(reexportedNode.sourceRef, originalGazeNode.sourceRef)
+      assert.equal(reexportedNode.until, originalGazeNode.until)
+      assert.equal(reexportedNode.title, originalGazeNode.title)
+      assert.equal(reexportedNode.body, originalGazeNode.body)
+      assert.equal(reexportedNode.hits, originalGazeNode.hits)
+      assert.equal(reexportedNode.contentHash, originalGazeNode.contentHash)
+
+      // Verify all 4 edges were preserved without loss
+      assert.ok(Array.isArray(reexportedNode.edges))
+      assert.equal(reexportedNode.edges.length, 4)
+      const edgeLink = reexportedNode.edges.find((e) => e.kind === 'link')
+      const edgeIssue = reexportedNode.edges.find((e) => e.kind === 'same-issue')
+      const edgeEntry = reexportedNode.edges.find((e) => e.kind === 'same-entry')
+      const edgeSimilar = reexportedNode.edges.find((e) => e.kind === 'similar')
+
+      assert.ok(edgeLink)
+      assert.equal(edgeLink.targetId, `node-link-${i}`)
+      assert.equal(edgeLink.weight, 0.85)
+
+      assert.ok(edgeIssue)
+      assert.equal(edgeIssue.targetId, `node-issue-${i}`)
+      assert.equal(edgeIssue.weight, 1.0)
+
+      assert.ok(edgeEntry)
+      assert.equal(edgeEntry.targetId, `node-entry-${i}`)
+
+      assert.ok(edgeSimilar)
+      assert.equal(edgeSimilar.targetId, `node-similar-${i}`)
+      assert.equal(edgeSimilar.weight, 0.65)
+
+      // Verify user tags survived roundtrip
+      assert.ok(reexportedNode.tags?.includes(`tag-${kind}`))
+      assert.ok(reexportedNode.tags?.includes(`tag-${source}`))
+      assert.ok(reexportedNode.tags?.includes('custom-annotation'))
+    }
+  })
+
   it('computes and validates deterministic SHA-256 checksums and rejects corrupted payloads', () => {
     const memory: MemoryRecord = {
       id: 'mem-checksum-1',
@@ -228,8 +352,86 @@ describe('P2P Contract & Gaze Compatibility Engine', () => {
     const verified = verifyP2PPayload(payload)
     assert.equal(verified.checksum, checksum)
 
-    const corrupted: P2PSyncPayloadV1 = { ...payload, checksum: 'bad-checksum-deadbeef' }
-    assert.throws(() => verifyP2PPayload(corrupted), /checksum mismatch/)
+    // 1. Rejects null or non-object
+    assert.throws(() => verifyP2PPayload(null), /expected a non-null JSON object/)
+    assert.throws(() => verifyP2PPayload('not-an-object'), /expected a non-null JSON object/)
+    assert.throws(() => verifyP2PPayload(42), /expected a non-null JSON object/)
+
+    // 2. Rejects invalid format
+    assert.throws(
+      () => verifyP2PPayload({ ...payload, format: 'invalid-contract' }),
+      /Invalid P2P format/
+    )
+
+    // 3. Rejects unsupported version
+    assert.throws(
+      () => verifyP2PPayload({ ...payload, version: 2 }),
+      /Unsupported P2P version/
+    )
+
+    // 4. Rejects invalid originNodeId
+    assert.throws(
+      () => verifyP2PPayload({ ...payload, originNodeId: '' }),
+      /originNodeId must be a non-empty string/
+    )
+    assert.throws(
+      () => verifyP2PPayload({ ...payload, originNodeId: 123 as any }),
+      /originNodeId must be a non-empty string/
+    )
+
+    // 5. Rejects invalid exportedAt
+    assert.throws(
+      () => verifyP2PPayload({ ...payload, exportedAt: '   ' }),
+      /exportedAt must be a non-empty string/
+    )
+
+    // 6. Rejects invalid nodes
+    assert.throws(
+      () => verifyP2PPayload({ ...payload, nodes: 'not-an-array' as any }),
+      /nodes must be an array/
+    )
+
+    // 7. Rejects invalid edges
+    assert.throws(
+      () => verifyP2PPayload({ ...payload, edges: 'not-an-array' as any }),
+      /edges must be an array when provided/
+    )
+
+    // 8. Rejects invalid tombstones
+    assert.throws(
+      () => verifyP2PPayload({ ...payload, tombstones: null as any }),
+      /tombstones must be an array/
+    )
+
+    // 9. Rejects missing or empty checksum
+    assert.throws(
+      () => verifyP2PPayload({ ...payload, checksum: '' }),
+      /checksum must be a non-empty string/
+    )
+
+    // 10. Rejects tampered checksum
+    const corruptedChecksum: P2PSyncPayloadV1 = { ...payload, checksum: 'bad-checksum-deadbeef' }
+    assert.throws(() => verifyP2PPayload(corruptedChecksum), /checksum mismatch/)
+
+    // 11. Rejects tampered content with original checksum
+    const tamperedTitlePayload: P2PSyncPayloadV1 = {
+      ...payload,
+      nodes: [
+        {
+          ...gazeNode,
+          title: 'Tampered Title In Transit'
+        }
+      ]
+    }
+    assert.throws(() => verifyP2PPayload(tamperedTitlePayload), /checksum mismatch/)
+
+    // 12. Transparently unwraps envelope and verifies or throws
+    const enveloped = wrapP2PEnvelope('exchange', payload)
+    const verifiedEnveloped = verifyP2PPayload(enveloped)
+    assert.equal(verifiedEnveloped.checksum, checksum)
+
+    const corruptedEnveloped = wrapP2PEnvelope('exchange', corruptedChecksum)
+    assert.throws(() => verifyP2PPayload(corruptedEnveloped), /checksum mismatch/)
   })
 
   it('wraps and unwraps P2P contract envelopes', () => {
