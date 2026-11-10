@@ -8,7 +8,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { afterEach, beforeEach, describe, it } from 'node:test'
-import { resolvePeerBindHosts, startAutoSyncLoop } from '../src/core/auto-sync.ts'
+import { discoverPeers, resolvePeerBindHosts, startAutoSyncLoop } from '../src/core/auto-sync.ts'
 import { computeMemoryContentHash } from '../src/core/p2p-contract.ts'
 import { renderSystemdUnit, renderWindowsLauncher } from '../src/core/service.ts'
 import { computeSnapshotChecksum } from '../src/core/snapshot.ts'
@@ -286,6 +286,50 @@ describe('Security hardening of the P2P node', () => {
       assert.equal(nodes.length, 0)
     } finally {
       socket.close()
+    }
+  })
+
+  it('registers discovered peers only when verified with a token, using the effective serve token', async () => {
+    const vault = open('n2-register')
+    vault.enableNodeMode({ role: 'peer', authToken: null })
+    const node = {
+      nodeId: 'n2-node',
+      nodeName: 'N2',
+      role: 'peer' as const,
+      port: 7432,
+      urls: ['http://100.64.0.4:7432'],
+      address: '100.64.0.4',
+      requiresAuth: true
+    }
+    assert.equal(registerDiscoveredPeers(vault, [{ ...node, authVerified: true }], { token: null }).length, 0)
+    assert.equal(registerDiscoveredPeers(vault, [node], { token: 'tok' }).length, 0, 'unverified nodes are never registered')
+    assert.deepEqual(await probeP2PNodes(['127.0.0.1'], { port: 1, token: null }), [])
+    const none = await discoverPeers(vault, { platform: 'linux', env: {}, execProcess: async () => ({ exitCode: 1, stdout: '', stderr: '' }) }, {
+      port: 1,
+      tailscale: false
+    })
+    assert.equal(none.nodes.length, 0)
+
+    // El token de `serve --token` no está persistido pero la discovery lo usa
+    const remote = open('n2-remote')
+    remote.enableNodeMode({ role: 'peer', authToken: 'serve-only' })
+    const handle = await startSyncServer(remote, { host: '127.0.0.1', port: 0, enableUdpDiscovery: false })
+    try {
+      const loop = startAutoSyncLoop(vault, {
+        intervalMs: 60_000,
+        discoveryIntervalMs: 60_000,
+        changePollMs: 60_000,
+        token: 'serve-only',
+        discover: () => probeP2PNodes(['127.0.0.1'], { port: handle.port, token: 'serve-only' })
+      })
+      const urls = await loop.discoverNow()
+      await loop.close()
+      assert.equal(vault.getNodeConfig().authToken, null)
+      const peer = vault.listPeers().find((p) => p.peerNodeId === remote.getNodeId())
+      assert.ok(peer, `registered: ${urls.join(',')}`)
+      assert.equal(peer.authToken, 'serve-only')
+    } finally {
+      await handle.close()
     }
   })
 

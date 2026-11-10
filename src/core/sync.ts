@@ -747,6 +747,8 @@ export async function probeP2PNodes(
     concurrency?: number
   }
 ): Promise<DiscoveredLanNode[]> {
+  // Sin token no hay forma de verificar a nadie: no se descubre nada
+  if (!options.token) return []
   const unique = Array.from(new Set(hosts.filter((h) => h.trim().length > 0)))
   const found = new Map<string, DiscoveredLanNode>()
   const concurrency = Math.max(1, options.concurrency ?? 8)
@@ -854,13 +856,14 @@ export function registerDiscoveredPeers(
   options?: { token?: string | null }
 ): SyncPeerRecord[] {
   const config = vault.getNodeConfig()
-  if (config.role !== 'peer') return []
+  // Solo se registra lo que pasó el reto con un token: sin token, nadie
+  if (config.role !== 'peer' || !options?.token) return []
   const excluded = new Set(vault.getExcludedPeerIds?.() ?? [])
   const known = vault.listPeers()
   const registered: SyncPeerRecord[] = []
   for (const node of nodes) {
     if (node.role !== 'peer' || node.nodeId === config.nodeId) continue
-    if (excluded.has(node.nodeId)) continue
+    if (excluded.has(node.nodeId) || node.authVerified !== true) continue
     if (node.contracts && !node.contracts.includes('p2p-memory-contract')) continue
     const rawUrl = node.urls[0] ?? `http://${node.address}:${node.port}`
     let url: string
@@ -878,7 +881,7 @@ export function registerDiscoveredPeers(
       url,
       name: node.nodeName,
       peerNodeId: node.nodeId,
-      ...(node.authVerified && options?.token ? { authToken: options.token } : {}),
+      authToken: options.token,
       lastStatus: 'discovered'
     })
     known.push(peer)

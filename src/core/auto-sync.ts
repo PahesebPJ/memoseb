@@ -37,6 +37,8 @@ export interface AutoSyncLoopOptions {
   timeoutMs?: number
   discover?: () => Promise<DiscoveredLanNode[]>
   callbackUrl?: (peerUrl: string) => string | undefined
+  /** Token efectivo (p. ej. `serve --token`), aunque no esté persistido. */
+  token?: string | null
   onEvent?: (event: AutoSyncEvent) => void
 }
 
@@ -148,7 +150,7 @@ export function startAutoSyncLoop(
       }
       if (closed) return []
       const registered = registerDiscoveredPeers(vault, nodes, {
-        token: vault.getNodeConfig().authToken
+        token: options.token !== undefined ? options.token : vault.getNodeConfig().authToken
       })
       if (registered.length === 0) return []
       const urls = registered.map((p) => p.url)
@@ -259,11 +261,15 @@ export async function discoverPeers(
     lan?: boolean
     tailscale?: boolean
     timeoutMs?: number
+    token?: string | null
     probeTailscale?: typeof probeTailscale
   }
 ): Promise<PeerDiscoveryResult> {
   const config = vault.getNodeConfig()
-  const token = config.authToken
+  const token = options.token !== undefined ? options.token : config.authToken
+  if (!token) {
+    return { nodes: [], lan: [], tailnet: [], tailscale: 'disabled' }
+  }
   const lanPromise =
     options.lan === false
       ? Promise.resolve([] as DiscoveredLanNode[])

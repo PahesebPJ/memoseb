@@ -1909,6 +1909,7 @@ export async function executeMemoCli(
         const tokenFailure = serveTokenFailure()
         if (tokenFailure) return tokenFailure
         const serveConfig = vault.getNodeConfig()
+        const effectiveToken = flags.token ?? serveConfig.authToken ?? null
 
         if (serveConfig.role === 'peer') {
           const tokenless = vault.listPeers().filter((p) => !p.authToken)
@@ -1945,10 +1946,12 @@ export async function executeMemoCli(
           loop = startAutoSyncLoop(vault, {
             intervalMs:
               intervalFlag.minutes !== undefined ? intervalFlag.minutes * 60_000 : undefined,
+            token: effectiveToken,
             discover: () =>
               discoverPeers(vault, runtime, {
                 port: handle.port,
                 lan: !noLanFlag && vault.getNodeConfig().lanDiscovery,
+                token: effectiveToken,
               }).then((r) => r.nodes),
             callbackUrl: (peerUrl) =>
               peerCallbackUrl(vault, peerUrl, {
