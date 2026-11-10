@@ -67,6 +67,7 @@ import {
   nodeServiceStatus,
   removeServePidFile,
   resolveServiceCommand,
+  serveStateFiles,
   serviceNames,
   uninstallNodeService,
   windowsFirewallRule,
@@ -1374,7 +1375,7 @@ export async function executeMemoCli(
           }
           const res = await applyWindowsFirewallRule(runtime, firewallPort, {
             name: firewallName,
-            dataDir: ctx.dataDir,
+            marker: serveStateFiles(ctx.dbPath).firewallMarker,
           })
           return { applied: res.ok, command: res.command, ...(res.error ? { error: res.error } : {}) }
         }
@@ -1873,9 +1874,8 @@ export async function executeMemoCli(
       if (subcommand === 'serve' && switches.has('detach')) {
         const tokenFailure = serveTokenFailure()
         if (tokenFailure) return tokenFailure
-        const dataDir = path.dirname(path.resolve(vault.dbPath))
-        fs.mkdirSync(dataDir, { recursive: true })
-        const logFile = path.join(dataDir, 'node-serve.log')
+        const { logFile } = serveStateFiles(vault.dbPath)
+        fs.mkdirSync(path.dirname(logFile), { recursive: true })
         const childArgs = detachedServeArgs(argv)
         if (!childArgs.includes('--db')) {
           childArgs.push('--db', path.resolve(vault.dbPath))
@@ -2017,7 +2017,7 @@ export async function executeMemoCli(
             },
           })
         }
-        const pidFile = writeServePidFile(path.dirname(vault.dbPath))
+        const pidFile = writeServePidFile(serveStateFiles(vault.dbPath).pidFile)
 
         const primaryUrl = handle.urls[0] ?? `http://${handle.host}:${handle.port}`
         if (jsonMode) {

@@ -9,7 +9,6 @@ export const WINDOWS_TASK_NAME = 'memoseb-node'
 export const FIREWALL_RULE_NAME = 'memoseb-node'
 export const TAILNET_CIDR = '100.64.0.0/10'
 const SCHTASKS_TR_LIMIT = 261
-const FIREWALL_MARKER = 'node-firewall.json'
 
 /** Sufijo estable por bóveda: cada --db tiene su propio servicio. */
 export function serviceIdentity(dbPath: string): string {
@@ -22,6 +21,23 @@ export interface ServiceNames {
   taskName: string
   launcherName: string
   firewallRule: string
+}
+
+/** Archivos de estado de `serve` para una bóveda: llevan el sufijo de serviceIdentity. */
+export function serveStateFiles(dbPath: string): {
+  logFile: string
+  pidFile: string
+  serviceMarker: string
+  firewallMarker: string
+} {
+  const dir = path.dirname(path.resolve(dbPath))
+  const id = serviceIdentity(dbPath)
+  return {
+    logFile: path.join(dir, `node-serve-${id}.log`),
+    pidFile: path.join(dir, `node-serve-${id}.pid`),
+    serviceMarker: path.join(dir, `node-service-${id}.json`),
+    firewallMarker: path.join(dir, `node-firewall-${id}.json`)
+  }
 }
 
 export function serviceNames(dbPath: string): ServiceNames {
@@ -53,6 +69,8 @@ export interface ServicePaths {
   unitFile: string
   logFile: string
   pidFile: string
+  serviceMarker: string
+  firewallMarker: string
   launcherFile: string | null
   startupFile: string | null
 }
@@ -64,6 +82,8 @@ export interface ServiceContext {
   command?: ServiceCommand
   uid?: number
   killProcess?: (pid: number) => void
+  /** Confirma que el pid es un `memoseb node serve` antes de detenerlo. */
+  isMemosebProcess?: (pid: number) => Promise<boolean>
 }
 
 export interface ServiceReport {
@@ -106,8 +126,7 @@ export function resolveServicePaths(
   if (!manager) return null
   const p = path
   const names = serviceNames(dbPath)
-  const logFile = p.join(dataDir, 'node-serve.log')
-  const pidFile = p.join(dataDir, 'node-serve.pid')
+  const { logFile, pidFile, serviceMarker, firewallMarker } = serveStateFiles(dbPath)
   if (manager === 'launchd') {
     return {
       manager,
@@ -115,6 +134,8 @@ export function resolveServicePaths(
       unitFile: p.join(runtime.homeDir, 'Library', 'LaunchAgents', `${names.label}.plist`),
       logFile,
       pidFile,
+      serviceMarker,
+      firewallMarker,
       launcherFile: null,
       startupFile: null
     }
@@ -128,6 +149,8 @@ export function resolveServicePaths(
       unitFile: p.join(configHome, 'systemd', 'user', names.systemdUnit),
       logFile,
       pidFile,
+      serviceMarker,
+      firewallMarker,
       launcherFile: null,
       startupFile: null
     }
@@ -140,6 +163,8 @@ export function resolveServicePaths(
     unitFile: names.taskName,
     logFile,
     pidFile,
+    serviceMarker,
+    firewallMarker,
     launcherFile: p.join(dataDir, names.launcherName),
     startupFile: p.join(
       appData,
@@ -345,7 +370,7 @@ async function runElevatedPowershell(
 export async function applyWindowsFirewallRule(
   runtime: ServiceRuntime,
   port: number,
-  options?: { name?: string; dataDir?: string }
+  options?: { name?: string; marker?: string }
 ): Promise<{ ok: boolean; command: string; error?: string }> {
   const name = options?.name ?? FIREWALL_RULE_NAME
   const rule = windowsFirewallRule(port, name)
@@ -353,11 +378,11 @@ export async function applyWindowsFirewallRule(
     return { ok: false, command: rule.powershell, error: 'The firewall rule only applies to Windows.' }
   }
   const outcome = await runElevatedPowershell(runtime, rule.powershell)
-  if (outcome.ok && options?.dataDir) {
-    // Marca para que uninstall borre solo la regla que creamos
-    fs.mkdirSync(options.dataDir, { recursive: true })
+  if (outcome.ok && options?.marker) {
+    // Marca para que uninstall borre solo la regla que creó este servicio
+    fs.mkdirSync(path.dirname(options.marker), { recursive: true })
     fs.writeFileSync(
-      path.join(options.dataDir, FIREWALL_MARKER),
+      options.marker,
       JSON.stringify({ rule: name, port }, null, 2),
       'utf-8'
     )
@@ -365,13 +390,12 @@ export async function applyWindowsFirewallRule(
   return { command: rule.powershell, ...outcome }
 }
 
-/** Borra la regla del firewall solo si memoseb la creó (marca en el dataDir). */
+/** Borra la regla del firewall solo si la creó este servicio (marca con su sufijo). */
 export async function removeWindowsFirewallRule(
   runtime: ServiceRuntime,
-  dataDir: string
+  marker: string
 ): Promise<FirewallRemoval | undefined> {
   if (runtime.platform !== 'win32') return undefined
-  const marker = path.join(dataDir, FIREWALL_MARKER)
   let rule: string
   try {
     rule = String(JSON.parse(fs.readFileSync(marker, 'utf-8')).rule)
@@ -385,10 +409,9 @@ export async function removeWindowsFirewallRule(
   return { removed: outcome.ok, rule, command, ...(outcome.error ? { error: outcome.error } : {}) }
 }
 
-export function writeServePidFile(dataDir: string, pid: number = process.pid): string {
-  const file = path.join(dataDir, 'node-serve.pid')
+export function writeServePidFile(file: string, pid: number = process.pid): string {
   try {
-    fs.mkdirSync(dataDir, { recursive: true })
+    fs.mkdirSync(path.dirname(file), { recursive: true })
     fs.writeFileSync(file, `${pid}\n`, 'utf-8')
   } catch {
     // Sin archivo de pid el servicio sigue funcionando
@@ -423,9 +446,39 @@ function isAlive(pid: number): boolean {
   }
 }
 
-function stopRecordedServe(paths: ServicePaths, ctx: ServiceContext): boolean {
+export function looksLikeMemosebServe(commandLine: string): boolean {
+  return /memoseb/i.test(commandLine) && /\bnode\b[\s"']+serve\b/.test(commandLine)
+}
+
+/** Línea de comandos del proceso (ps en POSIX, Win32_Process en Windows). */
+async function processCommandLine(runtime: ServiceRuntime, pid: number): Promise<string> {
+  try {
+    const outcome =
+      runtime.platform === 'win32'
+        ? await runtime.execProcess('powershell.exe', [
+            '-NoProfile',
+            '-NonInteractive',
+            '-Command',
+            `(Get-CimInstance Win32_Process -Filter 'ProcessId=${pid}').CommandLine`
+          ])
+        : await runtime.execProcess('ps', ['-p', String(pid), '-o', 'command='])
+    return outcome.exitCode === 0 ? outcome.stdout.trim() : ''
+  } catch {
+    return ''
+  }
+}
+
+async function stopRecordedServe(paths: ServicePaths, ctx: ServiceContext): Promise<boolean> {
   const pid = readServePid(paths.pidFile)
   if (!pid || pid === process.pid) return false
+  // Un pid reciclado por otro programa nunca se mata
+  const isMemoseb = ctx.isMemosebProcess
+    ? await ctx.isMemosebProcess(pid)
+    : looksLikeMemosebServe(await processCommandLine(ctx.runtime, pid))
+  if (!isMemoseb) {
+    fs.rmSync(paths.pidFile, { force: true })
+    return false
+  }
   const kill = ctx.killProcess ?? ((target: number) => {
     if (isAlive(target)) process.kill(target)
   })
@@ -450,7 +503,7 @@ export function nodeServiceStatus(ctx: ServiceContext): ServiceReport {
   const pid = readServePid(paths.pidFile)
   const running = pid !== null && isAlive(pid)
   if (paths.manager === 'schtasks') {
-    const marker = path.join(ctx.dataDir, 'node-service.json')
+    const marker = paths.serviceMarker
     let mode: ServiceReport['mode']
     try {
       mode = JSON.parse(fs.readFileSync(marker, 'utf-8')).mode
@@ -562,11 +615,11 @@ export async function installNodeService(ctx: ServiceContext): Promise<ServiceRe
   }
 
   const winPath = path
-  stopRecordedServe(paths, ctx)
+  await stopRecordedServe(paths, ctx)
   let taskRun = windowsCommandLine(ctx.command)
   if (taskRun.length > SCHTASKS_TR_LIMIT - 1) {
     fs.writeFileSync(paths.launcherFile!, renderWindowsLauncher(ctx.command), 'utf-8')
-    taskRun = windowsQuote(paths.launcherFile!)
+    taskRun = windowsQuote(paths.launcherFile!).replace(/%/g, '%%')
   }
   let mode: 'schtasks' | 'startup-folder' = 'schtasks'
   const created = await exec('schtasks', [
@@ -604,7 +657,7 @@ export async function installNodeService(ctx: ServiceContext): Promise<ServiceRe
     }
   }
   fs.writeFileSync(
-    winPath.join(ctx.dataDir, 'node-service.json'),
+    paths.serviceMarker,
     JSON.stringify({ mode, task: paths.names.taskName, startupFile: paths.startupFile }, null, 2),
     'utf-8'
   )
@@ -626,7 +679,7 @@ export async function installNodeService(ctx: ServiceContext): Promise<ServiceRe
 export async function uninstallNodeService(ctx: ServiceContext): Promise<ServiceReport> {
   const status = nodeServiceStatus(ctx)
   const paths = resolveServicePaths(ctx.runtime, ctx.dataDir, ctx.dbPath)
-  const firewall = await removeWindowsFirewallRule(ctx.runtime, ctx.dataDir)
+  const firewall = paths ? await removeWindowsFirewallRule(ctx.runtime, paths.firewallMarker) : undefined
   if (!paths || !status.installed) {
     return { ...status, removed: false, ...(firewall ? { firewall } : {}) }
   }
@@ -645,7 +698,6 @@ export async function uninstallNodeService(ctx: ServiceContext): Promise<Service
     fs.rmSync(paths.unitFile, { force: true })
     await exec('systemctl', ['--user', 'daemon-reload']).catch(swallow)
   } else {
-    const winPath = path
     if (status.mode === 'schtasks') {
       await exec('schtasks', ['/End', '/TN', paths.names.taskName]).catch(swallow)
       const deleted = await exec('schtasks', ['/Delete', '/TN', paths.names.taskName, '/F']).catch(swallow)
@@ -655,8 +707,8 @@ export async function uninstallNodeService(ctx: ServiceContext): Promise<Service
     }
     if (paths.startupFile) fs.rmSync(paths.startupFile, { force: true })
     if (paths.launcherFile) fs.rmSync(paths.launcherFile, { force: true })
-    fs.rmSync(winPath.join(ctx.dataDir, 'node-service.json'), { force: true })
-    stopRecordedServe(paths, ctx)
+    fs.rmSync(paths.serviceMarker, { force: true })
+    await stopRecordedServe(paths, ctx)
   }
 
   return {

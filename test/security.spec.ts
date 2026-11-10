@@ -16,7 +16,7 @@ import {
   startAutoSyncLoop
 } from '../src/core/auto-sync.ts'
 import { computeMemoryContentHash } from '../src/core/p2p-contract.ts'
-import { renderSystemdUnit, renderWindowsLauncher } from '../src/core/service.ts'
+import { looksLikeMemosebServe, renderSystemdUnit, renderWindowsLauncher } from '../src/core/service.ts'
 import { openVaultDatabase } from '../src/core/schema.ts'
 import { computeSnapshotChecksum } from '../src/core/snapshot.ts'
 import {
@@ -566,6 +566,10 @@ describe('Security hardening of the P2P node', () => {
     const unit = renderSystemdUnit({ executable: '/usr/bin/node', args: ['/home/$USER/100%/m.js'] }, '/tmp/$x.log')
     assert.ok(unit.includes('"/home/$$USER/100%%/m.js"'))
     assert.ok(unit.includes('append:/tmp/$$x.log'))
+    assert.equal(looksLikeMemosebServe('/usr/bin/node /opt/memoseb/dist/bin/memoseb.js node serve --db /v.sqlite'), true)
+    assert.equal(looksLikeMemosebServe('"C:\\node.exe" "C:\\memoseb.js" "node" "serve"'), true)
+    assert.equal(looksLikeMemosebServe('/usr/bin/vim /tmp/memoseb-notes.txt'), false)
+    assert.equal(looksLikeMemosebServe(''), false)
     const cmd = renderWindowsLauncher({ executable: 'C:\\node.exe', args: ['C:\\%TEMP%\\m.js'] })
     assert.ok(cmd.includes('"C:\\%%TEMP%%\\m.js"'))
   })

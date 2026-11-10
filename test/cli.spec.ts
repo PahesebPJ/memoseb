@@ -21,7 +21,7 @@ import type {
 } from '../src/core/vault.ts'
 import { MemoryVault } from '../src/core/vault.ts'
 import { startSyncServer } from '../src/core/sync.ts'
-import { serviceNames } from '../src/core/service.ts'
+import { serveStateFiles, serviceNames } from '../src/core/service.ts'
 import { handleMcpRequest } from '../src/mcp/server.ts'
 import { deployMemoseb } from '../src/setup.ts'
 
@@ -1701,7 +1701,7 @@ describe('CLI node service, token policy and auto-sync serve', () => {
       assert.ok(text.stdout.includes('memoseb node service install'))
       assert.deepEqual(runtime.calls, [], `${platform}: enable must not run any command`)
       assert.deepEqual(listFiles(homeDir), [], `${platform}: enable must not write into the home dir`)
-      assert.ok(!fs.existsSync(path.join(tmpDir, 'data', 'node-service.json')))
+      assert.ok(!fs.existsSync(serveStateFiles(dbPath).serviceMarker))
 
       const status = await executeMemoCli(['node', 'service', 'status', '--json'], { runtime, dbPath })
       const packet = decodeWire<{ service: { installed: boolean } }>(status.stdout) as WireSuccess<{
@@ -1905,9 +1905,13 @@ describe('CLI node service, token policy and auto-sync serve', () => {
 
   it('registers a logon scheduled task on Windows, falls back to the Startup folder and keeps the firewall opt-in', async () => {
     let allowSchtasks = true
-    const runtime = makeRuntime('win32', (exe) =>
-      exe === 'schtasks' && !allowSchtasks ? { exitCode: 1, stderr: 'Access is denied.' } : { exitCode: 0 }
-    )
+    let recordedCommandLine = 'C:\\node.exe C:\\memoseb\\memoseb.js node serve --db C:\\vault.sqlite --detach'
+    const runtime = makeRuntime('win32', (exe, args) => {
+      if (exe === 'powershell.exe' && args.join(' ').includes('Win32_Process')) {
+        return { exitCode: 0, stdout: `${recordedCommandLine}\r\n` }
+      }
+      return exe === 'schtasks' && !allowSchtasks ? { exitCode: 1, stderr: 'Access is denied.' } : { exitCode: 0 }
+    })
     await executeMemoCli(['node', 'enable', '--role', 'peer', '--token', 'tok'], { runtime, dbPath })
     const names = serviceNames(dbPath)
     const killed: number[] = []
@@ -1932,7 +1936,9 @@ describe('CLI node service, token policy and auto-sync serve', () => {
     assert.ok(runtime.calls.some((c) => c.args.join(' ') === `/Run /TN ${names.taskName}`))
     assert.ok(!runtime.calls.some((c) => /powershell|netsh/i.test(c.executable)))
 
-    fs.writeFileSync(path.join(tmpDir, 'data', 'node-serve.pid'), '424242\n')
+    const state = serveStateFiles(dbPath)
+    assert.match(path.basename(state.pidFile), /^node-serve-[0-9a-f]{10}\.pid$/)
+    fs.writeFileSync(state.pidFile, '424242\n')
     runtime.calls.length = 0
     const removed = await executeMemoCli(['node', 'service', 'uninstall'], {
       runtime,
@@ -1941,9 +1947,16 @@ describe('CLI node service, token policy and auto-sync serve', () => {
     })
     assert.ok(removed.stdout.includes('removed (schtasks)'))
     assert.deepEqual(
-      runtime.calls.map((c) => c.args.join(' ')),
+      runtime.calls.filter((c) => c.executable === 'schtasks').map((c) => c.args.join(' ')),
       [`/End /TN ${names.taskName}`, `/Delete /TN ${names.taskName} /F`]
     )
+    assert.deepEqual(killed, [424242])
+
+    // Un pid reciclado por otro programa no se mata
+    await executeMemoCli(['node', 'service', 'install'], { runtime, dbPath, killProcess: (pid) => killed.push(pid) })
+    recordedCommandLine = 'C:\\Windows\\notepad.exe'
+    fs.writeFileSync(state.pidFile, '515151\n')
+    await executeMemoCli(['node', 'service', 'uninstall'], { runtime, dbPath, killProcess: (pid) => killed.push(pid) })
     assert.deepEqual(killed, [424242])
 
     allowSchtasks = false
@@ -1986,6 +1999,38 @@ describe('CLI node service, token policy and auto-sync serve', () => {
     runtime.calls.length = 0
     await executeMemoCli(['uninstall', '--json'], { runtime, dbPath })
     assert.ok(!runtime.calls.some((c) => c.args.join(' ').includes('Remove-NetFirewallRule')))
+  })
+
+  it('removes on Windows only the firewall rule created by the same service and escapes % in the launcher', async () => {
+    const runtime = makeRuntime('win32')
+    const otherDb = path.join(tmpDir, 'other%dir', 'vault.sqlite')
+    for (const db of [dbPath, otherDb]) {
+      await executeMemoCli(['node', 'enable', '--role', 'peer', '--token', 'tok'], { runtime, dbPath: db })
+    }
+    await executeMemoCli(['node', 'service', 'firewall', '--apply'], { runtime, dbPath })
+    assert.ok(fs.existsSync(serveStateFiles(dbPath).firewallMarker))
+    assert.ok(!fs.existsSync(serveStateFiles(otherDb).firewallMarker))
+
+    runtime.calls.length = 0
+    await executeMemoCli(['node', 'service', 'uninstall'], { runtime, dbPath: otherDb })
+    assert.ok(!runtime.calls.some((c) => c.args.join(' ').includes('Remove-NetFirewallRule')))
+    await executeMemoCli(['node', 'service', 'uninstall'], { runtime, dbPath })
+    assert.ok(
+      runtime.calls.some((c) =>
+        c.args.join(' ').includes(`Remove-NetFirewallRule -DisplayName ${serviceNames(dbPath).firewallRule}`)
+      )
+    )
+
+    runtime.calls.length = 0
+    await executeMemoCli(['node', 'service', 'install'], {
+      runtime,
+      dbPath: otherDb,
+      serviceEntry: `C:\\${'x'.repeat(200)}\\memoseb.js`
+    })
+    const create = runtime.calls.find((c) => c.args[0] === '/Create')!
+    const tr = create.args[create.args.indexOf('/TR') + 1]!
+    assert.ok(tr.includes('other%%dir'), tr)
+    assert.ok(!/[^%]%[^%]/.test(tr.replace(/%%/g, '')), 'every % is doubled')
   })
 
   it('keeps one service per vault: uninstall only removes the service of its own --db', async () => {
@@ -2078,12 +2123,12 @@ describe('CLI node service, token policy and auto-sync serve', () => {
         await new Promise((r) => setTimeout(r, 50))
       }
       assert.equal(probe.getStats().memoryCount, 1)
-      assert.ok(fs.existsSync(path.join(tmpDir, 'data', 'node-serve.pid')))
+      assert.ok(fs.existsSync(serveStateFiles(dbPath).pidFile))
       probe.close()
       controller.abort()
       const res = await serving
       assert.equal(res.exitCode, 0)
-      assert.ok(!fs.existsSync(path.join(tmpDir, 'data', 'node-serve.pid')))
+      assert.ok(!fs.existsSync(serveStateFiles(dbPath).pidFile))
     } finally {
       controller.abort()
       await remoteServer.close()
