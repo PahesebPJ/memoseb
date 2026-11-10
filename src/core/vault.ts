@@ -2061,20 +2061,16 @@ export class MemoryVault {
           | RawMemoryRow
           | undefined
 
-        if (!localMem) {
+        const ensureProject = (projectId: string) => {
           const projectExists = this.db
             .prepare(`SELECT id FROM projects WHERE id = ?`)
-            .get(memory.projectId)
+            .get(projectId)
           if (!projectExists) {
-            const snapProject = snapshot.projects.find(
-              (p) => p.id === memory.projectId
-            )
-            const pName = snapProject?.name || memory.projectId
+            const snapProject = snapshot.projects.find((p) => p.id === projectId)
+            const pName = snapProject?.name || projectId
             const pRoot =
               snapProject?.rootPath ||
-              (memory.projectId === 'global'
-                ? 'global'
-                : path.resolve(process.cwd()))
+              (projectId === 'global' ? 'global' : path.resolve(process.cwd()))
             const pUpdated = snapProject?.updatedAt || memory.updatedAt
             this.db
               .prepare(
@@ -2082,8 +2078,12 @@ export class MemoryVault {
                  VALUES (?, ?, ?, ?)
                  ON CONFLICT(id) DO UPDATE SET updated_at = excluded.updated_at`
               )
-              .run(memory.projectId, pName, pRoot, pUpdated)
+              .run(projectId, pName, pRoot, pUpdated)
           }
+        }
+
+        if (!localMem) {
+          ensureProject(memory.projectId)
 
           const tagsJson = JSON.stringify(memory.tags ?? [])
           const tagsText = (memory.tags ?? []).join(' ')
@@ -2165,10 +2165,27 @@ export class MemoryVault {
               memory.tokenCount ||
               estimateTokens(`${memory.title}\n${memory.content}`)
 
+            // Si gana el entrante, la memoria sigue su proyecto y su hash se
+            // recalcula; si el destino ya tiene ese mismo contenido, se queda donde está.
+            const nextHash = crypto
+              .createHash('sha256')
+              .update(`${memory.projectId}:${memory.category}:${memory.content.trim()}`)
+              .digest('hex')
+            const conflicting = this.db
+              .prepare(
+                `SELECT id FROM memories WHERE project_id = ? AND content_hash = ? AND id != ? LIMIT 1`
+              )
+              .get(memory.projectId, nextHash, localMem.id)
+            const nextProjectId = conflicting ? localMem.project_id : memory.projectId
+            const nextContentHash = conflicting ? localMem.content_hash : nextHash
+            ensureProject(nextProjectId)
+
             this.db
               .prepare(
                 `UPDATE memories
-                 SET title = ?,
+                 SET project_id = ?,
+                     content_hash = ?,
+                     title = ?,
                      category = ?,
                      content = ?,
                      tags = ?,
@@ -2180,6 +2197,8 @@ export class MemoryVault {
                  WHERE id = ?`
               )
               .run(
+                nextProjectId,
+                nextContentHash,
                 memory.title,
                 memory.category,
                 memory.content,
@@ -2202,7 +2221,7 @@ export class MemoryVault {
               )
               .run(
                 localMem.id,
-                memory.projectId,
+                nextProjectId,
                 memory.title,
                 memory.content,
                 tagsText
