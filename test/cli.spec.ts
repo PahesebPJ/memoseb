@@ -1127,7 +1127,14 @@ describe('CLI hubseb/v1 Wire Contract, MCP JSON-RPC Server, and Topology Integra
     assert.deepEqual(createPacket.payload.group.projects, ['p1', 'p2'])
     assert.deepEqual(createPacket.payload.group.categories, ['architecture', 'convention'])
     assert.equal(createPacket.payload.group.permissions, 'readwrite')
-    assert.equal(createPacket.payload.group.groupToken, 'secret-group-token')
+    // El token del grupo no va en el JSON: solo en texto al crearlo
+    assert.equal(createPacket.payload.group.groupToken, '[redacted]')
+    assert.ok(!createRes.stdout.includes('secret-group-token'))
+    assert.ok(createRes.stderr.includes('secret-group-token'))
+    const redactedList = await executeMemoCli(['group', 'list', '--json'], { runtime, dbPath })
+    assert.ok(!redactedList.stdout.includes('secret-group-token'))
+    const redactedStatus = await executeMemoCli(['node', 'status', '--json'], { runtime, dbPath })
+    assert.ok(!redactedStatus.stdout.includes('secret-group-token'))
 
     // 3. invalid validations
     const noNameRes = await executeMemoCli(['group', 'create', '--json'], { runtime, dbPath })

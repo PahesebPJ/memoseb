@@ -122,13 +122,15 @@ const CLI_ENTRY = fileURLToPath(import.meta.url)
 
 const REDACTED = '[redacted]'
 
-/** Copia profunda que oculta authToken (nodo y peers) en la salida --json. */
+const SECRET_KEYS = new Set(['authToken', 'groupToken'])
+
+/** Copia profunda que oculta authToken (nodo y peers) y groupToken en la salida --json. */
 export function redactTokens<T>(value: T): T {
   if (Array.isArray(value)) return value.map((v) => redactTokens(v)) as unknown as T
   if (value && typeof value === 'object') {
     const out: Record<string, unknown> = {}
     for (const [key, v] of Object.entries(value as Record<string, unknown>)) {
-      out[key] = key === 'authToken' && typeof v === 'string' && v.length > 0 ? REDACTED : redactTokens(v)
+      out[key] = SECRET_KEYS.has(key) && typeof v === 'string' && v.length > 0 ? REDACTED : redactTokens(v)
     }
     return out as T
   }
@@ -2081,6 +2083,8 @@ export async function executeMemoCli(
   }
 
   if (command === 'group' || command === 'groups') {
+    const wireGroup = (payload: Record<string, unknown>) =>
+      wireSuccess('group', redactTokens(payload))
     const subcommand = positional[1] ?? 'list'
     const vault = new MemoryVault({ dbPath, runtime })
     try {
@@ -2090,7 +2094,7 @@ export async function executeMemoCli(
         if (jsonMode) {
           return {
             exitCode: 0,
-            stdout: serializeWire(wireSuccess('group', { groups, unassignedGroupPolicy })),
+            stdout: serializeWire(wireGroup({ groups, unassignedGroupPolicy })),
             stderr: '',
           }
         }
@@ -2214,16 +2218,18 @@ export async function executeMemoCli(
           // ignore
         }
 
+        // El token del grupo solo se muestra al crearlo, y en texto
+        const tokenLine = flags.token ? `Group token (shown once): ${flags.token}\n` : ''
         if (jsonMode) {
           return {
             exitCode: 0,
-            stdout: serializeWire(wireSuccess('group', { group })),
-            stderr: '',
+            stdout: serializeWire(wireGroup({ group })),
+            stderr: tokenLine,
           }
         }
         return {
           exitCode: 0,
-          stdout: `Created/updated group "${group.name}" (permissions: ${group.permissions}, projects: [${group.projects.join(', ')}], categories: [${group.categories.join(', ')}]).\n`,
+          stdout: `Created/updated group "${group.name}" (permissions: ${group.permissions}, projects: [${group.projects.join(', ')}], categories: [${group.categories.join(', ')}]).\n${tokenLine}`,
           stderr: '',
         }
       }
@@ -2270,7 +2276,7 @@ export async function executeMemoCli(
         if (jsonMode) {
           return {
             exitCode: 0,
-            stdout: serializeWire(wireSuccess('group', { group, addedNode: nodeIdentifier })),
+            stdout: serializeWire(wireGroup({ group, addedNode: nodeIdentifier })),
             stderr: '',
           }
         }
@@ -2323,7 +2329,7 @@ export async function executeMemoCli(
         if (jsonMode) {
           return {
             exitCode: 0,
-            stdout: serializeWire(wireSuccess('group', { group, removedNode: nodeIdentifier })),
+            stdout: serializeWire(wireGroup({ group, removedNode: nodeIdentifier })),
             stderr: '',
           }
         }
@@ -2377,7 +2383,7 @@ export async function executeMemoCli(
             exitCode: deleted ? 0 : 1,
             stdout: serializeWire(
               deleted
-                ? wireSuccess('group', { name: groupName, deleted })
+                ? wireGroup({ name: groupName, deleted })
                 : wireFailure('group', 'GROUP_NOT_FOUND', `Group "${groupName}" not found`),
             ),
             stderr: '',
@@ -2431,7 +2437,7 @@ export async function executeMemoCli(
           return {
             exitCode: 0,
             stdout: serializeWire(
-              wireSuccess('group', redactTokens({ unassignedGroupPolicy: config.unassignedGroupPolicy, config })),
+              wireGroup({ unassignedGroupPolicy: config.unassignedGroupPolicy, config }),
             ),
             stderr: '',
           }
