@@ -1617,3 +1617,333 @@ describe('CLI hubseb/v1 Wire Contract, MCP JSON-RPC Server, and Topology Integra
     }
   })
 })
+
+class RecordingRuntime extends SystemRuntime {
+  readonly calls: Array<{ executable: string; args: string[] }> = []
+  private readonly responder: (executable: string, args: string[]) => {
+    exitCode: number
+    stdout?: string
+    stderr?: string
+  }
+
+  constructor(
+    config: { platform: NodeJS.Platform; homeDir: string; env: NodeJS.ProcessEnv },
+    responder?: (executable: string, args: string[]) => { exitCode: number; stdout?: string; stderr?: string }
+  ) {
+    super(config)
+    this.responder = responder ?? (() => ({ exitCode: 0 }))
+  }
+
+  override async execProcess(executable: string, args: readonly string[] = []) {
+    const list = [...args]
+    this.calls.push({ executable, args: list })
+    const res = this.responder(executable, list)
+    return { exitCode: res.exitCode, stdout: res.stdout ?? '', stderr: res.stderr ?? '' }
+  }
+}
+
+describe('CLI node service, token policy and auto-sync serve', () => {
+  let tmpDir: string
+  let homeDir: string
+  let dbPath: string
+
+  const makeRuntime = (
+    platform: NodeJS.Platform,
+    responder?: (executable: string, args: string[]) => { exitCode: number; stdout?: string; stderr?: string }
+  ) =>
+    new RecordingRuntime(
+      {
+        platform,
+        homeDir,
+        env: {
+          HOME: homeDir,
+          XDG_CONFIG_HOME: path.join(homeDir, '.config'),
+          APPDATA: path.join(homeDir, 'AppData', 'Roaming'),
+          LOCALAPPDATA: path.join(homeDir, 'AppData', 'Local'),
+          MEMOSEB_DB_PATH: dbPath
+        }
+      },
+      responder
+    )
+
+  const listFiles = (dir: string): string[] => {
+    if (!fs.existsSync(dir)) return []
+    return fs.readdirSync(dir, { recursive: true }).map(String)
+  }
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'memoseb-cli-service-'))
+    homeDir = path.join(tmpDir, 'home')
+    fs.mkdirSync(homeDir, { recursive: true })
+    dbPath = path.join(tmpDir, 'data', 'vault.sqlite')
+  })
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true })
+  })
+
+  it('node enable only configures the node: no service, scheduled task, Startup entry or firewall rule', async () => {
+    for (const platform of ['darwin', 'linux', 'win32'] as const) {
+      const runtime = makeRuntime(platform)
+      const res = await executeMemoCli(['node', 'enable', '--role', 'p2p', '--json'], { runtime, dbPath })
+      assert.equal(res.exitCode, 0)
+      const text = await executeMemoCli(['node', 'enable', '--role', 'peer'], { runtime, dbPath })
+      assert.equal(text.exitCode, 0)
+      assert.ok(text.stdout.includes('memoseb node service install'))
+      assert.deepEqual(runtime.calls, [], `${platform}: enable must not run any command`)
+      assert.deepEqual(listFiles(homeDir), [], `${platform}: enable must not write into the home dir`)
+      assert.ok(!fs.existsSync(path.join(tmpDir, 'data', 'node-service.json')))
+
+      const status = await executeMemoCli(['node', 'service', 'status', '--json'], { runtime, dbPath })
+      const packet = decodeWire<{ service: { installed: boolean } }>(status.stdout) as WireSuccess<{
+        service: { installed: boolean }
+      }>
+      assert.equal(packet.payload.service.installed, false)
+
+      const disabled = await executeMemoCli(['node', 'disable', '--json'], { runtime, dbPath })
+      assert.equal(disabled.exitCode, 0)
+      assert.deepEqual(runtime.calls, [], `${platform}: disable without a service runs nothing`)
+    }
+  })
+
+  it('generates a sync token when enabling a peer without one and refuses unauthenticated serve', async () => {
+    const runtime = makeRuntime('darwin')
+    const res = await executeMemoCli(['node', 'enable', '--role', 'peer', '--json'], { runtime, dbPath })
+    const packet = decodeWire<{ generatedToken?: string; config: { authToken: string | null } }>(
+      res.stdout
+    ) as WireSuccess<{ generatedToken?: string; config: { authToken: string | null } }>
+    assert.match(packet.payload.generatedToken ?? '', /^[0-9a-f]{64}$/)
+    assert.equal(packet.payload.config.authToken, packet.payload.generatedToken)
+
+    const again = await executeMemoCli(['node', 'enable', '--role', 'peer', '--json'], { runtime, dbPath })
+    const againPacket = decodeWire<{ generatedToken?: string }>(again.stdout) as WireSuccess<{
+      generatedToken?: string
+    }>
+    assert.equal(againPacket.payload.generatedToken, undefined)
+
+    const explicit = await executeMemoCli(
+      ['node', 'enable', '--role', 'peer', '--token', 'my-own-token', '--json'],
+      { runtime, dbPath }
+    )
+    const explicitPacket = decodeWire<{ generatedToken?: string; config: { authToken: string } }>(
+      explicit.stdout
+    ) as WireSuccess<{ generatedToken?: string; config: { authToken: string } }>
+    assert.equal(explicitPacket.payload.generatedToken, undefined)
+    assert.equal(explicitPacket.payload.config.authToken, 'my-own-token')
+
+    const vault = new MemoryVault({ dbPath })
+    vault.updateNodeConfig({ authToken: null })
+    vault.close()
+    const refused = await executeMemoCli(
+      ['node', 'serve', '--host', '0.0.0.0', '--port', '0', '--no-lan', '--json'],
+      { runtime, dbPath }
+    )
+    assert.equal(refused.exitCode, 2)
+    assert.ok(refused.stdout.includes('TOKEN_REQUIRED'))
+
+    const childVault = new MemoryVault({ dbPath: path.join(tmpDir, 'child.sqlite') })
+    childVault.close()
+    const child = await executeMemoCli(['node', 'enable', '--role', 'child', '--json'], {
+      runtime,
+      dbPath: path.join(tmpDir, 'child.sqlite')
+    })
+    const childPacket = decodeWire<{ generatedToken?: string }>(child.stdout) as WireSuccess<{
+      generatedToken?: string
+    }>
+    assert.equal(childPacket.payload.generatedToken, undefined)
+  })
+
+  it('installs and uninstalls a launchd user agent on macOS only when asked', async () => {
+    const runtime = makeRuntime('darwin')
+    await executeMemoCli(['node', 'enable', '--role', 'peer', '--token', 'tok'], { runtime, dbPath })
+    const installed = await executeMemoCli(['node', 'service', 'install', '--json'], {
+      runtime,
+      dbPath,
+      serviceUid: 501,
+      serviceEntry: '/opt/memoseb/dist/bin/memoseb.js'
+    })
+    assert.equal(installed.exitCode, 0)
+    const plist = path.join(homeDir, 'Library', 'LaunchAgents', 'io.github.pahesebpj.memoseb.node.plist')
+    assert.ok(fs.existsSync(plist))
+    const content = fs.readFileSync(plist, 'utf-8')
+    assert.ok(content.includes('<string>/opt/memoseb/dist/bin/memoseb.js</string>'))
+    assert.ok(content.includes('<string>serve</string>'))
+    assert.ok(content.includes(`<string>${dbPath}</string>`))
+    assert.ok(content.includes('<key>RunAtLoad</key>'))
+    assert.deepEqual(
+      runtime.calls.map((c) => [c.executable, ...c.args]),
+      [
+        ['launchctl', 'bootout', 'gui/501/io.github.pahesebpj.memoseb.node'],
+        ['launchctl', 'bootstrap', 'gui/501', plist]
+      ]
+    )
+
+    const status = await executeMemoCli(['node', 'service', 'status'], { runtime, dbPath })
+    assert.ok(status.stdout.includes('installed (launchd'))
+
+    runtime.calls.length = 0
+    const removed = await executeMemoCli(['node', 'disable'], { runtime, dbPath, serviceUid: 501 })
+    assert.ok(removed.stdout.includes('Background service removed.'))
+    assert.ok(!fs.existsSync(plist))
+    assert.deepEqual(runtime.calls.map((c) => [c.executable, ...c.args]), [
+      ['launchctl', 'bootout', 'gui/501/io.github.pahesebpj.memoseb.node']
+    ])
+
+    const disabledInstall = await executeMemoCli(['node', 'service', 'install'], { runtime, dbPath })
+    assert.equal(disabledInstall.exitCode, 2)
+  })
+
+  it('installs a systemd --user unit on Linux and reports a missing user bus as a warning', async () => {
+    const runtime = makeRuntime('linux', (exe, args) =>
+      exe === 'systemctl' && args.includes('restart')
+        ? { exitCode: 1, stderr: 'Failed to connect to bus' }
+        : { exitCode: 0 }
+    )
+    await executeMemoCli(['node', 'enable', '--role', 'peer', '--token', 'tok'], { runtime, dbPath })
+    const installed = await executeMemoCli(['node', 'service', 'install', '--json'], {
+      runtime,
+      dbPath,
+      serviceEntry: '/opt/memo seb/memoseb.js'
+    })
+    assert.equal(installed.exitCode, 0)
+    const packet = decodeWire<{ service: { warnings: string[]; installed: boolean } }>(
+      installed.stdout
+    ) as WireSuccess<{ service: { warnings: string[]; installed: boolean } }>
+    assert.equal(packet.payload.service.installed, true)
+    assert.equal(packet.payload.service.warnings.length, 1)
+    const unit = path.join(homeDir, '.config', 'systemd', 'user', 'memoseb-node.service')
+    const content = fs.readFileSync(unit, 'utf-8')
+    assert.ok(content.includes('"/opt/memo seb/memoseb.js" "node" "serve" "--db"'))
+    assert.ok(content.includes('Restart=on-failure'))
+    assert.deepEqual(
+      runtime.calls.map((c) => c.args.join(' ')),
+      ['--user daemon-reload', '--user enable memoseb-node.service', '--user restart memoseb-node.service']
+    )
+
+    runtime.calls.length = 0
+    const removed = await executeMemoCli(['node', 'service', 'uninstall'], { runtime, dbPath })
+    assert.ok(removed.stdout.includes('removed'))
+    assert.ok(!fs.existsSync(unit))
+    assert.deepEqual(
+      runtime.calls.map((c) => c.args.join(' ')),
+      ['--user disable --now memoseb-node.service', '--user daemon-reload']
+    )
+  })
+
+  it('registers a logon scheduled task on Windows, falls back to the Startup folder and keeps the firewall opt-in', async () => {
+    let allowSchtasks = true
+    const runtime = makeRuntime('win32', (exe) =>
+      exe === 'schtasks' && !allowSchtasks ? { exitCode: 1, stderr: 'Access is denied.' } : { exitCode: 0 }
+    )
+    await executeMemoCli(['node', 'enable', '--role', 'peer', '--token', 'tok'], { runtime, dbPath })
+    const killed: number[] = []
+    const installed = await executeMemoCli(['node', 'service', 'install'], {
+      runtime,
+      dbPath,
+      serviceEntry: 'C:\\Users\\me\\AppData\\Roaming\\npm\\node_modules\\memoseb\\dist\\bin\\memoseb.js',
+      killProcess: (pid) => killed.push(pid)
+    })
+    assert.equal(installed.exitCode, 0)
+    assert.ok(installed.stdout.includes('memoseb node service firewall --apply'))
+    const create = runtime.calls.find((c) => c.args[0] === '/Create')
+    assert.ok(create)
+    assert.deepEqual(create.args.slice(0, 5), ['/Create', '/SC', 'ONLOGON', '/TN', 'memoseb-node'])
+    const tr = create.args[create.args.indexOf('/TR') + 1]!
+    const launcher = path.join(tmpDir, 'data', 'memoseb-node.cmd')
+    assert.ok(tr.length < 261)
+    const taskCommand = tr === `"${launcher}"` ? fs.readFileSync(launcher, 'utf-8') : tr
+    assert.ok(taskCommand.includes('"node" "serve" "--db"'))
+    assert.ok(taskCommand.trimEnd().endsWith('"--detach"'))
+    assert.ok(create.args.includes('LIMITED'))
+    assert.ok(runtime.calls.some((c) => c.args.join(' ') === '/Run /TN memoseb-node'))
+    assert.ok(!runtime.calls.some((c) => /powershell|netsh/i.test(c.executable)))
+
+    fs.writeFileSync(path.join(tmpDir, 'data', 'node-serve.pid'), '424242\n')
+    runtime.calls.length = 0
+    const removed = await executeMemoCli(['node', 'service', 'uninstall'], {
+      runtime,
+      dbPath,
+      killProcess: (pid) => killed.push(pid)
+    })
+    assert.ok(removed.stdout.includes('removed (schtasks)'))
+    assert.deepEqual(
+      runtime.calls.map((c) => c.args.join(' ')),
+      ['/End /TN memoseb-node', '/Delete /TN memoseb-node /F']
+    )
+    assert.deepEqual(killed, [424242])
+
+    allowSchtasks = false
+    runtime.calls.length = 0
+    const fallback = await executeMemoCli(['node', 'service', 'install', '--json'], { runtime, dbPath })
+    const fbPacket = decodeWire<{ service: { mode: string; unit: string } }>(fallback.stdout) as WireSuccess<{
+      service: { mode: string; unit: string }
+    }>
+    assert.equal(fbPacket.payload.service.mode, 'startup-folder')
+    const startupFile = path.join(
+      homeDir, 'AppData', 'Roaming', 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup', 'memoseb-node.cmd'
+    )
+    assert.equal(fbPacket.payload.service.unit, startupFile)
+    assert.ok(fs.readFileSync(startupFile, 'utf-8').includes('"--detach"'))
+    const removedFallback = await executeMemoCli(['node', 'service', 'uninstall'], { runtime, dbPath })
+    assert.ok(removedFallback.stdout.includes('removed (startup-folder)'))
+    assert.ok(!fs.existsSync(startupFile))
+
+    runtime.calls.length = 0
+    const hint = await executeMemoCli(['node', 'service', 'firewall'], { runtime, dbPath })
+    assert.ok(
+      hint.stdout.includes(
+        'New-NetFirewallRule -DisplayName memoseb-node -Direction Inbound -Action Allow -Protocol TCP -LocalPort 7432 -RemoteAddress 100.64.0.0/10'
+      )
+    )
+    assert.equal(runtime.calls.length, 0)
+    const applied = await executeMemoCli(['node', 'service', 'firewall', '--apply'], { runtime, dbPath })
+    assert.equal(applied.exitCode, 0)
+    assert.equal(runtime.calls[0]?.executable, 'powershell.exe')
+    assert.ok(runtime.calls[0]?.args.join(' ').includes('-Verb RunAs'))
+  })
+
+  it('serves with the auto-sync loop and shuts down cleanly on abort', async () => {
+    const runtime = makeRuntime('darwin')
+    await executeMemoCli(['node', 'enable', '--role', 'peer', '--token', 'tok'], { runtime, dbPath })
+    const remoteDb = path.join(tmpDir, 'remote.sqlite')
+    const remoteVault = new MemoryVault({ dbPath: remoteDb })
+    remoteVault.enableNodeMode({ role: 'peer', authToken: 'tok' })
+    remoteVault.storeMemory({
+      projectId: 'den',
+      category: 'convention',
+      content: 'Pulled automatically when node serve starts.'
+    })
+    const remoteServer = await startSyncServer(remoteVault, {
+      host: '127.0.0.1',
+      port: 0,
+      enableUdpDiscovery: false
+    })
+    const setup = new MemoryVault({ dbPath })
+    setup.upsertPeer({ role: 'peer', url: `http://127.0.0.1:${remoteServer.port}` })
+    setup.updateNodeConfig({ tailscaleDiscovery: false })
+    setup.close()
+
+    const controller = new AbortController()
+    try {
+      const serving = executeMemoCli(
+        ['node', 'serve', '--host', '127.0.0.1', '--port', '0', '--no-lan', '--json'],
+        { runtime, dbPath, signal: controller.signal }
+      )
+      const probe = new MemoryVault({ dbPath })
+      const deadline = Date.now() + 8000
+      while (probe.getStats().memoryCount === 0 && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 50))
+      }
+      assert.equal(probe.getStats().memoryCount, 1)
+      assert.ok(fs.existsSync(path.join(tmpDir, 'data', 'node-serve.pid')))
+      probe.close()
+      controller.abort()
+      const res = await serving
+      assert.equal(res.exitCode, 0)
+      assert.ok(!fs.existsSync(path.join(tmpDir, 'data', 'node-serve.pid')))
+    } finally {
+      await remoteServer.close()
+      remoteVault.close()
+    }
+  })
+})
