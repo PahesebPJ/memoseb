@@ -280,6 +280,8 @@ export function openVaultDatabase(dbPath: string): DatabaseSync {
     fs.mkdirSync(path.dirname(dbPath), { recursive: true })
   }
   const db = new DatabaseSync(dbPath)
+  // Otro proceso (serve, MCP) puede tener la bóveda abierta: esperar en vez de fallar
+  db.exec('PRAGMA busy_timeout = 5000;')
   db.exec('PRAGMA journal_mode = WAL;')
   db.exec('PRAGMA foreign_keys = ON;')
   db.exec(SCHEMA_SQL)

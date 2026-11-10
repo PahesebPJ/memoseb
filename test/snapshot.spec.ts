@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { computeMemoryContentHash } from '../src/core/p2p-contract.ts'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import os from 'node:os'
@@ -509,5 +510,50 @@ describe('Vault Snapshot Engine: Export, Import, Tamper Detection, and Merging S
     const rows = vaultB.exportSnapshot().memories
     assert.equal(rows.find((m) => m.id === original.memory.id)?.projectId, 'alpha')
     assert.equal(rows.find((m) => m.id === twin.memory.id)?.projectId, 'beta')
+  })
+
+  it('never leaves new content with an old hash when a moved and edited memory collides', () => {
+    const original = vaultA.storeMemory({ projectId: 'alpha', category: 'convention', content: 'Old wording.' })
+    vaultB.importSnapshot(vaultA.exportSnapshot())
+    vaultB.storeMemory({ projectId: 'beta', category: 'convention', content: 'New wording.' })
+
+    const base = vaultA.exportSnapshot()
+    const { checksum: _ignored, ...rest } = base
+    const edited = {
+      ...rest,
+      memories: base.memories.map((m) => ({
+        ...m,
+        projectId: 'beta',
+        content: 'New wording.',
+        updatedAt: '2030-01-01T00:00:00.000Z'
+      }))
+    }
+    const result = vaultB.importSnapshot({ ...edited, checksum: computeSnapshotChecksum(edited) })
+    assert.equal(result.memoriesUpdated, 1)
+    const moved = vaultB.exportSnapshot().memories.find((m) => m.id === original.memory.id)!
+    assert.equal(moved.projectId, 'alpha')
+    assert.equal(moved.content, 'New wording.')
+    assert.equal(moved.contentHash, computeMemoryContentHash('alpha', 'convention', 'New wording.'))
+    for (const m of vaultB.exportSnapshot().memories) {
+      assert.equal(m.contentHash, computeMemoryContentHash(m.projectId, m.category, m.content))
+    }
+
+    vaultB.storeMemory({ projectId: 'alpha', category: 'convention', content: 'Third wording.' })
+    vaultB.storeMemory({ projectId: 'beta', category: 'convention', content: 'Third wording.' })
+    const again = {
+      ...rest,
+      memories: base.memories.map((m) => ({
+        ...m,
+        projectId: 'beta',
+        content: 'Third wording.',
+        updatedAt: '2031-01-01T00:00:00.000Z'
+      }))
+    }
+    const skipped = vaultB.importSnapshot({ ...again, checksum: computeSnapshotChecksum(again) })
+    assert.equal(skipped.memoriesUpdated, 0)
+    assert.equal(skipped.memoriesSkipped, 1)
+    const kept = vaultB.exportSnapshot().memories.find((m) => m.id === original.memory.id)!
+    assert.equal(kept.content, 'New wording.')
+    assert.equal(kept.contentHash, computeMemoryContentHash('alpha', 'convention', 'New wording.'))
   })
 })

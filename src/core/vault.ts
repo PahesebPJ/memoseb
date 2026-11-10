@@ -2305,18 +2305,27 @@ export class MemoryVault {
               estimateTokens(`${memory.title}\n${memory.content}`)
 
             // Si gana el entrante, la memoria sigue su proyecto y su hash se
-            // recalcula; si el destino ya tiene ese mismo contenido, se queda donde está.
-            const nextHash = crypto
-              .createHash('sha256')
-              .update(`${memory.projectId}:${memory.category}:${memory.content.trim()}`)
-              .digest('hex')
-            const conflicting = this.db
-              .prepare(
-                `SELECT id FROM memories WHERE project_id = ? AND content_hash = ? AND id != ? LIMIT 1`
+            // recalcula. Si el destino ya tiene ese contenido, se queda en su
+            // proyecto con el hash recalculado allí; si también choca, se salta.
+            // Nunca queda contenido nuevo con un hash viejo.
+            const hasConflict = (projectId: string, hash: string) =>
+              Boolean(
+                this.db
+                  .prepare(
+                    `SELECT id FROM memories WHERE project_id = ? AND content_hash = ? AND id != ? LIMIT 1`
+                  )
+                  .get(projectId, hash, localMem.id)
               )
-              .get(memory.projectId, nextHash, localMem.id)
-            const nextProjectId = conflicting ? localMem.project_id : memory.projectId
-            const nextContentHash = conflicting ? localMem.content_hash : nextHash
+            let nextProjectId = memory.projectId
+            let nextContentHash = computeMemoryContentHash(memory.projectId, memory.category, memory.content)
+            if (hasConflict(nextProjectId, nextContentHash)) {
+              nextProjectId = localMem.project_id
+              nextContentHash = computeMemoryContentHash(localMem.project_id, memory.category, memory.content)
+              if (hasConflict(nextProjectId, nextContentHash)) {
+                memoriesSkipped++
+                continue
+              }
+            }
             ensureProject(nextProjectId)
 
             this.db

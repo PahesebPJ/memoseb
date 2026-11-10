@@ -11,6 +11,7 @@ import { afterEach, beforeEach, describe, it } from 'node:test'
 import { discoverPeers, resolvePeerBindHosts, startAutoSyncLoop } from '../src/core/auto-sync.ts'
 import { computeMemoryContentHash } from '../src/core/p2p-contract.ts'
 import { renderSystemdUnit, renderWindowsLauncher } from '../src/core/service.ts'
+import { openVaultDatabase } from '../src/core/schema.ts'
 import { computeSnapshotChecksum } from '../src/core/snapshot.ts'
 import {
   acceptCallbackUrl,
@@ -633,6 +634,13 @@ describe('Security hardening of the P2P node', () => {
       'legacy-again',
       'the migration runs only once'
     )
+  })
+
+  it('opens the vault with a busy timeout before running the migration', () => {
+    const db = openVaultDatabase(path.join(tmpDir, 'busy.sqlite'))
+    const row = db.prepare('PRAGMA busy_timeout').get() as Record<string, number>
+    db.close()
+    assert.equal(Object.values(row)[0], 5000)
   })
 
   it('migrates a non-colliding legacy hash to the contract formula', () => {
