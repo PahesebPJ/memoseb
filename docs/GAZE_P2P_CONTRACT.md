@@ -1,0 +1,506 @@
+# Contrato Técnico Oficial de Interoperabilidad P2P: `memoseb` ↔ `KikeDeAlba/gaze`
+
+Este documento define la especificación técnica completa, el modelo de datos bidireccional y los contratos de red para la interoperabilidad descentralizada punto a punto (P2P) entre la bóveda de memoria [**`memoseb`**](https://github.com/PahesebPJ/memoseb) y el grafo de memoria [**`KikeDeAlba/gaze`**](https://github.com/KikeDeAlba/gaze), en plena compatibilidad con los estándares de sobre de [`KikeDeAlba/kit`](https://github.com/KikeDeAlba/kit).
+
+---
+
+## 1. Arquitectura de Coexistencia Dual en `memoseb`
+
+`memoseb` soporta dos modelos operacionales de sincronización sobre una misma base de persistencia SQLite (WAL + FTS5 + vectores `Float32Array`):
+
+1. **Modo Jerárquico (`parent` / `child`)**:
+   - Orientado a topologías en estrella (Hub-and-Spoke).
+   - Un nodo central (`parent`) consolida la memoria de múltiples nodos clientes (`child`), tales como estaciones de trabajo o agentes subordinados.
+   - Ideal para control corporativo centralizado y flujos de consolidación vertical.
+2. **Modo P2P Descentralizado (`peer` / `p2p`)**:
+   - Orientado a topologías en malla (Mesh) y comunicación federada.
+   - Todos los nodos son pares simétricos; cualquier nodo puede iniciar un intercambio bidireccional contra cualquier otro nodo `memoseb` o agente `gaze`.
+   - `p2p` es un alias de primera clase para `peer`: la CLI y la API normalizan de forma transparente `--role p2p` hacia el rol de par (`NodeRole = 'peer'`).
+
+```mermaid
+flowchart TB
+    subgraph Jerarquico["Topología Jerárquica (Hub-and-Spoke)"]
+        ParentNode["Nodo Padre (parent)\nmemoseb server"]
+        Child1["Nodo Hijo A (child)"] -->|sync| ParentNode
+        Child2["Nodo Hijo B (child)"] -->|sync| ParentNode
+    end
+
+    subgraph MallaP2P["Topología P2P Federada (Mesh)"]
+        PeerA["Nodo memoseb (peer/p2p)"] <-->|/api/v1/p2p/exchange| GazeNode["Nodo Gaze (KikeDeAlba/gaze)"]
+        PeerA <-->|/api/v1/p2p/exchange| PeerB["Nodo memoseb B (peer/p2p)"]
+        GazeNode <-->|P2P Contract V1| PeerB
+    end
+
+    ParentNode -.->|Fusión por LWW| PeerA
+```
+
+Ambos modos comparten el motor unificado de resolución:
+- **Last-Write-Wins (LWW)** determinista basado en marcas de tiempo ISO-8601 (`updatedAt`) y hash SHA-256 (`contentHash`).
+- **Propagación de Tombstones**: Eliminaciones registradas criptográficamente para evitar resurrección accidental de datos.
+- **Grupos de Permisos (ACL)**: Filtrado granular por proyecto, categoría y modo de acceso (`readwrite`, `readonly`, `writeonly`).
+
+---
+
+## 2. Especificación del Sobre: `P2PContractEnvelopeV1`
+
+Para garantizar la interoperabilidad sin fricciones con `KikeDeAlba/kit` y los servicios del ecosistema `gaze`, las comunicaciones HTTP P2P y los archivos exportados pueden encapsularse en el sobre canónico `P2PContractEnvelopeV1`.
+
+### Definición TypeScript
+
+```typescript
+export interface P2PContractEnvelopeV1<T = unknown> {
+  schemaVersion: 1
+  ok: boolean
+  command: string
+  generatedAt: string
+  data: T
+  error?: {
+    code: string
+    message: string
+  }
+}
+```
+
+### Campos del Sobre
+
+| Campo | Tipo | Requerido | Descripción |
+|---|---|---|---|
+| `schemaVersion` | `1` (literal) | Sí | Versión del sobre de interoperabilidad. Debe ser `1`. |
+| `ok` | `boolean` | Sí | `true` si la operación concluyó exitosamente; `false` en caso de error. |
+| `command` | `string` | Sí | Nombre de la operación (`handshake`, `exchange`, `status`, `export`, etc.). |
+| `generatedAt` | `string` (ISO-8601) | Sí | Marca de tiempo UTC en que se emitió el sobre. |
+| `data` | `T` | Sí | Carga útil (payload) del comando ejecutado. |
+| `error` | `{ code: string; message: string }` | Opcional | Detalle de fallo en caso de que `ok === false`. |
+
+### Desenvolvimiento Transparente (`unwrapP2PEnvelope`)
+
+El motor de `memoseb` implementa unwrapping automático: si un payload recibido contiene `schemaVersion: 1` y una propiedad `data`, extrae la información interna; si recibe directamente el objeto de datos, lo procesa sin requerir adaptación previa.
+
+---
+
+## 3. Especificación del Payload: `P2PSyncPayloadV1`
+
+El payload transportado en los intercambios P2P (`/api/v1/p2p/exchange`) y en bundles exportados con formato `p2p` o `gaze` sigue el contrato `p2p-memory-contract` versión `1`.
+
+### Definición TypeScript
+
+```typescript
+export const P2P_CONTRACT_FORMAT = 'p2p-memory-contract' as const
+export const P2P_CONTRACT_VERSION = 1 as const
+
+export interface P2PSyncPayloadV1 {
+  format: 'p2p-memory-contract'
+  version: 1
+  app?: 'memoseb' | 'gaze'
+  originNodeId: string
+  originNodeName?: string
+  exportedAt: string
+  projectId?: string | null
+  projectFilter?: string | null
+  projects?: P2PProjectV1[]
+  nodes: GazeNodeV1[]
+  edges?: GazeEdgeV1[]
+  tombstones: P2PTombstoneV1[]
+  checksum: string
+}
+
+export interface P2PProjectV1 {
+  id?: string
+  slug?: string
+  name: string
+  rootPath?: string
+  bitaId?: number | null
+  key?: string | null
+  updatedAt: string
+}
+
+export interface P2PTombstoneV1 {
+  id?: string
+  memoryId?: string
+  project?: string
+  projectId?: string
+  contentHash: string
+  deletedAt: string
+  originNodeId: string | null
+}
+```
+
+### Verificación de Integridad mediante Checksum Canónico
+
+El campo `checksum` garantiza que ningún byte sea alterado durante la transferencia o el almacenamiento. Se calcula aplicando **SHA-256** sobre la representación JSON canónica (`canonicalStringify`, con claves ordenadas lexicográficamente) del objeto normalizado:
+
+```typescript
+const normalized = {
+  format: payload.format,
+  version: payload.version,
+  originNodeId: payload.originNodeId,
+  exportedAt: payload.exportedAt,
+  projectId: payload.projectId ?? payload.projectFilter ?? null,
+  nodes: payload.nodes,
+  edges: payload.edges ?? [],
+  tombstones: payload.tombstones
+}
+const checksum = crypto.createHash('sha256').update(canonicalStringify(normalized)).digest('hex')
+```
+
+---
+
+## 4. Mapeo Bidireccional Lossless: `MemoryRecord` ↔ `GazeNodeV1`
+
+Uno de los pilares del contrato es la conversión sin pérdida de información (lossless) entre los recuerdos de `memoseb` y los nodos del grafo de conocimiento de `gaze`.
+
+### 4.1 Definición de Estructuras
+
+#### `MemoryRecord` (`memoseb`)
+```typescript
+export interface MemoryRecord {
+  id: string
+  projectId: string
+  category: 'architecture' | 'convention' | 'bugfix' | 'decision' | 'domain'
+  title: string
+  content: string
+  tags: string[]
+  sourceAgent: string | null
+  contentHash: string
+  tokenCount: number
+  importance: number // 0.0 a 1.0
+  accessCount: number
+  createdAt: string
+  updatedAt: string
+}
+```
+
+#### `GazeNodeV1` (`gaze`)
+```typescript
+export interface GazeNodeV1 {
+  id: string
+  project?: string
+  projectId?: string
+  kind: 'rule' | 'fact' | 'decision' | 'doc' | 'entry' | 'issue' | 'meeting' | 'memory'
+  source: 'claude' | 'harvest' | 'inkwell' | 'recap' | 'bita' | 'tally' | 'import' | 'user'
+  sourceRef?: string | null
+  title: string
+  body: string
+  pinned?: boolean
+  until?: string | null
+  createdAt: string
+  updatedAt: string
+  hits?: number
+  contentHash?: string
+  attrs?: Array<{ key: string; value: string }>
+  edges?: GazeEdgeV1[]
+  tags?: string[]
+}
+```
+
+### 4.2 Tabla de Mapeo de Categorías y Tipos
+
+| Categoría en `memoseb` | Kind en `Gaze` | Atributo `memoseb:category` | Nota |
+|---|---|---|---|
+| `convention` | `rule` | *(no requerido)* | Mapeo natural 1:1 con reglas de comportamiento. |
+| `decision` | `decision` | *(no requerido)* | Mapeo natural 1:1 con acuerdos arquitectónicos. |
+| `architecture` | `fact` | `architecture` | Se preserva la semántica exacta mediante atributo. |
+| `domain` | `fact` | `domain` | Conceptos e invariantes de negocio. |
+| `bugfix` | `memory` | `bugfix` | Fallos depurados y lecciones aprendidas. |
+
+En sentido inverso (`GazeNodeV1` → `MemoryRecord`), si el nodo contiene el atributo `memoseb:category`, se utiliza ese valor directamente. En su defecto, se aplica la siguiente heurística de fallback:
+- `rule` → `convention`
+- `decision` / `meeting` → `decision`
+- `issue` → `bugfix`
+- `doc` → `architecture`
+- `fact` / `memory` / `entry` → `domain`
+
+### 4.3 Preservación de Metadatos y Grafo de Aristas
+
+Para garantizar fidelidad completa entre ambos ecosistemas:
+
+1. **Atributos Métricos de `memoseb` en `attrs` de `gaze`**:
+   - `memoseb:token_count`: conteo exacto de tokens.
+   - `memoseb:importance`: peso de relevancia flotante (`0.0` a `1.0`).
+   - `memoseb:access_count`: frecuencia de acceso.
+   - `memoseb:source_agent`: nombre del agente o rol de origen (si no coincide con los enumerados nativos de `GazeSource`).
+   - Cada etiqueta de usuario (`userTag`) se almacena tanto en `tags` como en `attrs` con `{ key: "tag", value: "<etiqueta>" }`.
+
+2. **Metadatos Nativos de `gaze` preservados en `tags` de `memoseb`**:
+   - `gaze:kind:<kind>`
+   - `gaze:source:<source>`
+   - `gaze:source_ref:<ref>`
+   - `gaze:until:<timestamp>`
+   - `gaze:edge:<dst>:<kind>[:<weight>]` (o `gaze:edge:<src>-><dst>:<kind>[:<weight>]`)
+
+3. **Relevancia e Importancia**:
+   - `MemoryRecord.importance >= 0.85` ↔ `GazeNodeV1.pinned = true`.
+   - Si un nodo Gaze tiene `pinned === true` y carece de `memoseb:importance`, se inicializa con `importance = 0.9`.
+   - `MemoryRecord.accessCount` ↔ `GazeNodeV1.hits`.
+
+---
+
+## 5. Protocolo de Red P2P
+
+### 5.1 Auto-Descubrimiento Local por UDP
+
+El protocolo implementa descubrimiento local sin configuración previa sobre el puerto UDP `7432`:
+
+- **Solicitud de Descubrimiento (`MEMOSEB_DISCOVER_V1`)**:
+  - Broadcast a `255.255.255.255` y `127.0.0.1`.
+  - Carga JSON:
+    ```json
+    {
+      "magic": "MEMOSEB_DISCOVER_V1",
+      "nonce": "c929a738-4f51-41fa-8d48-6a56ecbe319b",
+      "timestamp": "2026-11-10T04:00:00.000Z",
+      "authTag": "optional-hmac-sha256-hex"
+    }
+    ```
+- **Respuesta de Anuncio (`MEMOSEB_ANNOUNCE_V1`)**:
+  - Unicast directo a la dirección y puerto de origen del datagrama.
+  - Carga JSON:
+    ```json
+    {
+      "magic": "MEMOSEB_ANNOUNCE_V1",
+      "nonce": "c929a738-4f51-41fa-8d48-6a56ecbe319b",
+      "nodeId": "node-memoseb-alpha-7f8a",
+      "nodeName": "Workstation Astrid",
+      "role": "peer",
+      "port": 7432,
+      "urls": ["http://192.168.1.150:7432"],
+      "requiresAuth": true,
+      "app": "memoseb",
+      "contracts": ["memoseb-snapshot", "p2p-memory-contract"],
+      "authTag": "optional-hmac-sha256-hex"
+    }
+    ```
+
+### 5.2 Autenticación y Cabeceras HTTP Aceptadas
+
+El servidor de red de `memoseb` valida tokens con comparación en tiempo constante (`crypto.timingSafeEqual`) contra el token global o tokens dedicados de grupo. Acepta cualquiera de las siguientes cabeceras:
+
+```http
+Authorization: Bearer <token>
+X-Memoseb-Token: <token>
+X-Gaze-Token: <token>
+```
+
+### 5.3 Endpoints HTTP P2P y Fallback Transparente
+
+Tanto el cliente como el servidor soportan las rutas oficiales P2P (`/api/v1/p2p/*`) y disponen de fallback transparente hacia las rutas jerárquicas clásicas (`/api/v1/sync/*`) ante códigos `404 Not Found`.
+
+| Endpoint | Método | Propósito | Formato Envuelto |
+|---|---|---|---|
+| `/api/v1/p2p/status` | `GET` | Consulta capacidades, métricas y contratos soportados por el nodo. | Sí (`schemaVersion: 1`) |
+| `/api/v1/p2p/handshake` | `POST` | Establece emparejamiento mutuo e intercambia roles y membresía a grupos. | Sí (`schemaVersion: 1`) |
+| `/api/v1/p2p/exchange` | `POST` | Intercambio bidireccional atómico de memorias, aristas y tombstones. | Sí (`schemaVersion: 1`) |
+
+---
+
+## 6. Diagrama de Secuencia: Flujo de Intercambio P2P
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Gaze as "Gaze Node / Client (KikeDeAlba/gaze)"
+    participant Memo as "memoseb Node (peer/p2p :7432)"
+
+    Note over Gaze,Memo: 1. Handshake y Emparejamiento
+    Gaze->>Memo: POST /api/v1/p2p/handshake<br/>(Envelope { command: "handshake", data: { nodeId, role: "peer" } })
+    Memo->>Memo: Registra par en base de datos SQLite y valida tokens
+    Memo-->>Gaze: 200 OK (Envelope { ok: true, command: "handshake", data: { nodeId, supportedContracts: [...] } })
+
+    Note over Gaze,Memo: 2. Intercambio Atómico Bidireccional
+    Gaze->>Memo: POST /api/v1/p2p/exchange<br/>(Envelope { command: "exchange", data: { delta: P2PSyncPayloadV1, contract: "p2p-memory-contract" } })
+    
+    activate Memo
+    Memo->>Memo: Desenvolve sobre (unwrapP2PEnvelope)
+    Memo->>Memo: Verifica SHA-256 canónico del payload
+    Memo->>Memo: Aplica Last-Write-Wins en SQLite WAL
+    Memo->>Memo: Reindexa FTS5 y recalcula vectores Float32Array
+    Memo->>Memo: Prepara serverDelta en formato P2PSyncPayloadV1 con nuevo checksum
+    Memo-->>Gaze: 200 OK (Envelope { ok: true, command: "exchange", data: { appliedOnServer, serverDelta } })
+    deactivate Memo
+
+    Gaze->>Gaze: Integra serverDelta en grafo de conocimiento local
+```
+
+---
+
+## 7. Ejemplos Reales de Petición y Respuesta
+
+### 7.1 Petición `POST /api/v1/p2p/handshake`
+
+```json
+{
+  "schemaVersion": 1,
+  "ok": true,
+  "command": "handshake",
+  "generatedAt": "2026-11-10T04:15:00.000Z",
+  "data": {
+    "nodeId": "gaze-agent-bravo",
+    "nodeName": "Gaze Primary Worker",
+    "role": "peer",
+    "callbackUrl": "http://192.168.1.180:7432",
+    "groups": ["ai-engineering"]
+  }
+}
+```
+
+### 7.2 Respuesta `POST /api/v1/p2p/handshake`
+
+```json
+{
+  "schemaVersion": 1,
+  "ok": true,
+  "command": "handshake",
+  "generatedAt": "2026-11-10T04:15:00.120Z",
+  "data": {
+    "ok": true,
+    "nodeId": "node-memoseb-alpha-7f8a",
+    "nodeName": "Workstation Astrid",
+    "role": "peer",
+    "assignedGroups": ["ai-engineering"],
+    "stats": {
+      "projects": 3,
+      "memories": 48,
+      "tombstones": 2,
+      "vectors": 48
+    },
+    "timestamp": "2026-11-10T04:15:00.120Z",
+    "supportedContracts": ["memoseb-snapshot", "p2p-memory-contract"]
+  }
+}
+```
+
+### 7.3 Petición `POST /api/v1/p2p/exchange`
+
+```json
+{
+  "schemaVersion": 1,
+  "ok": true,
+  "command": "exchange",
+  "generatedAt": "2026-11-10T04:15:05.000Z",
+  "data": {
+    "clientNodeId": "gaze-agent-bravo",
+    "clientName": "Gaze Primary Worker",
+    "clientRole": "peer",
+    "contract": "p2p-memory-contract",
+    "format": "gaze",
+    "delta": {
+      "format": "p2p-memory-contract",
+      "version": 1,
+      "app": "gaze",
+      "originNodeId": "gaze-agent-bravo",
+      "exportedAt": "2026-11-10T04:15:04.990Z",
+      "projectId": "memoseb",
+      "nodes": [
+        {
+          "id": "mem_01JBMX9Z88F",
+          "projectId": "memoseb",
+          "kind": "rule",
+          "source": "claude",
+          "title": "Conventional Commits enforcement",
+          "body": "All git commits must follow conventional commits specification in english.",
+          "pinned": true,
+          "createdAt": "2026-11-10T03:00:00.000Z",
+          "updatedAt": "2026-11-10T03:00:00.000Z",
+          "hits": 12,
+          "contentHash": "5a4f78d9b...",
+          "attrs": [
+            { "key": "tag", "value": "git" },
+            { "key": "tag", "value": "standards" }
+          ],
+          "tags": ["git", "standards"]
+        }
+      ],
+      "edges": [],
+      "tombstones": [],
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  }
+}
+```
+
+### 7.4 Respuesta `POST /api/v1/p2p/exchange`
+
+```json
+{
+  "schemaVersion": 1,
+  "ok": true,
+  "command": "exchange",
+  "generatedAt": "2026-11-10T04:15:05.350Z",
+  "data": {
+    "ok": true,
+    "serverNodeId": "node-memoseb-alpha-7f8a",
+    "serverName": "Workstation Astrid",
+    "serverRole": "peer",
+    "serverTimestamp": "2026-11-10T04:15:05.350Z",
+    "appliedOnServer": {
+      "strategy": "merge",
+      "projectsImported": 1,
+      "memoriesCreated": 1,
+      "memoriesUpdated": 0,
+      "memoriesSkipped": 0,
+      "tombstonesApplied": 0
+    },
+    "serverDelta": {
+      "format": "p2p-memory-contract",
+      "version": 1,
+      "app": "memoseb",
+      "originNodeId": "node-memoseb-alpha-7f8a",
+      "originNodeName": "Workstation Astrid",
+      "exportedAt": "2026-11-10T04:15:05.350Z",
+      "projectId": "memoseb",
+      "nodes": [],
+      "edges": [],
+      "tombstones": [],
+      "checksum": "8f2d56a..."
+    },
+    "effectiveGroups": ["ai-engineering"]
+  }
+}
+```
+
+---
+
+## 8. Guía de Uso Rápido CLI y MCP
+
+### CLI
+
+```bash
+# 1. Habilitar modo P2P en el nodo
+memoseb node enable --role p2p --port 7432 --token "secreto-compartido"
+
+# 2. Conectar a un peer Gaze remoto
+memoseb node add-peer http://192.168.1.180:7432 --name "gaze-bravo" --token "secreto-compartido"
+
+# 3. Sincronizar en formato Gaze P2P
+memoseb sync --format gaze
+
+# 4. Exportar bundle compatible con Gaze
+memoseb export ./bundles/gaze-bundle.json --format gaze --project memoseb
+
+# 5. Importar bundle de Gaze en la bóveda local
+memoseb import ./bundles/gaze-bundle.json
+```
+
+### Servidor MCP
+
+En clientes compatibles con MCP (Claude Code, Antigravity CLI, Codex):
+
+```json
+// Exportar en formato Gaze P2P
+{
+  "name": "memory_export",
+  "arguments": {
+    "format": "gaze",
+    "filePath": "./gaze-export.json"
+  }
+}
+
+// Sincronizar directamente con un peer Gaze
+{
+  "name": "memory_sync",
+  "arguments": {
+    "peerUrl": "http://192.168.1.180:7432",
+    "format": "gaze"
+  }
+}
+```

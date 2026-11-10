@@ -56,11 +56,11 @@ memoseb context [--max-tokens N]             # Briefing del proyecto activo dent
 memoseb projects [--json]                    # Lista los proyectos indexados, conteo de memorias y tokens
 memoseb forget <id> [--json]                 # Elimina una memoria obsoleta por su ID
 memoseb stats [--json]                       # Muestra métricas globales de la bóveda (proyectos, vectores, tokens)
-memoseb export [file] [--project <id>]       # Exporta el cerebro a un snapshot JSON portable con checksum SHA-256
-memoseb import <file> [--replace] [--project <id>] # Importa un snapshot JSON en otra máquina (merge LWW por defecto o --replace)
-memoseb node status | enable | disable | discover | set-parent | add-child | remove | serve # Gestión opcional de red Padre ↔ Hijos
+memoseb export [file] [--format memoseb|gaze|p2p] [--project <id>] # Exporta a snapshot nativo o bundle P2P/Gaze con checksum SHA-256
+memoseb import <file> [--replace] [--project <id>] # Importa snapshot nativo o bundle Gaze/P2P con merge LWW o --replace
+memoseb node status | enable | disable | discover | set-parent | add-child | add-peer | remove | serve # Red Jerárquica (Padre/Hijo) o P2P Descentralizada
 memoseb group create | list | add-node | remove-node | delete | default-policy # Control de acceso y grupos de permisos (ACL)
-memoseb sync [--url <peer>] [--project <id>] [--full] # Sincronización bidireccional Padre ↔ Hijos
+memoseb sync [--url <peer>] [--project <id>] [--full] [--format memoseb|gaze|p2p] # Sincronización bidireccional (Jerárquica o P2P Gaze)
 memoseb mcp                                  # Inicia el servidor MCP JSON-RPC 2.0 por stdio
 memoseb check [--json]                       # Verifica la integridad SHA-256 de las directivas en cada host
 memoseb uninstall [--json]                   # Purga archivos desplegados y desconecta el nodo de hubseb
@@ -82,12 +82,15 @@ memoseb capabilities [--json]                # Muestra capacidades (provides/con
 | `--max-tokens <N>` | `recall`, `context` | Presupuesto estricto de tokens para la respuesta (por defecto `1200`) |
 | `--replace` | `import` | Reemplaza todas las memorias del proyecto en lugar de fusionar por Last-Write-Wins |
 | `--strategy <s>` | `import` | Estrategia de importación: `merge` (por defecto) o `replace` |
-| `--role <r>` | `node enable`, `node serve` | Rol del nodo en la topología de red: `parent` o `child` |
+| `--format <f>` | `export`, `import`, `sync` | Formato de contrato o bundle: `memoseb` (por defecto) o `gaze`/`p2p` (contrato interoperable P2P) |
+| `--contract <c>` | `sync` | Alias de `--format`: `memoseb` o `gaze`/`p2p` |
+| `--role <r>` | `node enable`, `node serve` | Rol del nodo en la red: `parent`, `child`, o `peer`/`p2p` (par simétrico) |
 | `--port <N>` | `node enable`, `node serve`, `node discover` | Puerto HTTP/UDP para el servicio de red (por defecto `7432`) |
-| `--token <sec>` | `node enable`, `node set-parent`, `node add-child`, `group create`, `sync` | Secreto/token Bearer para autenticación segura entre nodos o token dedicado de grupo |
+| `--token <sec>` | `node enable`, `node set-parent`, `node add-child`, `node add-peer`, `group create`, `sync` | Secreto/token Bearer para autenticación segura entre nodos o token dedicado de grupo |
 | `--parent <url>` | `node enable` | URL directa del nodo Padre al habilitar un nodo Hijo |
-| `--discover` | `node enable` | Auto-descubre un nodo Padre en la red LAN local mediante sondeo UDP |
-| `--url <peer>` | `sync`, `node set-parent`, `node add-child`, `node remove` | URL del peer remoto (ej. `http://192.168.1.50:7432`) |
+| `--peer <url>` | `node enable` | URL directa del nodo Par al habilitar un nodo en modo `peer`/`p2p` |
+| `--discover` | `node enable` | Auto-descubre nodos en la red LAN local mediante sondeo UDP `:7432` |
+| `--url <peer>` | `sync`, `node set-parent`, `node add-child`, `node add-peer`, `node remove` | URL del peer remoto (ej. `http://192.168.1.50:7432`) |
 | `--full` | `sync` | Fuerza una sincronización completa de snapshot en lugar de sincronización delta |
 | `--purge-peers` | `node disable` | Elimina los peers registrados al desactivar la red del nodo |
 | `--projects <p1,p2>` | `group create` | Proyectos autorizados para el grupo (separados por comas o `*` para todos) |
@@ -103,6 +106,7 @@ memoseb capabilities [--json]                # Muestra capacidades (provides/con
 ### Características del Snapshot
 - **Integridad Criptográfica**: Cada snapshot incluye un checksum `SHA-256` canónico calculado sobre su contenido ordenado. Si el archivo es alterado o truncado, el proceso de importación lo detecta y lo rechaza de inmediato.
 - **Tombstones de Eliminación**: Incluye registros de eliminación (`tombstones`) para propagar de forma segura recuerdos borrados sin riesgo de resurrección accidental.
+- **Soporte Dual de Formatos (Nativo y Gaze P2P)**: Exporta tanto al snapshot nativo (`memoseb-snapshot`) como a bundles interoperables `p2p-memory-contract` mediante `--format gaze` o `--format p2p`. Al importar, `memoseb` autodetecta el formato (desenvolviendo sobres `P2PContractEnvelopeV1` si existen) y ejecuta un mapeo lossless automático.
 - **Estrategias de Importación**:
   - `merge` (predeterminada): Resuelve conflictos mediante **Last-Write-Wins (LWW)** basándose en marcas de tiempo ISO-8601 (`updatedAt`) y hashes de contenido. Si un recuerdo local es más reciente, se preserva; si el remoto es más nuevo o inexistente, se inserta o actualiza.
   - `--replace`: Limpia las memorias previas del proyecto y restaura el snapshot como única fuente de verdad.
@@ -138,51 +142,81 @@ memoseb import ./backups/memoseb-auth-service.json
 
 # 4. Importar reemplazando por completo las memorias de un proyecto específico
 memoseb import ./backups/memoseb-auth-service.json --replace --project auth-service
+
+# 5. Exportar bundle P2P compatible con KikeDeAlba/gaze (p2p-memory-contract v1)
+memoseb export ./backups/gaze-bundle.json --format gaze --project auth-service
+
+# 6. Importar bundle de Gaze o snapshot nativo (autodetectado con merge LWW)
+memoseb import ./backups/gaze-bundle.json
 ```
 
-## Sincronización en Red Padre ↔ Hijos (Opcional)
+## Sincronización en Red: Jerárquica (Padre ↔ Hijos) y P2P Descentralizada (`peer`/`p2p` ↔ Gaze)
 
-Por diseño y seguridad, `memoseb` funciona de manera predeterminada en **modo standalone** (red desactivada, operación 100% local y offline).
+Por diseño y seguridad, `memoseb` opera por defecto en **modo standalone** (red desactivada, operación 100% local y offline).
 
-Cuando trabajas en equipo, con múltiples estaciones de trabajo, entornos de prueba o flotas de agentes coordinados por `crewseb`, puedes habilitar la topología **Padre ↔ Hijos (Parent-Child)** para sincronizar automáticamente o bajo demanda el aprendizaje entre nodos.
+Cuando trabajas en equipo, con múltiples estaciones de trabajo, entornos de prueba o flotas de agentes coordinados por `crewseb`, `memoseb` ofrece **coexistencia dual de sincronización** sobre una misma bóveda SQLite:
 
-### Arquitectura de Red
+1. **Topología Jerárquica (`parent` ↔ `child`)**: Un nodo central (`parent`) consolida el conocimiento emitido por múltiples nodos subordinados (`child`) en una topología en estrella (Hub-and-Spoke).
+2. **Topología P2P Descentralizada (`peer` / `p2p`) e Interoperabilidad con `KikeDeAlba/gaze`**: Pares equivalentes y federados (Mesh) donde cualquier nodo puede sincronizar bidireccionalmente con otros nodos `memoseb` o agentes de grafo de memoria [`KikeDeAlba/gaze`](https://github.com/KikeDeAlba/gaze) mediante el contrato canónico [`docs/GAZE_P2P_CONTRACT.md`](docs/GAZE_P2P_CONTRACT.md).
 
-- **Nodo Padre (`parent`)**: Actúa como el concentrador central (en un servidor local, VPS o estación de trabajo principal). Ejecuta un servidor HTTP REST para sincronización y un respondedor UDP para auto-descubrimiento en la red LAN.
-- **Nodos Hijos (`child`)**: Se conectan al nodo Padre ya sea por auto-descubrimiento en la red local o mediante su URL/IP directa.
-- **Sincronización Bidireccional Delta**: En cada ciclo de sincronización (`memoseb sync`), el Hijo envía sus recuerdos nuevos/actualizados y tombstones al Padre, y recibe los cambios nuevos del Padre. Los conflictos se resuelven automáticamente con Last-Write-Wins.
-- **Seguridad**: Autenticación mediante token secreto compartido (Bearer token) y comparación en tiempo constante para mitigar ataques de temporización.
+### Arquitectura de Red y Protocolo P2P
+
+- **Descubrimiento UDP LAN (`:7432`)**: Paquetes `MEMOSEB_DISCOVER_V1` y `MEMOSEB_ANNOUNCE_V1` con autenticación opcional HMAC-SHA256 (`authTag`).
+- **Endpoints REST Canónicos y Fallback Automático**: Rutas P2P dedicadas (`/api/v1/p2p/status`, `/api/v1/p2p/handshake`, `/api/v1/p2p/exchange`) que encapsulan la carga en sobres estándar `P2PContractEnvelopeV1` (compatibles con `KikeDeAlba/kit`), con fallback transparente a `/api/v1/sync/*`.
+- **Cabeceras de Autenticación Flexibles**: Valida indistintamente `Authorization: Bearer <token>`, `X-Memoseb-Token: <token>` o `X-Gaze-Token: <token>` con comparación en tiempo constante.
+- **Resolución Determinista**: Ambos modos resuelven conflictos mediante **Last-Write-Wins (LWW)** basándose en marcas de tiempo ISO-8601 (`updatedAt`) y hash SHA-256 (`contentHash`), propagando `tombstones` criptográficos para borrados definitivos.
+- **Mapeo Bidireccional Lossless**: Traduce automáticamente y sin pérdida entre `MemoryRecord` (`convention`, `decision`, `architecture`, `bugfix`, `domain`) y `GazeNodeV1` (`rule`, `decision`, `fact`, `memory`, `doc`, `issue`), preservando aristas (`edges`), atributos métricos y fidelidad contextual. Consulta la especificación exhaustiva en [`docs/GAZE_P2P_CONTRACT.md`](docs/GAZE_P2P_CONTRACT.md).
+
+- **Nodo Padre (`parent`)**: Concentrador central en topología jerárquica.
+- **Nodos Hijos (`child`)**: Clientes subordinados que sincronizan exclusivamente con su nodo Padre.
+- **Nodos Pares (`peer` / `p2p`)**: Nodos simétricos en topología de malla que sincronizan directamente entre sí o con agentes `KikeDeAlba/gaze`.
 
 ```mermaid
 sequenceDiagram
     autonumber
-    participant Child as "Nodo Hijo (Laptop / Agente)"
-    participant Parent as "Nodo Padre (memoseb node serve :7432)"
+    participant Client as "Cliente / Peer (memoseb o Gaze)"
+    participant Server as "Nodo Servidor (memoseb node serve :7432)"
 
-    Note over Child,Parent: Fase 1: Descubrimiento o Conexión Directa
+    Note over Client,Server: Fase 1: Descubrimiento UDP o Handshake Directo
     alt Auto-descubrimiento LAN (UDP 7432)
-        Child->>Parent: UDP Broadcast (MEMOSEB_DISCOVER_V1)
-        Parent-->>Child: UDP Unicast (MEMOSEB_ANNOUNCE_V1 + URLs)
-    else Conexión Directa
-        Child->>Parent: Configuración directa por URL / IP
+        Client->>Server: UDP Broadcast (MEMOSEB_DISCOVER_V1)
+        Server-->>Client: UDP Unicast (MEMOSEB_ANNOUNCE_V1 + URLs)
     end
 
-    Child->>Parent: GET /api/v1/sync/status (Handshake con Bearer Token)
-    Parent-->>Child: 200 OK (NodeId, Role: parent)
+    Client->>Server: POST /api/v1/p2p/handshake (P2P Envelope + Bearer Token)
+    Server-->>Client: 200 OK (P2P Envelope { nodeId, role, supportedContracts })
 
-    Note over Child,Parent: Fase 2: Sincronización Bidireccional (memoseb sync)
-    Child->>Parent: POST /api/v1/sync/push (Deltas locales + Tombstones desde lastSyncAt)
-    Parent->>Parent: Aplica Last-Write-Wins, FTS5 y propaga Tombstones
-    Parent-->>Child: 200 OK (Confirmación de ingesta)
-
-    Child->>Parent: POST /api/v1/sync/pull (Solicita deltas del Padre)
-    Parent-->>Child: 200 OK (Deltas del Padre + Tombstones)
-    Child->>Child: Aplica Last-Write-Wins y regenera índices locales
+    Note over Client,Server: Fase 2: Intercambio Bidireccional Atómico (memoseb sync)
+    Client->>Server: POST /api/v1/p2p/exchange (P2PSyncPayloadV1: deltas + tombstones)
+    Server->>Server: Aplica Last-Write-Wins, FTS5 y regenera vectores Float32
+    Server-->>Client: 200 OK (serverDelta en P2PSyncPayloadV1 + confirmación)
+    Client->>Client: Fusiona serverDelta en la bóveda local
 ```
 
 ### Guía Paso a Paso
 
-#### 1. Configurar y Levantar el Nodo Padre
+#### Modo A: Configuración P2P Descentralizada (o Conexión con KikeDeAlba/gaze)
+
+```bash
+# 1. Habilitar el nodo en rol P2P (p2p es alias directo de peer)
+memoseb node enable --role p2p --port 7432 --token "mi-token-secreto"
+
+# 2. Iniciar el servicio HTTP y respondedor UDP en primer plano
+memoseb node serve
+
+# 3. Emparejar con un nodo peer de memoseb o un agente KikeDeAlba/gaze
+memoseb node add-peer http://192.168.1.180:7432 --name "gaze-peer" --token "mi-token-secreto"
+
+# 4. Sincronizar bidireccionalmente usando el contrato Gaze P2P
+memoseb sync --format gaze
+
+# 5. O sincronizar todos los peers registrados
+memoseb sync
+```
+
+#### Modo B: Configuración Jerárquica (Padre ↔ Hijos)
+
+##### 1. Configurar y Levantar el Nodo Padre
 
 En la máquina central o servidor:
 
@@ -197,7 +231,7 @@ memoseb node serve
 > [!NOTE]
 > `memoseb node serve` escucha en `0.0.0.0:7432` por defecto y responde a sondeos de descubrimiento UDP en la LAN. Si deseas limitar el servicio solo a HTTP sin descubrimiento UDP, añade `--no-lan`.
 
-#### 2. Configurar el Nodo Hijo
+##### 2. Configurar el Nodo Hijo
 
 En la laptop, máquina de desarrollo o agente de IA:
 
@@ -214,7 +248,7 @@ Si el Padre está en otra subred, contenedor Docker, VPS o red remota:
 memoseb node enable --role child --parent http://192.168.1.50:7432 --token "mi-token-secreto-compartido"
 ```
 
-#### 3. Ejecutar la Sincronización
+##### 3. Ejecutar la Sincronización
 
 ```bash
 # Sincronización bidireccional de deltas con los peers configurados
@@ -233,7 +267,7 @@ memoseb sync --full
 > [!TIP]
 > Si el nodo se configuró con auto-sincronización (`--auto-sync`, habilitado por defecto al hacer `node enable`), cualquier memoria guardada (`remember`), borrada (`forget`) o indexada (`analyze`) disparará automáticamente un ciclo de sincronización en segundo plano con el nodo Padre.
 
-#### 4. Gestión y Diagnóstico del Nodo
+#### Diagnóstico y Desconexión del Nodo
 
 ```bash
 # Ver estado del nodo, rol, auto-sync, URLs LAN e historial de sincronización de peers
@@ -252,15 +286,11 @@ memoseb node add-child http://192.168.1.100:7432 --name "laptop-agente"
 memoseb node remove http://192.168.1.100:7432
 ```
 
-#### 5. Desactivar la Red (Volver a Standalone)
-
-Para desconectar el nodo de la red y volver a la operación puramente local:
-
 ```bash
-# Desactiva el networking manteniendo la lista de peers para futura reactivación
+# Desactivar el networking volviendo al modo standalone manteniendo los peers
 memoseb node disable
 
-# Desactiva el networking y purga la lista de peers registrados
+# Desactivar el networking y purgar los peers registrados
 memoseb node disable --purge-peers
 ```
 
@@ -358,7 +388,7 @@ memoseb group delete grupo-x
 | `memory_briefing` | `projectId`, `maxTokens` | Recupera el briefing prioritario del proyecto (`architecture`, `convention`, `decision`, `bugfix`) al iniciar sesión |
 | `memory_forget` | `id` (req) | Elimina un registro de memoria obsoleto junto con su índice FTS5 y su vector |
 | `memory_analyze` | `path`, `projectId`, `dryRun` | Analiza un repositorio y sintetiza memorias de `architecture`, `convention` y `domain` en la bóveda |
-| `memory_export` | `filePath`, `projectId` | Exporta la bóveda completa o un proyecto a un snapshot JSON portable con checksum SHA-256 |
-| `memory_import` | `filePath` (req), `strategy`, `projectId` | Importa un snapshot JSON con resolución Last-Write-Wins (o `--replace`), reindexando FTS5 y vectores |
-| `memory_sync` | `peerUrl`, `projectId`, `full` | Ejecuta sincronización bidireccional de deltas y tombstones con el nodo Padre o peer remoto |
+| `memory_export` | `filePath`, `projectId`, `format` | Exporta la bóveda completa o un proyecto a snapshot JSON (`memoseb`) o bundle P2P/Gaze (`gaze` / `p2p`) con checksum SHA-256 |
+| `memory_import` | `filePath` (req), `strategy`, `projectId`, `format` | Importa snapshot JSON nativo o bundle Gaze/P2P autodetectado con resolución Last-Write-Wins (o `--replace`), reindexando FTS5 y vectores |
+| `memory_sync` | `peerUrl`, `projectId`, `full`, `format` | Ejecuta sincronización bidireccional (jerárquica o P2P Gaze mediante `format: 'gaze'`) de deltas y tombstones |
 | `memory_group` | `action` (req: `list`, `create`, `add_node`, `remove_node`, `delete`, `default_policy`), `name`, `projects`, `categories`, `permissions`, `groupToken`, `description`, `node`, `policy` | Administra grupos de permisos y reglas ACL de sincronización por proyecto, categoría y modo de acceso |
