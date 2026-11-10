@@ -1507,10 +1507,13 @@ export class MemoryVault {
       | RawPeerRow
       | undefined
 
+    // Si el identificador corresponde a un peer registrado, la membresía se
+    // guarda por su identidad local (id y URL), que es lo que se resuelve en red
     const identifiersToInsert = new Set<string>()
     identifiersToInsert.add(trimmedId)
-    if (peer?.peer_node_id) {
-      identifiersToInsert.add(peer.peer_node_id)
+    if (peer) {
+      identifiersToInsert.add(peer.id)
+      identifiersToInsert.add(peer.url.replace(/\/+$/, ''))
     }
 
     const now = new Date().toISOString()
@@ -1593,22 +1596,19 @@ export class MemoryVault {
       .prepare(`SELECT * FROM sync_peers`)
       .all() as unknown as RawPeerRow[]
 
+    // Solo la identidad del peer registrado localmente (id, URL o su IP):
+    // nunca su nombre ni el nodeId que declaró en un handshake
     for (const peer of peerRows) {
       const normUrl = peer.url.replace(/\/+$/, '')
-      const matches =
-        searchIds.has(peer.id) ||
-        (peer.peer_node_id !== null && searchIds.has(peer.peer_node_id)) ||
-        searchIds.has(peer.name) ||
-        searchIds.has(peer.url) ||
-        searchIds.has(normUrl)
-
+      const matches = searchIds.has(peer.id) || searchIds.has(peer.url) || searchIds.has(normUrl)
       if (matches) {
-        if (peer.id) searchIds.add(peer.id)
-        if (peer.peer_node_id) searchIds.add(peer.peer_node_id)
-        if (peer.name) searchIds.add(peer.name)
-        if (peer.url) {
-          searchIds.add(peer.url)
-          searchIds.add(normUrl)
+        searchIds.add(peer.id)
+        searchIds.add(peer.url)
+        searchIds.add(normUrl)
+        try {
+          searchIds.add(new URL(peer.url).hostname.replace(/^\[|\]$/g, ''))
+        } catch {
+          // URL inválida: solo id y URL
         }
       }
     }
@@ -1678,12 +1678,7 @@ export class MemoryVault {
       }
     }
 
-    const memberGroups = this.getPeerGroups([
-      input?.peerId,
-      input?.peerNodeId,
-      input?.peerName,
-      input?.peerUrl
-    ])
+    const memberGroups = this.getPeerGroups([input?.peerId, input?.peerUrl])
 
     if (input?.matchedGroupByToken && input.matchedGroupByToken.trim()) {
       const tokenGroup =

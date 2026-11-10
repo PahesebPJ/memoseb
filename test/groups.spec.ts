@@ -145,17 +145,22 @@ describe('Sync Groups & ACL Permissions: Vault CRUD and Network Enforcement', ()
 
         // Pre-register a peer in sync_peers to test automatic peer_node_id linking
         const peerNodeId = crypto.randomUUID()
-        vault.upsertPeer({
+        const registeredPeer = vault.upsertPeer({
           role: 'child',
           url: 'http://127.0.0.1:4040',
           name: 'Child-Infra-4040',
           peerNodeId
         })
 
-        // Adding peer URL automatically links its peerNodeId as well
+        // La membresía de un peer registrado se guarda por su identidad local
+        // (id y URL), nunca por el nodeId que declaró
         const afterAdd = vault.addNodeToGroup('infra-ops', 'http://127.0.0.1:4040')
         assert.ok(afterAdd.memberNodeIds.includes('http://127.0.0.1:4040'))
-        assert.ok(afterAdd.memberNodeIds.includes(peerNodeId))
+        assert.ok(afterAdd.memberNodeIds.includes(registeredPeer.id))
+        assert.ok(!afterAdd.memberNodeIds.includes(peerNodeId))
+        assert.deepEqual(vault.getPeerGroups([peerNodeId]), [])
+        assert.deepEqual(vault.getPeerGroups(['Child-Infra-4040']), [])
+        assert.equal(vault.getPeerGroups([registeredPeer.id])[0]?.name, 'infra-ops')
 
         // Adding arbitrary identifier
         const arbitraryNode = 'custom-worker-node-1'
@@ -294,18 +299,18 @@ describe('Sync Groups & ACL Permissions: Vault CRUD and Network Enforcement', ()
         projects: ['proyecto-x'],
         permissions: 'readwrite'
       })
-      parentVault.addNodeToGroup('grupo-x', childXVault.getNodeId())
       // La membresía se resuelve por el peer registrado localmente (no por el nodeId declarado)
       parentVault.upsertPeer({ role: 'child', url: 'http://127.0.0.1:41001', peerNodeId: childXVault.getNodeId() })
+      parentVault.addNodeToGroup('grupo-x', childXVault.getNodeId())
 
       parentVault.upsertGroup({
         name: 'grupo-y',
         projects: ['proyecto-y'],
         permissions: 'readwrite'
       })
-      parentVault.addNodeToGroup('grupo-y', childYVault.getNodeId())
       // La membresía se resuelve por el peer registrado localmente (no por el nodeId declarado)
       parentVault.upsertPeer({ role: 'child', url: 'http://127.0.0.1:41002', peerNodeId: childYVault.getNodeId() })
+      parentVault.addNodeToGroup('grupo-y', childYVault.getNodeId())
 
       const parentServer = await startSyncServer(parentVault, {
         host: '127.0.0.1',
@@ -470,9 +475,9 @@ describe('Sync Groups & ACL Permissions: Vault CRUD and Network Enforcement', ()
         categories: ['architecture'],
         permissions: 'readonly'
       })
-      parentVault.addNodeToGroup('core-readers', childReadonlyVault.getNodeId())
       // La membresía se resuelve por el peer registrado localmente (no por el nodeId declarado)
       parentVault.upsertPeer({ role: 'child', url: 'http://127.0.0.1:41003', peerNodeId: childReadonlyVault.getNodeId() })
+      parentVault.addNodeToGroup('core-readers', childReadonlyVault.getNodeId())
 
       // Setup writeonly group for telemetry / audit logging
       parentVault.upsertGroup({
@@ -480,9 +485,9 @@ describe('Sync Groups & ACL Permissions: Vault CRUD and Network Enforcement', ()
         projects: ['core-platform'],
         permissions: 'writeonly'
       })
-      parentVault.addNodeToGroup('audit-writers', childWriteonlyVault.getNodeId())
       // La membresía se resuelve por el peer registrado localmente (no por el nodeId declarado)
       parentVault.upsertPeer({ role: 'child', url: 'http://127.0.0.1:41004', peerNodeId: childWriteonlyVault.getNodeId() })
+      parentVault.addNodeToGroup('audit-writers', childWriteonlyVault.getNodeId())
 
       const parentServer = await startSyncServer(parentVault, {
         host: '127.0.0.1',

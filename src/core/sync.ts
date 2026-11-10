@@ -1893,8 +1893,7 @@ export async function syncWithPeer(
       vault.updatePeerSyncState(existingPeer.id, {
         lastSyncAt: serverTimestamp,
         lastStatus: 'ok',
-        peerNodeId: serverNodeId,
-        name: serverName
+        peerNodeId: serverNodeId
       })
     } else {
       vault.upsertPeer({

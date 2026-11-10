@@ -368,8 +368,8 @@ describe('Security hardening of the P2P node', () => {
     parent.enableNodeMode({ role: 'parent', listenPort: 0 })
     parent.storeMemory({ projectId: 'secret', category: 'domain', content: 'Only for the trusted child.' })
     parent.upsertGroup({ name: 'trusted', projects: ['secret'], permissions: 'readwrite' })
+    parent.upsertPeer({ role: 'child', url: 'http://100.64.0.7:7432', name: 'Trusted', peerNodeId: 'trusted-child-id' })
     parent.addNodeToGroup('trusted', 'trusted-child-id')
-    parent.upsertPeer({ role: 'child', url: 'http://100.64.0.7:7432', peerNodeId: 'trusted-child-id' })
 
     // El atacante declara el nodeId del hijo de confianza
     const attackerDb = path.join(tmpDir, 'acl-attacker.sqlite')
@@ -390,16 +390,33 @@ describe('Security hardening of the P2P node', () => {
         peerRole: 'parent'
       })
       assert.equal(spoofed.pulled.memoriesCreated, 0, 'declared nodeId from another address gets nothing')
-      assert.equal(parent.getGroup('trusted')?.memberNodeIds.length, 1)
+      assert.deepEqual(parent.evaluatePeerPermissions({ peerNodeId: 'trusted-child-id', peerName: 'Trusted' }).groups, [])
 
-      // Control: registrado en loopback, el mismo nodeId sí recibe su proyecto
+      // Control: registrado en loopback y en el grupo, el mismo nodeId sí recibe su proyecto
       parent.upsertPeer({ role: 'child', url: 'http://127.0.0.1:41009', peerNodeId: 'trusted-child-id' })
+      parent.addNodeToGroup('trusted', 'http://127.0.0.1:41009')
       const legit = await syncWithPeer(attacker, {
         peerUrl: `http://127.0.0.1:${handle.port}`,
         peerRole: 'parent',
         full: true
       })
       assert.equal(legit.pulled.memoriesCreated, 1)
+    } finally {
+      await handle.close()
+    }
+  })
+
+  it('keeps the local peer name instead of adopting the server-declared one', async () => {
+    const local = open('name-local')
+    const remote = open('name-remote')
+    local.enableNodeMode({ role: 'peer', authToken: 'tok' })
+    remote.enableNodeMode({ role: 'peer', nodeName: 'admin-group-member', authToken: 'tok' })
+    const handle = await startSyncServer(remote, { host: '127.0.0.1', port: 0, enableUdpDiscovery: false })
+    try {
+      local.upsertPeer({ role: 'peer', url: `http://127.0.0.1:${handle.port}`, name: 'Local name', authToken: 'tok' })
+      const summary = await syncAllPeers(local)
+      assert.equal(summary.errors.length, 0)
+      assert.equal(local.listPeers()[0]?.name, 'Local name')
     } finally {
       await handle.close()
     }
