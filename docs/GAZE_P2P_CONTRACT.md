@@ -293,6 +293,8 @@ El broadcast UDP no cruza el tailnet. `memoseb node serve` (cada 60 s) y `memose
    ```
 
    `host:port` es la dirección que marcó el cliente. El servidor la toma de `req.socket.localAddress:localPort` y normaliza `::ffff:a.b.c.d` a `a.b.c.d`; el cliente usa la IP y el puerto que sondeó. Un nodo que reenvía el reto a otro (relay) obtiene un tag ligado a otra dirección y no verifica. gaze usa la misma fórmula.
+
+   El `host` del reto es la IP literal que se marcó (por ejemplo `100.64.0.7` o `::1`, sin corchetes), nunca un nombre MagicDNS ni otro hostname: el servidor solo conoce la IP local del socket. Un cliente que conecta por nombre resuelve primero la IP y firma con la IP a la que llegó.
 3. Sin nonce y sin token responde `401`. Un nonce inválido (fuera de `[A-Za-z0-9-]{16,128}`) responde `400`.
 4. Solo si el `authTag` es válido el cliente repite el `GET` con `Authorization: Bearer <token>`; ese segundo sondeo sigue siendo necesario porque el reto anónimo no revela `nodeId`, `nodeName` ni `stats`.
 
