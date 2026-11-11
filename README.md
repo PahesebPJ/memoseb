@@ -252,7 +252,7 @@ Si la regla la creó `--apply`, `memoseb node service uninstall` y `memoseb unin
 - La primera vez que se abre la bóveda, `memories.content_hash` se recalcula con la fórmula del contrato (`sha256(project:category:content.trim())`); las filas que chocarían con otra se dejan como estaban.
 - El servicio instalado con la versión anterior (sin sufijo) no se reconoce: quítalo con `launchctl bootout gui/$(id -u)/io.github.pahesebpj.memoseb.node`, `systemctl --user disable --now memoseb-node.service` o `schtasks /Delete /TN memoseb-node /F`, y vuelve a instalarlo.
 - Los nodos gaze deben responder el reto `nonce`/`authTag` (fórmula ligada a `host:port`) en `GET /api/v1/p2p/status` para ser descubiertos por Tailscale.
-- Los miembros de grupo agregados por `nodeId` o nombre antes de registrar el peer ya no lo identifican: vuelve a agregarlos con `memoseb group add-node <grupo> <url-del-peer>`.
+- Los miembros de grupo agregados por `nodeId` o nombre antes de registrar el peer ya no lo identifican: vuelve a agregarlos con `memoseb group add-node <grupo> <url-del-peer>`. `memoseb node serve` lista al arrancar las membresías que siguen en ese estado y el comando exacto para cada una.
 
 #### Modo B: Configuración Jerárquica (Padre ↔ Hijos)
 

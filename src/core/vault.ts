@@ -1628,6 +1628,48 @@ export class MemoryVault {
     return groupRows.map((r) => this.mapRowToGroupRecord(r))
   }
 
+  listStaleGroupMembers(): Array<{ group: string; identifier: string; peerUrl: string }> {
+    const peerRows = this.db
+      .prepare(`SELECT * FROM sync_peers`)
+      .all() as unknown as RawPeerRow[]
+    const memberRows = this.db
+      .prepare(
+        `SELECT g.name AS group_name, m.group_id, m.peer_identifier
+         FROM sync_group_members m JOIN sync_groups g ON g.id = m.group_id
+         ORDER BY g.name ASC, m.peer_identifier ASC`
+      )
+      .all() as unknown as Array<{ group_name: string; group_id: string; peer_identifier: string }>
+
+    const localIdentity = (peer: RawPeerRow): Set<string> => {
+      const ids = new Set<string>([peer.id, peer.url, peer.url.replace(/\/+$/, '')])
+      if (URL.canParse(peer.url)) {
+        ids.add(new URL(peer.url).hostname.replace(/^\[|\]$/g, ''))
+      }
+      return ids
+    }
+
+    const membersByGroup = new Map<string, Set<string>>()
+    for (const row of memberRows) {
+      const set = membersByGroup.get(row.group_id) ?? new Set<string>()
+      set.add(row.peer_identifier)
+      membersByGroup.set(row.group_id, set)
+    }
+
+    const stale: Array<{ group: string; identifier: string; peerUrl: string }> = []
+    for (const row of memberRows) {
+      const members = membersByGroup.get(row.group_id)!
+      for (const peer of peerRows) {
+        const identity = localIdentity(peer)
+        if (identity.has(row.peer_identifier)) continue
+        const legacy = row.peer_identifier === peer.peer_node_id || row.peer_identifier === peer.name
+        if (!legacy) continue
+        if ([...identity].some((id) => members.has(id))) continue
+        stale.push({ group: row.group_name, identifier: row.peer_identifier, peerUrl: peer.url })
+      }
+    }
+    return stale
+  }
+
   findGroupByToken(token: string | null | undefined): SyncGroupRecord | null {
     if (!token || typeof token !== 'string') {
       return null

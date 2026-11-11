@@ -201,6 +201,37 @@ describe('Sync Groups & ACL Permissions: Vault CRUD and Network Enforcement', ()
       }
     })
 
+    it('reports legacy memberships stored by node id or name and clears them once re-added by url', () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'memoseb-groups-stale-'))
+      const vault = new MemoryVault({ dbPath: path.join(tmpDir, 'test.sqlite') })
+
+      try {
+        vault.upsertGroup({ name: 'legacy-ops' })
+        vault.upsertGroup({ name: 'named-ops' })
+        const legacyNodeId = crypto.randomUUID()
+        vault.addNodeToGroup('legacy-ops', legacyNodeId)
+        vault.addNodeToGroup('named-ops', 'Laptop-B')
+        vault.addNodeToGroup('named-ops', 'unregistered-worker')
+        vault.upsertPeer({ role: 'peer', url: 'http://100.64.0.7:7438', name: 'Laptop-B', peerNodeId: legacyNodeId })
+
+        assert.deepEqual(vault.listStaleGroupMembers(), [
+          { group: 'legacy-ops', identifier: legacyNodeId, peerUrl: 'http://100.64.0.7:7438' },
+          { group: 'named-ops', identifier: 'Laptop-B', peerUrl: 'http://100.64.0.7:7438' }
+        ])
+
+        vault.addNodeToGroup('legacy-ops', 'http://100.64.0.7:7438')
+        assert.deepEqual(
+          vault.listStaleGroupMembers().map((m) => m.group),
+          ['named-ops']
+        )
+        vault.addNodeToGroup('named-ops', 'http://100.64.0.7:7438')
+        assert.deepEqual(vault.listStaleGroupMembers(), [])
+      } finally {
+        vault.close()
+        fs.rmSync(tmpDir, { recursive: true, force: true })
+      }
+    })
+
     it('lists groups ordered alphabetically and deletes group cascading member records', () => {
       const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'memoseb-groups-list-del-'))
       const dbPath = path.join(tmpDir, 'test.sqlite')

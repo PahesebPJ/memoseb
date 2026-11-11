@@ -1960,6 +1960,17 @@ export async function executeMemoCli(
           }
         }
 
+        const staleMembers = vault.listStaleGroupMembers()
+        if (staleMembers.length > 0) {
+          process.stderr.write(
+            `memoseb: ${staleMembers.length} group membership(s) were stored by node id or name and no longer apply: ${staleMembers
+              .map((m) => `${m.group}:${m.identifier}`)
+              .join(', ')}. Re-add each peer by its URL: ${staleMembers
+              .map((m) => `"memoseb group add-node ${m.group} ${m.peerUrl}"`)
+              .join(', ')}.\n`,
+          )
+        }
+
         // Rol peer sin --host: IP de Tailscale + loopback, o solo loopback si Tailscale
         // no corre todavía; nunca 0.0.0.0. La discovery reabre la IP al aparecer.
         const bindPlan = await resolveServeBindPlan(runtime, serveConfig, flags.host)
