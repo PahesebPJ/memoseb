@@ -114,7 +114,7 @@ export function detachedServeArgs(argv: readonly string[]): string[] {
   const out: string[] = []
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]!
-    if (a === '--detach' || a === '--token-stdin') continue
+    if (a === '--detach' || a === '--token-stdin' || a.startsWith('--token=')) continue
     if (a === '--token') {
       i++
       continue

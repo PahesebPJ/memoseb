@@ -11,7 +11,7 @@ import {
   TopologyStore,
   type WireSuccess
 } from 'hubseb'
-import { executeMemoCli } from '../src/bin/memoseb.ts'
+import { detachedServeArgs, executeMemoCli } from '../src/bin/memoseb.ts'
 import type { ProjectAnalysisReport } from '../src/core/analyzer.ts'
 import type {
   ProjectSummary,
@@ -2083,6 +2083,21 @@ describe('CLI node service, token policy and auto-sync serve', () => {
     assert.equal(withFlag.exitCode, 0)
     assert.ok(!calls[1]!.args.includes('flag-secret'))
     assert.equal(calls[1]!.env.MEMOSEB_SYNC_TOKEN, 'flag-secret')
+
+    const withEquals = await executeMemoCli(['node', 'serve', '--detach', '--token=equals-secret'], {
+      runtime,
+      dbPath,
+      spawnProcess: fakeSpawn(false)
+    })
+    assert.equal(withEquals.exitCode, 0)
+    assert.ok(!calls[2]!.args.some((a) => a.includes('equals-secret')), calls[2]!.args.join(' '))
+    assert.equal(calls[2]!.env.MEMOSEB_SYNC_TOKEN, 'equals-secret')
+    assert.deepEqual(detachedServeArgs(['node', 'serve', '--token=a', '--token', 'b', '--token-stdin', '--detach', '--port', '1']), [
+      'node',
+      'serve',
+      '--port',
+      '1'
+    ])
 
     const failed = await executeMemoCli(['node', 'serve', '--detach'], { runtime, dbPath, spawnProcess: fakeSpawn(true) })
     assert.equal(failed.exitCode, 1)
