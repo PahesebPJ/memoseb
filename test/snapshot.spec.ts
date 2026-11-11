@@ -512,6 +512,22 @@ describe('Vault Snapshot Engine: Export, Import, Tamper Detection, and Merging S
     assert.equal(rows.find((m) => m.id === twin.memory.id)?.projectId, 'beta')
   })
 
+  it('exports changes made in the same millisecond as the since mark', () => {
+    // Causa del fallo intermitente de la propagación de tombstones: un forget en
+    // el mismo ms que el último sync quedaba fuera de `deleted_at > since`.
+    const stored = vaultA.storeMemory({ projectId: 'edge', category: 'domain', content: 'Same millisecond.' })
+    const since = stored.memory.updatedAt
+    assert.equal(vaultA.exportSnapshot({ since }).memories.length, 1)
+    assert.equal(vaultA.forgetMemory(stored.memory.id), true)
+    const tombstone = vaultA.exportSnapshot().tombstones.find((t) => t.memoryId === stored.memory.id)!
+    const delta = vaultA.exportSnapshot({ since: tombstone.deletedAt })
+    assert.ok(delta.tombstones.some((t) => t.memoryId === stored.memory.id))
+
+    vaultB.importSnapshot(vaultA.exportSnapshot())
+    const again = vaultB.importSnapshot(vaultA.exportSnapshot({ since: tombstone.deletedAt }))
+    assert.equal(again.memoriesUpdated + again.memoriesCreated + again.tombstonesApplied, 0, 're-sending the edge is idempotent')
+  })
+
   it('never leaves new content with an old hash when a moved and edited memory collides', () => {
     const original = vaultA.storeMemory({ projectId: 'alpha', category: 'convention', content: 'Old wording.' })
     vaultB.importSnapshot(vaultA.exportSnapshot())

@@ -1822,8 +1822,11 @@ export class MemoryVault {
       memoriesSql += ' AND project_id = ?'
       memoriesParams.push(targetProjectId)
     }
+    // >= y no >: la marca `since` tiene resolución de milisegundos y un cambio
+    // hecho en el mismo milisegundo que el último sync se perdía. Reenviar el
+    // borde es idempotente (LWW lo descarta).
     if (since) {
-      memoriesSql += ' AND updated_at > ?'
+      memoriesSql += ' AND updated_at >= ?'
       memoriesParams.push(since)
     }
     memoriesSql += ' ORDER BY created_at ASC, id ASC'
@@ -1841,7 +1844,7 @@ export class MemoryVault {
         tombstonesParams.push(targetProjectId)
       }
       if (since) {
-        tombstonesSql += ' AND deleted_at > ?'
+        tombstonesSql += ' AND deleted_at >= ?'
         tombstonesParams.push(since)
       }
       tombstonesSql += ' ORDER BY deleted_at ASC, memory_id ASC'
@@ -1885,7 +1888,7 @@ export class MemoryVault {
       }
     } else if (since) {
       const pRows = this.db
-        .prepare(`SELECT * FROM projects WHERE updated_at > ?`)
+        .prepare(`SELECT * FROM projects WHERE updated_at >= ?`)
         .all(since) as unknown as Array<{
         id: string
         name: string
