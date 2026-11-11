@@ -43,6 +43,7 @@ import {
   discoverLanParents,
   getLocalLanUrls,
   isLoopbackHost,
+  listenUrls,
   normalizePeerUrl,
   performPeerHandshake,
   resolveCallbackUrl,
@@ -67,8 +68,11 @@ import {
   nodeServiceStatus,
   removeServePidFile,
   resolveServiceCommand,
+  readActiveListen,
+  removeActiveListen,
   serveStateFiles,
   serviceNames,
+  writeActiveListen,
   uninstallNodeService,
   windowsFirewallRule,
   writeServePidFile,
@@ -1044,10 +1048,12 @@ export async function executeMemoCli(
         const groups = vault.listGroups()
         const lanUrls = getLocalLanUrls(config.listenPort)
         const service = nodeServiceStatus(serviceContext(vault))
+        // config.listenHost/listenPort son la config guardada; activeListen, lo que escucha el serve en curso
+        const activeListen = readActiveListen(serveStateFiles(vault.dbPath).activeFile)
         if (jsonMode) {
           return {
             exitCode: 0,
-            stdout: serializeWire(wireNode({ config, peers, lanUrls, groups, service })),
+            stdout: serializeWire(wireNode({ config, activeListen, peers, lanUrls, groups, service })),
             stderr: '',
           }
         }
@@ -1056,7 +1062,8 @@ export async function executeMemoCli(
           `  Status:      ${config.enabled ? `ENABLED (role=${config.role})` : 'DISABLED (standalone)'}`,
           `  Node ID:     ${config.nodeId}`,
           `  Node Name:   ${config.nodeName}`,
-          `  Listen:      ${config.listenHost}:${config.listenPort}`,
+          `  Listen:      ${config.listenHost}:${config.listenPort} (saved config)`,
+          `  Active:      ${activeListen ? `${activeListen.urls.join(', ')} (pid ${activeListen.pid})` : 'not serving'}`,
           `  Auto-sync:   ${config.autoSync ? 'enabled' : 'disabled'}`,
           `  LAN discov.: ${config.lanDiscovery ? 'enabled' : 'disabled'}`,
           `  Tailscale:   ${config.tailscaleDiscovery === false ? 'disabled' : 'enabled'}${config.tailscaleBin ? ` (${config.tailscaleBin})` : ''}`,
@@ -1959,6 +1966,7 @@ export async function executeMemoCli(
         const bindHosts = bindPlan.hosts
 
         let loop: AutoSyncLoopHandle | null = null
+        let activeRecorder: (() => void) | null = null
         const handle = await startSyncServer(vault, {
           host: bindHosts[0] ?? flags.host,
           additionalHosts: bindHosts.slice(1),
@@ -1981,6 +1989,7 @@ export async function executeMemoCli(
               if (bindPlan.auto) {
                 const opened = await refreshPeerBindHosts(runtime, vault.getNodeConfig(), handle)
                 if (opened.length > 0) {
+                  activeRecorder?.()
                   process.stderr.write(`memoseb node serve now also listening on ${opened.join(', ')}\n`)
                 }
               }
@@ -2017,16 +2026,30 @@ export async function executeMemoCli(
             },
           })
         }
-        const pidFile = writeServePidFile(serveStateFiles(vault.dbPath).pidFile)
+        const stateFiles = serveStateFiles(vault.dbPath)
+        const pidFile = writeServePidFile(stateFiles.pidFile)
+        const startedAt = new Date().toISOString()
+        const recordActive = () =>
+          writeActiveListen(stateFiles.activeFile, {
+            pid: process.pid,
+            hosts: [...handle.hosts],
+            port: handle.port,
+            urls: listenUrls(handle.hosts, handle.port),
+            startedAt,
+          })
+        recordActive()
+        activeRecorder = recordActive
 
-        const primaryUrl = handle.urls[0] ?? `http://${handle.host}:${handle.port}`
+        // Solo las direcciones en las que de verdad escucha
+        const activeUrls = listenUrls(handle.hosts, handle.port)
+        const primaryUrl = activeUrls[0] ?? `http://${handle.host}:${handle.port}`
         if (jsonMode) {
           process.stdout.write(
             serializeWire(
               wireNode({
                 serving: true,
                 url: primaryUrl,
-                urls: handle.urls,
+                urls: activeUrls,
                 port: handle.port,
                 host: handle.host,
                 hosts: handle.hosts,
@@ -2036,7 +2059,7 @@ export async function executeMemoCli(
           )
         } else {
           process.stdout.write(
-            `memoseb sync node serving on ${primaryUrl} (role=${vault.getNodeConfig().role})\nPress Ctrl+C to stop.\n`,
+            `memoseb sync node serving on ${activeUrls.join(', ')} (role=${vault.getNodeConfig().role})\nPress Ctrl+C to stop.\n`,
           )
         }
 
@@ -2050,6 +2073,7 @@ export async function executeMemoCli(
             await loop?.close()
             await handle.close()
             removeServePidFile(pidFile)
+            removeActiveListen(stateFiles.activeFile)
             resolve()
           }
           process.on('SIGINT', cleanup)

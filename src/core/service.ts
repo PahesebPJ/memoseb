@@ -29,10 +29,12 @@ export function serveStateFiles(dbPath: string): {
   pidFile: string
   serviceMarker: string
   firewallMarker: string
+  activeFile: string
 } {
   const dir = path.dirname(path.resolve(dbPath))
   const id = serviceIdentity(dbPath)
   return {
+    activeFile: path.join(dir, `node-serve-${id}.json`),
     logFile: path.join(dir, `node-serve-${id}.log`),
     pidFile: path.join(dir, `node-serve-${id}.pid`),
     serviceMarker: path.join(dir, `node-service-${id}.json`),
@@ -417,6 +419,44 @@ export function writeServePidFile(file: string, pid: number = process.pid): stri
     // Sin archivo de pid el servicio sigue funcionando
   }
   return file
+}
+
+export interface ActiveListen {
+  pid: number
+  hosts: string[]
+  port: number
+  urls: string[]
+  startedAt: string
+}
+
+/** Direcciones efectivas del `serve` en curso (distintas de la config guardada). */
+export function writeActiveListen(file: string, active: ActiveListen): void {
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true })
+    fs.writeFileSync(file, JSON.stringify(active, null, 2), 'utf-8')
+  } catch {
+    // Sin el archivo, node status solo muestra la config
+  }
+}
+
+/** Lee el serve activo; null si no hay archivo o el proceso ya no vive. */
+export function readActiveListen(file: string): ActiveListen | null {
+  try {
+    const data = JSON.parse(fs.readFileSync(file, 'utf-8')) as ActiveListen
+    if (!Number.isInteger(data.pid) || !isAlive(data.pid)) return null
+    return data
+  } catch {
+    return null
+  }
+}
+
+export function removeActiveListen(file: string, pid: number = process.pid): void {
+  try {
+    const data = JSON.parse(fs.readFileSync(file, 'utf-8')) as ActiveListen
+    if (data.pid === pid) fs.rmSync(file, { force: true })
+  } catch {
+    // ignore missing file
+  }
 }
 
 export function removeServePidFile(file: string, pid: number = process.pid): void {

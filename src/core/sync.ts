@@ -250,6 +250,26 @@ export function getLocalLanUrls(port: number): string[] {
   return Array.from(new Set(urls))
 }
 
+/**
+ * URLs en las que el servidor escucha de verdad: un host comodín se expande a
+ * las IPv4 locales; un host concreto se muestra tal cual.
+ */
+export function listenUrls(
+  hosts: readonly string[],
+  port: number,
+  lanUrls: (port: number) => string[] = getLocalLanUrls
+): string[] {
+  const urls: string[] = []
+  for (const host of hosts) {
+    if (host === '0.0.0.0' || host === '::') {
+      urls.push(...lanUrls(port), `http://127.0.0.1:${port}`)
+    } else {
+      urls.push(`http://${host.includes(':') ? `[${host}]` : host}:${port}`)
+    }
+  }
+  return Array.from(new Set(urls))
+}
+
 export function isLoopbackHost(host: string | null | undefined): boolean {
   if (!host) return false
   const h = host.trim().toLowerCase().replace(/^\[|\]$/g, '')

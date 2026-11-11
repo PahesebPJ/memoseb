@@ -20,7 +20,7 @@ import type {
   VaultStats
 } from '../src/core/vault.ts'
 import { MemoryVault } from '../src/core/vault.ts'
-import { startSyncServer } from '../src/core/sync.ts'
+import { listenUrls, startSyncServer } from '../src/core/sync.ts'
 import { serveStateFiles, serviceNames } from '../src/core/service.ts'
 import { handleMcpRequest } from '../src/mcp/server.ts'
 import { deployMemoseb } from '../src/setup.ts'
@@ -2090,6 +2090,17 @@ describe('CLI node service, token policy and auto-sync serve', () => {
     assert.ok(failed.stderr.includes('Could not start'))
   })
 
+  it('reports only the addresses serve really listens on', () => {
+    const lan = (port: number) => [`http://172.16.9.63:${port}`]
+    assert.deepEqual(listenUrls(['127.0.0.1'], 17433, lan), ['http://127.0.0.1:17433'])
+    assert.deepEqual(listenUrls(['100.80.0.28', '127.0.0.1'], 7432, lan), [
+      'http://100.80.0.28:7432',
+      'http://127.0.0.1:7432'
+    ])
+    assert.deepEqual(listenUrls(['::1'], 7432, lan), ['http://[::1]:7432'])
+    assert.deepEqual(listenUrls(['0.0.0.0'], 7432, lan), ['http://172.16.9.63:7432', 'http://127.0.0.1:7432'])
+  })
+
   it('serves with the auto-sync loop and shuts down cleanly on abort', async () => {
     const runtime = makeRuntime('darwin')
     await executeMemoCli(['node', 'enable', '--role', 'peer', '--token', 'tok'], { runtime, dbPath })
@@ -2125,10 +2136,30 @@ describe('CLI node service, token policy and auto-sync serve', () => {
       assert.equal(probe.getStats().memoryCount, 1)
       assert.ok(fs.existsSync(serveStateFiles(dbPath).pidFile))
       probe.close()
+
+      // node status distingue la config guardada de lo que escucha el serve en curso
+      type StatusPayload = {
+        config: { listenHost: string; listenPort: number }
+        activeListen: { hosts: string[]; port: number; urls: string[]; pid: number } | null
+      }
+      const live = await executeMemoCli(['node', 'status', '--json'], { runtime, dbPath })
+      const livePacket = decodeWire<StatusPayload>(live.stdout) as WireSuccess<StatusPayload>
+      const active = livePacket.payload.activeListen
+      assert.ok(active)
+      assert.deepEqual(active.hosts, ['127.0.0.1'])
+      assert.notEqual(active.port, 0)
+      assert.deepEqual(active.urls, [`http://127.0.0.1:${active.port}`], 'only the addresses it really listens on')
+      assert.equal(active.pid, process.pid)
+      const liveText = await executeMemoCli(['node', 'status'], { runtime, dbPath })
+      assert.ok(liveText.stdout.includes('(saved config)'))
+      assert.ok(liveText.stdout.includes(`Active:      http://127.0.0.1:${active.port}`))
+
       controller.abort()
       const res = await serving
       assert.equal(res.exitCode, 0)
       assert.ok(!fs.existsSync(serveStateFiles(dbPath).pidFile))
+      const stopped = await executeMemoCli(['node', 'status', '--json'], { runtime, dbPath })
+      assert.equal((decodeWire<StatusPayload>(stopped.stdout) as WireSuccess<StatusPayload>).payload.activeListen, null)
     } finally {
       controller.abort()
       await remoteServer.close()
