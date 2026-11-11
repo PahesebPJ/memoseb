@@ -45,6 +45,11 @@ export interface ImportOptions {
   strategy?: 'merge' | 'replace'
   projectId?: string
   includeTombstones?: boolean
+  /**
+   * Permiso por proyecto/categoría del emisor. Un update o tombstone solo se
+   * aplica si se permite tanto el proyecto entrante como el de la fila local.
+   */
+  canApply?: (projectId: string, category?: string) => boolean
 }
 
 export interface ImportResult {

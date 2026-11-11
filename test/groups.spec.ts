@@ -145,17 +145,22 @@ describe('Sync Groups & ACL Permissions: Vault CRUD and Network Enforcement', ()
 
         // Pre-register a peer in sync_peers to test automatic peer_node_id linking
         const peerNodeId = crypto.randomUUID()
-        vault.upsertPeer({
+        const registeredPeer = vault.upsertPeer({
           role: 'child',
           url: 'http://127.0.0.1:4040',
           name: 'Child-Infra-4040',
           peerNodeId
         })
 
-        // Adding peer URL automatically links its peerNodeId as well
+        // La membresía de un peer registrado se guarda por su identidad local
+        // (id y URL), nunca por el nodeId que declaró
         const afterAdd = vault.addNodeToGroup('infra-ops', 'http://127.0.0.1:4040')
         assert.ok(afterAdd.memberNodeIds.includes('http://127.0.0.1:4040'))
-        assert.ok(afterAdd.memberNodeIds.includes(peerNodeId))
+        assert.ok(afterAdd.memberNodeIds.includes(registeredPeer.id))
+        assert.ok(!afterAdd.memberNodeIds.includes(peerNodeId))
+        assert.deepEqual(vault.getPeerGroups([peerNodeId]), [])
+        assert.deepEqual(vault.getPeerGroups(['Child-Infra-4040']), [])
+        assert.equal(vault.getPeerGroups([registeredPeer.id])[0]?.name, 'infra-ops')
 
         // Adding arbitrary identifier
         const arbitraryNode = 'custom-worker-node-1'
@@ -190,6 +195,37 @@ describe('Sync Groups & ACL Permissions: Vault CRUD and Network Enforcement', ()
           () => vault.removeNodeFromGroup('infra-ops', '   '),
           /Peer identifier cannot be empty/
         )
+      } finally {
+        vault.close()
+        fs.rmSync(tmpDir, { recursive: true, force: true })
+      }
+    })
+
+    it('reports legacy memberships stored by node id or name and clears them once re-added by url', () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'memoseb-groups-stale-'))
+      const vault = new MemoryVault({ dbPath: path.join(tmpDir, 'test.sqlite') })
+
+      try {
+        vault.upsertGroup({ name: 'legacy-ops' })
+        vault.upsertGroup({ name: 'named-ops' })
+        const legacyNodeId = crypto.randomUUID()
+        vault.addNodeToGroup('legacy-ops', legacyNodeId)
+        vault.addNodeToGroup('named-ops', 'Laptop-B')
+        vault.addNodeToGroup('named-ops', 'unregistered-worker')
+        vault.upsertPeer({ role: 'peer', url: 'http://100.64.0.7:7438', name: 'Laptop-B', peerNodeId: legacyNodeId })
+
+        assert.deepEqual(vault.listStaleGroupMembers(), [
+          { group: 'legacy-ops', identifier: legacyNodeId, peerUrl: 'http://100.64.0.7:7438' },
+          { group: 'named-ops', identifier: 'Laptop-B', peerUrl: 'http://100.64.0.7:7438' }
+        ])
+
+        vault.addNodeToGroup('legacy-ops', 'http://100.64.0.7:7438')
+        assert.deepEqual(
+          vault.listStaleGroupMembers().map((m) => m.group),
+          ['named-ops']
+        )
+        vault.addNodeToGroup('named-ops', 'http://100.64.0.7:7438')
+        assert.deepEqual(vault.listStaleGroupMembers(), [])
       } finally {
         vault.close()
         fs.rmSync(tmpDir, { recursive: true, force: true })
@@ -294,6 +330,8 @@ describe('Sync Groups & ACL Permissions: Vault CRUD and Network Enforcement', ()
         projects: ['proyecto-x'],
         permissions: 'readwrite'
       })
+      // La membresía se resuelve por el peer registrado localmente (no por el nodeId declarado)
+      parentVault.upsertPeer({ role: 'child', url: 'http://127.0.0.1:41001', peerNodeId: childXVault.getNodeId() })
       parentVault.addNodeToGroup('grupo-x', childXVault.getNodeId())
 
       parentVault.upsertGroup({
@@ -301,6 +339,8 @@ describe('Sync Groups & ACL Permissions: Vault CRUD and Network Enforcement', ()
         projects: ['proyecto-y'],
         permissions: 'readwrite'
       })
+      // La membresía se resuelve por el peer registrado localmente (no por el nodeId declarado)
+      parentVault.upsertPeer({ role: 'child', url: 'http://127.0.0.1:41002', peerNodeId: childYVault.getNodeId() })
       parentVault.addNodeToGroup('grupo-y', childYVault.getNodeId())
 
       const parentServer = await startSyncServer(parentVault, {
@@ -381,6 +421,8 @@ describe('Sync Groups & ACL Permissions: Vault CRUD and Network Enforcement', ()
         const childYUrl = `http://127.0.0.1:${childYServer.port}`
 
         // Register children as peers on Father with their endpoints
+        parentVault.removePeer('http://127.0.0.1:41001')
+        parentVault.removePeer('http://127.0.0.1:41002')
         parentVault.upsertPeer({
           role: 'child',
           url: childXUrl,
@@ -464,6 +506,8 @@ describe('Sync Groups & ACL Permissions: Vault CRUD and Network Enforcement', ()
         categories: ['architecture'],
         permissions: 'readonly'
       })
+      // La membresía se resuelve por el peer registrado localmente (no por el nodeId declarado)
+      parentVault.upsertPeer({ role: 'child', url: 'http://127.0.0.1:41003', peerNodeId: childReadonlyVault.getNodeId() })
       parentVault.addNodeToGroup('core-readers', childReadonlyVault.getNodeId())
 
       // Setup writeonly group for telemetry / audit logging
@@ -472,6 +516,8 @@ describe('Sync Groups & ACL Permissions: Vault CRUD and Network Enforcement', ()
         projects: ['core-platform'],
         permissions: 'writeonly'
       })
+      // La membresía se resuelve por el peer registrado localmente (no por el nodeId declarado)
+      parentVault.upsertPeer({ role: 'child', url: 'http://127.0.0.1:41004', peerNodeId: childWriteonlyVault.getNodeId() })
       parentVault.addNodeToGroup('audit-writers', childWriteonlyVault.getNodeId())
 
       const parentServer = await startSyncServer(parentVault, {
@@ -637,10 +683,10 @@ describe('Sync Groups & ACL Permissions: Vault CRUD and Network Enforcement', ()
         assert.equal(handshakeRes.status, 'paired')
         assert.deepEqual(handshakeRes.assignedGroups, ['equipo-alpha'])
 
-        // Father has auto-enrolled Child Alpha into equipo-alpha
+        // El token de grupo da acceso, pero el nodeId declarado en el cuerpo no se inscribe
         const groupAfterHandshake = parentVault.getGroup('equipo-alpha')
         assert.ok(groupAfterHandshake)
-        assert.ok(groupAfterHandshake.memberNodeIds.includes(childAlphaVault.getNodeId()))
+        assert.ok(!groupAfterHandshake.memberNodeIds.includes(childAlphaVault.getNodeId()))
 
         // Child Alpha syncs with Father
         const syncRes = await syncWithPeer(childAlphaVault, {

@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict'
+import { computeMemoryContentHash } from '../src/core/p2p-contract.ts'
+import crypto from 'node:crypto'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -420,5 +422,154 @@ describe('Vault Snapshot Engine: Export, Import, Tamper Detection, and Merging S
 
     const p3AfterGlobal = vaultB.recallMemories('Global Only', { projectId: 'project-three' })
     assert.equal(p3AfterGlobal.memories.length, 1)
+  })
+
+  it('moves an existing memory to the incoming project and recalculates content_hash when the incoming record wins', () => {
+    const stored = vaultA.storeMemory({
+      projectId: 'alpha',
+      category: 'decision',
+      content: 'Releases are cut from main every Friday.'
+    })
+    vaultB.importSnapshot(vaultA.exportSnapshot())
+
+    const rewrite = (patch: Partial<VaultSnapshotV1['memories'][number]>) => {
+      const base = vaultA.exportSnapshot()
+      const memories = base.memories.map((m) => ({ ...m, ...patch }))
+      const projects = [
+        ...base.projects,
+        { id: 'beta', name: 'beta', rootPath: '/tmp/beta', updatedAt: '2030-01-01T00:00:00.000Z' }
+      ]
+      const { checksum: _ignored, ...rest } = base
+      const next = { ...rest, memories, projects }
+      return { ...next, checksum: computeSnapshotChecksum(next) }
+    }
+    const hashOf = (project: string, category: string, content: string) =>
+      crypto.createHash('sha256').update(`${project}:${category}:${content.trim()}`).digest('hex')
+
+    const moved = vaultB.importSnapshot(
+      rewrite({ projectId: 'beta', updatedAt: '2030-01-01T00:00:00.000Z' })
+    )
+    assert.equal(moved.memoriesUpdated, 1)
+    let row = vaultB.exportSnapshot().memories.find((m) => m.id === stored.memory.id)
+    assert.ok(row)
+    assert.equal(row.projectId, 'beta')
+    assert.equal(row.contentHash, hashOf('beta', 'decision', 'Releases are cut from main every Friday.'))
+    assert.equal(vaultB.recallMemories('Friday', { projectId: 'beta' }).memories.length, 1)
+    assert.equal(vaultB.recallMemories('Friday', { projectId: 'alpha' }).memories.length, 0)
+
+    const edited = vaultB.importSnapshot(
+      rewrite({
+        projectId: 'beta',
+        content: 'Releases are cut from main every Thursday.',
+        updatedAt: '2030-01-02T00:00:00.000Z'
+      })
+    )
+    assert.equal(edited.memoriesUpdated, 1)
+    row = vaultB.exportSnapshot().memories.find((m) => m.id === stored.memory.id)
+    assert.ok(row)
+    assert.equal(row.content, 'Releases are cut from main every Thursday.')
+    assert.equal(row.contentHash, hashOf('beta', 'decision', 'Releases are cut from main every Thursday.'))
+
+    const dedupe = vaultB.storeMemory({
+      projectId: 'beta',
+      category: 'decision',
+      content: 'Releases are cut from main every Thursday.'
+    })
+    assert.equal(dedupe.memory.id, stored.memory.id)
+
+    const stale = vaultB.importSnapshot(
+      rewrite({ projectId: 'alpha', updatedAt: '2020-01-01T00:00:00.000Z' })
+    )
+    assert.equal(stale.memoriesUpdated, 0)
+    row = vaultB.exportSnapshot().memories.find((m) => m.id === stored.memory.id)
+    assert.equal(row?.projectId, 'beta')
+  })
+
+  it('keeps the memory in place when the target project already holds the same content', () => {
+    const original = vaultA.storeMemory({
+      projectId: 'alpha',
+      category: 'convention',
+      content: 'Use pnpm in every repository.'
+    })
+    vaultB.importSnapshot(vaultA.exportSnapshot())
+    const twin = vaultB.storeMemory({
+      projectId: 'beta',
+      category: 'convention',
+      content: 'Use pnpm in every repository.'
+    })
+    assert.notEqual(twin.memory.id, original.memory.id)
+
+    const base = vaultA.exportSnapshot()
+    const { checksum: _ignored, ...rest } = base
+    const next = {
+      ...rest,
+      memories: base.memories.map((m) => ({ ...m, projectId: 'beta', updatedAt: '2030-01-01T00:00:00.000Z' }))
+    }
+    const result = vaultB.importSnapshot({ ...next, checksum: computeSnapshotChecksum(next) })
+    assert.equal(result.memoriesUpdated, 1)
+    const rows = vaultB.exportSnapshot().memories
+    assert.equal(rows.find((m) => m.id === original.memory.id)?.projectId, 'alpha')
+    assert.equal(rows.find((m) => m.id === twin.memory.id)?.projectId, 'beta')
+  })
+
+  it('exports changes made in the same millisecond as the since mark', () => {
+    // Causa del fallo intermitente de la propagación de tombstones: un forget en
+    // el mismo ms que el último sync quedaba fuera de `deleted_at > since`.
+    const stored = vaultA.storeMemory({ projectId: 'edge', category: 'domain', content: 'Same millisecond.' })
+    const since = stored.memory.updatedAt
+    assert.equal(vaultA.exportSnapshot({ since }).memories.length, 1)
+    assert.equal(vaultA.forgetMemory(stored.memory.id), true)
+    const tombstone = vaultA.exportSnapshot().tombstones.find((t) => t.memoryId === stored.memory.id)!
+    const delta = vaultA.exportSnapshot({ since: tombstone.deletedAt })
+    assert.ok(delta.tombstones.some((t) => t.memoryId === stored.memory.id))
+
+    vaultB.importSnapshot(vaultA.exportSnapshot())
+    const again = vaultB.importSnapshot(vaultA.exportSnapshot({ since: tombstone.deletedAt }))
+    assert.equal(again.memoriesUpdated + again.memoriesCreated + again.tombstonesApplied, 0, 're-sending the edge is idempotent')
+  })
+
+  it('never leaves new content with an old hash when a moved and edited memory collides', () => {
+    const original = vaultA.storeMemory({ projectId: 'alpha', category: 'convention', content: 'Old wording.' })
+    vaultB.importSnapshot(vaultA.exportSnapshot())
+    vaultB.storeMemory({ projectId: 'beta', category: 'convention', content: 'New wording.' })
+
+    const base = vaultA.exportSnapshot()
+    const { checksum: _ignored, ...rest } = base
+    const edited = {
+      ...rest,
+      memories: base.memories.map((m) => ({
+        ...m,
+        projectId: 'beta',
+        content: 'New wording.',
+        updatedAt: '2030-01-01T00:00:00.000Z'
+      }))
+    }
+    const result = vaultB.importSnapshot({ ...edited, checksum: computeSnapshotChecksum(edited) })
+    assert.equal(result.memoriesUpdated, 1)
+    const moved = vaultB.exportSnapshot().memories.find((m) => m.id === original.memory.id)!
+    assert.equal(moved.projectId, 'alpha')
+    assert.equal(moved.content, 'New wording.')
+    assert.equal(moved.contentHash, computeMemoryContentHash('alpha', 'convention', 'New wording.'))
+    for (const m of vaultB.exportSnapshot().memories) {
+      assert.equal(m.contentHash, computeMemoryContentHash(m.projectId, m.category, m.content))
+    }
+
+    vaultB.storeMemory({ projectId: 'alpha', category: 'convention', content: 'Third wording.' })
+    vaultB.storeMemory({ projectId: 'beta', category: 'convention', content: 'Third wording.' })
+    const again = {
+      ...rest,
+      memories: base.memories.map((m) => ({
+        ...m,
+        projectId: 'beta',
+        content: 'Third wording.',
+        updatedAt: '2031-01-01T00:00:00.000Z'
+      }))
+    }
+    const skipped = vaultB.importSnapshot({ ...again, checksum: computeSnapshotChecksum(again) })
+    assert.equal(skipped.memoriesUpdated, 0)
+    assert.equal(skipped.memoriesSkipped, 1)
+    const kept = vaultB.exportSnapshot().memories.find((m) => m.id === original.memory.id)!
+    assert.equal(kept.content, 'New wording.')
+    assert.equal(kept.contentHash, computeMemoryContentHash('alpha', 'convention', 'New wording.'))
   })
 })

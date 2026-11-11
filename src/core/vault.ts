@@ -15,6 +15,10 @@ import { detectProject, slugifyProjectId } from './project-detector.ts'
 import {
   isGroupPermissionMode,
   isMemoryCategory,
+  clampSyncInterval,
+  DEFAULT_SYNC_INTERVAL_MINUTES,
+  MAX_SYNC_INTERVAL_MINUTES,
+  MIN_SYNC_INTERVAL_MINUTES,
   isUnassignedGroupPolicy,
   normalizeNodeRole,
   normalizePeerRole,
@@ -30,6 +34,7 @@ import {
   type UnassignedGroupPolicy
 } from './schema.ts'
 import {
+  computeMemoryContentHash,
   isP2PContractPayload,
   p2pPayloadToSnapshot,
   snapshotToP2PPayload,
@@ -257,6 +262,20 @@ function mapRowToPeerRecord(row: RawPeerRow): SyncPeerRecord {
   }
 }
 
+/**
+ * Ruta de la bóveda con la misma precedencia que MemoryVault, sin abrir la base.
+ */
+export function resolveVaultDbPath(
+  runtime: SystemRuntime,
+  dbPath?: string
+): string {
+  return (
+    dbPath ??
+    runtime.env.MEMOSEB_DB_PATH ??
+    path.join(runtime.stateRoot, '..', 'memoseb', 'vault.sqlite')
+  )
+}
+
 export class MemoryVault {
   readonly dbPath: string
   private readonly db: DatabaseSync
@@ -269,12 +288,62 @@ export class MemoryVault {
     embedder?: EmbeddingProvider
   }) {
     this.runtime = options?.runtime ?? new SystemRuntime()
-    this.dbPath =
-      options?.dbPath ??
-      this.runtime.env.MEMOSEB_DB_PATH ??
-      path.join(this.runtime.stateRoot, '..', 'memoseb', 'vault.sqlite')
+    this.dbPath = resolveVaultDbPath(this.runtime, options?.dbPath)
     this.db = openVaultDatabase(this.dbPath)
     this.embedder = options?.embedder ?? new LocalFeatureHashEmbedder()
+    this.migrateContentHashes()
+  }
+
+  /**
+   * Migración única: alinea memories.content_hash con la fórmula del contrato
+   * (sha256(project:category:content.trim())). Las filas cuyo hash nuevo
+   * chocaría con el UNIQUE (project_id, content_hash) se dejan como están.
+   */
+  private migrateContentHashes(): { updated: number; skipped: number } {
+    const key = 'migration.content_hash_v1'
+    const done = this.db
+      .prepare(`SELECT value FROM node_meta WHERE key = ?`)
+      .get(key) as { value: string } | undefined
+    if (done) return { updated: 0, skipped: 0 }
+    let updated = 0
+    let skipped = 0
+    this.db.exec('BEGIN IMMEDIATE;')
+    try {
+      const rows = this.db
+        .prepare(`SELECT id, project_id, category, content, content_hash FROM memories`)
+        .all() as Array<{
+        id: string
+        project_id: string
+        category: string
+        content: string
+        content_hash: string
+      }>
+      const conflict = this.db.prepare(
+        `SELECT id FROM memories WHERE project_id = ? AND content_hash = ? AND id <> ? LIMIT 1`
+      )
+      const update = this.db.prepare(`UPDATE memories SET content_hash = ? WHERE id = ?`)
+      for (const row of rows) {
+        const next = computeMemoryContentHash(row.project_id, row.category, row.content)
+        if (next === row.content_hash) continue
+        if (conflict.get(row.project_id, next, row.id)) {
+          skipped++
+          continue
+        }
+        update.run(next, row.id)
+        updated++
+      }
+      this.db
+        .prepare(
+          `INSERT INTO node_meta (key, value, updated_at) VALUES (?, ?, ?)
+           ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`
+        )
+        .run(key, JSON.stringify({ updated, skipped }), new Date().toISOString())
+      this.db.exec('COMMIT;')
+    } catch (err) {
+      this.db.exec('ROLLBACK;')
+      throw err
+    }
+    return { updated, skipped }
   }
 
   private get runtimeEnvToken(): string | null {
@@ -850,6 +919,23 @@ export class MemoryVault {
     const unassignedGroupPolicy: UnassignedGroupPolicy =
       rawUnassigned === 'all' ? 'all' : 'none'
 
+    const rawInterval = Number(
+      meta.get('node.sync_interval_min') ??
+        this.runtime.env.MEMOSEB_SYNC_INTERVAL_MIN ??
+        process.env.MEMOSEB_SYNC_INTERVAL_MIN
+    )
+    const syncIntervalMinutes =
+      Number.isFinite(rawInterval) && rawInterval > 0
+        ? clampSyncInterval(rawInterval)
+        : DEFAULT_SYNC_INTERVAL_MINUTES
+
+    const rawTailscale = meta.get('node.tailscale_discovery')
+    const tailscaleDiscovery =
+      rawTailscale !== undefined ? rawTailscale === 'true' : true
+    const rawTailscaleBin = meta.get('node.tailscale_bin')?.trim()
+    const tailscaleBin =
+      rawTailscaleBin && rawTailscaleBin.length > 0 ? rawTailscaleBin : null
+
     return {
       nodeId,
       nodeName,
@@ -860,7 +946,10 @@ export class MemoryVault {
       authToken,
       autoSync,
       lanDiscovery,
-      unassignedGroupPolicy
+      unassignedGroupPolicy,
+      syncIntervalMinutes,
+      tailscaleDiscovery,
+      tailscaleBin
     }
   }
 
@@ -905,6 +994,28 @@ export class MemoryVault {
     if (patch.lanDiscovery !== undefined) {
       upsert.run('node.lan_discovery', String(patch.lanDiscovery), now)
     }
+    if (patch.syncIntervalMinutes !== undefined) {
+      if (
+        !Number.isFinite(patch.syncIntervalMinutes) ||
+        patch.syncIntervalMinutes < MIN_SYNC_INTERVAL_MINUTES ||
+        patch.syncIntervalMinutes > MAX_SYNC_INTERVAL_MINUTES
+      ) {
+        throw new Error(
+          `syncIntervalMinutes must be between ${MIN_SYNC_INTERVAL_MINUTES} and ${MAX_SYNC_INTERVAL_MINUTES}.`
+        )
+      }
+      upsert.run('node.sync_interval_min', String(patch.syncIntervalMinutes), now)
+    }
+    if (patch.tailscaleDiscovery !== undefined) {
+      upsert.run('node.tailscale_discovery', String(patch.tailscaleDiscovery), now)
+    }
+    if (patch.tailscaleBin !== undefined) {
+      if (patch.tailscaleBin === null || patch.tailscaleBin.trim() === '') {
+        del.run('node.tailscale_bin')
+      } else {
+        upsert.run('node.tailscale_bin', patch.tailscaleBin.trim(), now)
+      }
+    }
     if (patch.unassignedGroupPolicy !== undefined) {
       const policyVal: UnassignedGroupPolicy =
         patch.unassignedGroupPolicy === 'all' ? 'all' : 'none'
@@ -929,8 +1040,20 @@ export class MemoryVault {
     authToken?: string | null
     autoSync?: boolean
     lanDiscovery?: boolean
+    syncIntervalMinutes?: number
+    tailscaleDiscovery?: boolean
+    tailscaleBin?: string | null
   }): NodeConfiguration {
     return this.updateNodeConfig({
+      ...(options.syncIntervalMinutes !== undefined
+        ? { syncIntervalMinutes: options.syncIntervalMinutes }
+        : {}),
+      ...(options.tailscaleDiscovery !== undefined
+        ? { tailscaleDiscovery: options.tailscaleDiscovery }
+        : {}),
+      ...(options.tailscaleBin !== undefined
+        ? { tailscaleBin: options.tailscaleBin }
+        : {}),
       enabled: true,
       role: normalizeNodeRole(options.role),
       ...(options.nodeName !== undefined ? { nodeName: options.nodeName } : {}),
@@ -1056,9 +1179,22 @@ export class MemoryVault {
     return mapRowToPeerRecord(inserted)
   }
 
-  removePeer(urlOrId: string): boolean {
+  removePeer(urlOrId: string, options?: { exclude?: boolean }): boolean {
     const trimmed = urlOrId.trim()
     const normalizedUrl = trimmed.replace(/\/+$/, '')
+    if (options?.exclude) {
+      const rows = this.db
+        .prepare(
+          `SELECT peer_node_id FROM sync_peers
+           WHERE id = ? OR peer_node_id = ? OR name = ? OR url = ? OR url = ?`
+        )
+        .all(trimmed, trimmed, trimmed, trimmed, normalizedUrl) as Array<{
+        peer_node_id: string | null
+      }>
+      for (const row of rows) {
+        if (row.peer_node_id) this.excludePeer(row.peer_node_id)
+      }
+    }
     const res = this.db
       .prepare(
         `DELETE FROM sync_peers
@@ -1066,6 +1202,42 @@ export class MemoryVault {
       )
       .run(trimmed, trimmed, trimmed, trimmed, normalizedUrl)
     return res.changes > 0
+  }
+
+  /** nodeIds que la discovery no vuelve a registrar (`node remove`). */
+  getExcludedPeerIds(): string[] {
+    const row = this.db
+      .prepare(`SELECT value FROM node_meta WHERE key = 'node.excluded_peers'`)
+      .get() as { value: string } | undefined
+    if (!row) return []
+    try {
+      const parsed = JSON.parse(row.value)
+      return Array.isArray(parsed) ? parsed.filter((v) => typeof v === 'string') : []
+    } catch {
+      return []
+    }
+  }
+
+  excludePeer(nodeId: string): void {
+    this.writeExcludedPeers([...this.getExcludedPeerIds(), nodeId.trim()])
+  }
+
+  includePeer(nodeId: string): void {
+    this.writeExcludedPeers(this.getExcludedPeerIds().filter((id) => id !== nodeId.trim()))
+  }
+
+  private writeExcludedPeers(ids: string[]): void {
+    const unique = Array.from(new Set(ids.filter((id) => id.length > 0)))
+    if (unique.length === 0) {
+      this.db.prepare(`DELETE FROM node_meta WHERE key = 'node.excluded_peers'`).run()
+      return
+    }
+    this.db
+      .prepare(
+        `INSERT INTO node_meta (key, value, updated_at) VALUES ('node.excluded_peers', ?, ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`
+      )
+      .run(JSON.stringify(unique), new Date().toISOString())
   }
 
   listPeers(role?: PeerRole | 'p2p'): SyncPeerRecord[] {
@@ -1335,10 +1507,13 @@ export class MemoryVault {
       | RawPeerRow
       | undefined
 
+    // Si el identificador corresponde a un peer registrado, la membresía se
+    // guarda por su identidad local (id y URL), que es lo que se resuelve en red
     const identifiersToInsert = new Set<string>()
     identifiersToInsert.add(trimmedId)
-    if (peer?.peer_node_id) {
-      identifiersToInsert.add(peer.peer_node_id)
+    if (peer) {
+      identifiersToInsert.add(peer.id)
+      identifiersToInsert.add(peer.url.replace(/\/+$/, ''))
     }
 
     const now = new Date().toISOString()
@@ -1421,22 +1596,19 @@ export class MemoryVault {
       .prepare(`SELECT * FROM sync_peers`)
       .all() as unknown as RawPeerRow[]
 
+    // Solo la identidad del peer registrado localmente (id, URL o su IP):
+    // nunca su nombre ni el nodeId que declaró en un handshake
     for (const peer of peerRows) {
       const normUrl = peer.url.replace(/\/+$/, '')
-      const matches =
-        searchIds.has(peer.id) ||
-        (peer.peer_node_id !== null && searchIds.has(peer.peer_node_id)) ||
-        searchIds.has(peer.name) ||
-        searchIds.has(peer.url) ||
-        searchIds.has(normUrl)
-
+      const matches = searchIds.has(peer.id) || searchIds.has(peer.url) || searchIds.has(normUrl)
       if (matches) {
-        if (peer.id) searchIds.add(peer.id)
-        if (peer.peer_node_id) searchIds.add(peer.peer_node_id)
-        if (peer.name) searchIds.add(peer.name)
-        if (peer.url) {
-          searchIds.add(peer.url)
-          searchIds.add(normUrl)
+        searchIds.add(peer.id)
+        searchIds.add(peer.url)
+        searchIds.add(normUrl)
+        try {
+          searchIds.add(new URL(peer.url).hostname.replace(/^\[|\]$/g, ''))
+        } catch {
+          // URL inválida: solo id y URL
         }
       }
     }
@@ -1454,6 +1626,48 @@ export class MemoryVault {
       .all(...idList) as unknown as RawGroupRow[]
 
     return groupRows.map((r) => this.mapRowToGroupRecord(r))
+  }
+
+  listStaleGroupMembers(): Array<{ group: string; identifier: string; peerUrl: string }> {
+    const peerRows = this.db
+      .prepare(`SELECT * FROM sync_peers`)
+      .all() as unknown as RawPeerRow[]
+    const memberRows = this.db
+      .prepare(
+        `SELECT g.name AS group_name, m.group_id, m.peer_identifier
+         FROM sync_group_members m JOIN sync_groups g ON g.id = m.group_id
+         ORDER BY g.name ASC, m.peer_identifier ASC`
+      )
+      .all() as unknown as Array<{ group_name: string; group_id: string; peer_identifier: string }>
+
+    const localIdentity = (peer: RawPeerRow): Set<string> => {
+      const ids = new Set<string>([peer.id, peer.url, peer.url.replace(/\/+$/, '')])
+      if (URL.canParse(peer.url)) {
+        ids.add(new URL(peer.url).hostname.replace(/^\[|\]$/g, ''))
+      }
+      return ids
+    }
+
+    const membersByGroup = new Map<string, Set<string>>()
+    for (const row of memberRows) {
+      const set = membersByGroup.get(row.group_id) ?? new Set<string>()
+      set.add(row.peer_identifier)
+      membersByGroup.set(row.group_id, set)
+    }
+
+    const stale: Array<{ group: string; identifier: string; peerUrl: string }> = []
+    for (const row of memberRows) {
+      const members = membersByGroup.get(row.group_id)!
+      for (const peer of peerRows) {
+        const identity = localIdentity(peer)
+        if (identity.has(row.peer_identifier)) continue
+        const legacy = row.peer_identifier === peer.peer_node_id || row.peer_identifier === peer.name
+        if (!legacy) continue
+        if ([...identity].some((id) => members.has(id))) continue
+        stale.push({ group: row.group_name, identifier: row.peer_identifier, peerUrl: peer.url })
+      }
+    }
+    return stale
   }
 
   findGroupByToken(token: string | null | undefined): SyncGroupRecord | null {
@@ -1506,12 +1720,7 @@ export class MemoryVault {
       }
     }
 
-    const memberGroups = this.getPeerGroups([
-      input?.peerId,
-      input?.peerNodeId,
-      input?.peerName,
-      input?.peerUrl
-    ])
+    const memberGroups = this.getPeerGroups([input?.peerId, input?.peerUrl])
 
     if (input?.matchedGroupByToken && input.matchedGroupByToken.trim()) {
       const tokenGroup =
@@ -1655,8 +1864,11 @@ export class MemoryVault {
       memoriesSql += ' AND project_id = ?'
       memoriesParams.push(targetProjectId)
     }
+    // >= y no >: la marca `since` tiene resolución de milisegundos y un cambio
+    // hecho en el mismo milisegundo que el último sync se perdía. Reenviar el
+    // borde es idempotente (LWW lo descarta).
     if (since) {
-      memoriesSql += ' AND updated_at > ?'
+      memoriesSql += ' AND updated_at >= ?'
       memoriesParams.push(since)
     }
     memoriesSql += ' ORDER BY created_at ASC, id ASC'
@@ -1674,7 +1886,7 @@ export class MemoryVault {
         tombstonesParams.push(targetProjectId)
       }
       if (since) {
-        tombstonesSql += ' AND deleted_at > ?'
+        tombstonesSql += ' AND deleted_at >= ?'
         tombstonesParams.push(since)
       }
       tombstonesSql += ' ORDER BY deleted_at ASC, memory_id ASC'
@@ -1718,7 +1930,7 @@ export class MemoryVault {
       }
     } else if (since) {
       const pRows = this.db
-        .prepare(`SELECT * FROM projects WHERE updated_at > ?`)
+        .prepare(`SELECT * FROM projects WHERE updated_at >= ?`)
         .all(since) as unknown as Array<{
         id: string
         name: string
@@ -1829,6 +2041,18 @@ export class MemoryVault {
       ? slugifyProjectId(options.projectId)
       : snapshot.projectFilter
     const includeTombstones = options?.includeTombstones !== false
+    const canApply = options?.canApply
+    const localById = this.db.prepare(
+      `SELECT project_id, category FROM memories WHERE id = ?`
+    )
+    const isAllowed = (id: string, projectId: string, category?: string): boolean => {
+      if (!canApply) return true
+      if (!canApply(projectId, category)) return false
+      const local = localById.get(id) as
+        | { project_id: string; category: string }
+        | undefined
+      return !local || canApply(local.project_id, local.category)
+    }
 
     let projectsImported = 0
     let memoriesCreated = 0
@@ -1900,6 +2124,9 @@ export class MemoryVault {
       if (includeTombstones) {
         for (const tombstone of snapshot.tombstones) {
           if (targetProjectId && tombstone.projectId !== targetProjectId) {
+            continue
+          }
+          if (!isAllowed(tombstone.memoryId, tombstone.projectId)) {
             continue
           }
 
@@ -1976,6 +2203,10 @@ export class MemoryVault {
         if (targetProjectId && memory.projectId !== targetProjectId) {
           continue
         }
+        if (!isAllowed(memory.id, memory.projectId, memory.category)) {
+          memoriesSkipped++
+          continue
+        }
 
         const localTombstone = this.db
           .prepare(
@@ -2009,20 +2240,16 @@ export class MemoryVault {
           | RawMemoryRow
           | undefined
 
-        if (!localMem) {
+        const ensureProject = (projectId: string) => {
           const projectExists = this.db
             .prepare(`SELECT id FROM projects WHERE id = ?`)
-            .get(memory.projectId)
+            .get(projectId)
           if (!projectExists) {
-            const snapProject = snapshot.projects.find(
-              (p) => p.id === memory.projectId
-            )
-            const pName = snapProject?.name || memory.projectId
+            const snapProject = snapshot.projects.find((p) => p.id === projectId)
+            const pName = snapProject?.name || projectId
             const pRoot =
               snapProject?.rootPath ||
-              (memory.projectId === 'global'
-                ? 'global'
-                : path.resolve(process.cwd()))
+              (projectId === 'global' ? 'global' : path.resolve(process.cwd()))
             const pUpdated = snapProject?.updatedAt || memory.updatedAt
             this.db
               .prepare(
@@ -2030,8 +2257,12 @@ export class MemoryVault {
                  VALUES (?, ?, ?, ?)
                  ON CONFLICT(id) DO UPDATE SET updated_at = excluded.updated_at`
               )
-              .run(memory.projectId, pName, pRoot, pUpdated)
+              .run(projectId, pName, pRoot, pUpdated)
           }
+        }
+
+        if (!localMem) {
+          ensureProject(memory.projectId)
 
           const tagsJson = JSON.stringify(memory.tags ?? [])
           const tagsText = (memory.tags ?? []).join(' ')
@@ -2113,10 +2344,36 @@ export class MemoryVault {
               memory.tokenCount ||
               estimateTokens(`${memory.title}\n${memory.content}`)
 
+            // Si gana el entrante, la memoria sigue su proyecto y su hash se
+            // recalcula. Si el destino ya tiene ese contenido, se queda en su
+            // proyecto con el hash recalculado allí; si también choca, se salta.
+            // Nunca queda contenido nuevo con un hash viejo.
+            const hasConflict = (projectId: string, hash: string) =>
+              Boolean(
+                this.db
+                  .prepare(
+                    `SELECT id FROM memories WHERE project_id = ? AND content_hash = ? AND id != ? LIMIT 1`
+                  )
+                  .get(projectId, hash, localMem.id)
+              )
+            let nextProjectId = memory.projectId
+            let nextContentHash = computeMemoryContentHash(memory.projectId, memory.category, memory.content)
+            if (hasConflict(nextProjectId, nextContentHash)) {
+              nextProjectId = localMem.project_id
+              nextContentHash = computeMemoryContentHash(localMem.project_id, memory.category, memory.content)
+              if (hasConflict(nextProjectId, nextContentHash)) {
+                memoriesSkipped++
+                continue
+              }
+            }
+            ensureProject(nextProjectId)
+
             this.db
               .prepare(
                 `UPDATE memories
-                 SET title = ?,
+                 SET project_id = ?,
+                     content_hash = ?,
+                     title = ?,
                      category = ?,
                      content = ?,
                      tags = ?,
@@ -2128,6 +2385,8 @@ export class MemoryVault {
                  WHERE id = ?`
               )
               .run(
+                nextProjectId,
+                nextContentHash,
                 memory.title,
                 memory.category,
                 memory.content,
@@ -2150,7 +2409,7 @@ export class MemoryVault {
               )
               .run(
                 localMem.id,
-                memory.projectId,
+                nextProjectId,
                 memory.title,
                 memory.content,
                 tagsText
@@ -2256,6 +2515,17 @@ export class MemoryVault {
       vectorCount: Number(vectorRow.cnt),
       totalTokens: Number(memoryRow.tokens)
     }
+  }
+
+  /**
+   * PRAGMA data_version: cambia cuando otra conexión (otro proceso de CLI o MCP)
+   * confirma escrituras en la base. Las escrituras de esta conexión no lo cambian.
+   */
+  getDataVersion(): number {
+    const row = this.db.prepare('PRAGMA data_version').get() as
+      | { data_version: number }
+      | undefined
+    return Number(row?.data_version ?? 0)
   }
 
   close(): void {

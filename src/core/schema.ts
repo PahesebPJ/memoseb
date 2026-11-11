@@ -25,6 +25,17 @@ export interface NodeConfiguration {
   autoSync: boolean
   lanDiscovery: boolean
   unassignedGroupPolicy?: UnassignedGroupPolicy
+  syncIntervalMinutes?: number
+  tailscaleDiscovery?: boolean
+  tailscaleBin?: string | null
+}
+
+export const DEFAULT_SYNC_INTERVAL_MINUTES = 5
+export const MIN_SYNC_INTERVAL_MINUTES = 1
+export const MAX_SYNC_INTERVAL_MINUTES = 1440
+
+export function clampSyncInterval(minutes: number): number {
+  return Math.min(MAX_SYNC_INTERVAL_MINUTES, Math.max(MIN_SYNC_INTERVAL_MINUTES, minutes))
 }
 
 export interface SyncPeerRecord {
@@ -269,8 +280,26 @@ export function openVaultDatabase(dbPath: string): DatabaseSync {
     fs.mkdirSync(path.dirname(dbPath), { recursive: true })
   }
   const db = new DatabaseSync(dbPath)
+  // Otro proceso (serve, MCP) puede tener la bóveda abierta: esperar en vez de fallar
+  db.exec('PRAGMA busy_timeout = 5000;')
   db.exec('PRAGMA journal_mode = WAL;')
   db.exec('PRAGMA foreign_keys = ON;')
   db.exec(SCHEMA_SQL)
+  restrictVaultFilePermissions(dbPath)
   return db
+}
+
+/** La bóveda guarda tokens: en POSIX solo la lee su dueño (0600). */
+export function restrictVaultFilePermissions(
+  dbPath: string,
+  platform: NodeJS.Platform = process.platform
+): void {
+  if (dbPath === ':memory:' || platform === 'win32') return
+  for (const file of [dbPath, `${dbPath}-wal`, `${dbPath}-shm`]) {
+    try {
+      fs.chmodSync(file, 0o600)
+    } catch {
+      // el archivo -wal/-shm puede no existir todavía
+    }
+  }
 }

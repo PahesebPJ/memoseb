@@ -142,7 +142,7 @@ export interface P2PSyncPayloadV1 {
   projectFilter?: string | null
   projects?: P2PProjectV1[]
   nodes: GazeNodeV1[]
-  edges?: GazeEdgeV1[]
+  edges?: GazeEdgeV1[] | null
   tombstones: P2PTombstoneV1[]
   checksum: string
 }
@@ -284,6 +284,40 @@ export function memoryToGazeNode(memory: MemoryRecord): GazeNodeV1 {
 }
 
 /**
+ * contentHash canónico de memoseb: sha256("<proyecto>:<categoría>:<contenido recortado>").
+ * gaze exporta exactamente esta fórmula (ADR-0012 §6.4).
+ */
+export function computeMemoryContentHash(
+  projectId: string,
+  category: MemoryCategory | string,
+  content: string
+): string {
+  return crypto
+    .createHash('sha256')
+    .update(`${projectId}:${category}:${content.trim()}`)
+    .digest('hex')
+}
+
+/**
+ * Serializa una arista como etiqueta gaze:edge:. Si el src de la arista no es el
+ * propio nodo se usa la forma gaze:edge:<src>-><dst>:<kind>[:<weight>].
+ */
+export function gazeEdgeToTag(
+  edge: GazeEdgeV1,
+  ownerId: string
+): string | null {
+  const dst = edge.targetId ?? edge.dst
+  if (!dst || !isGazeEdgeKind(edge.kind)) return null
+  const src = edge.sourceId ?? edge.src ?? ownerId
+  const weightStr =
+    edge.weight !== undefined && Number.isFinite(edge.weight)
+      ? `:${edge.weight}`
+      : ''
+  const prefix = src === ownerId ? '' : `${src}->`
+  return `gaze:edge:${prefix}${dst}:${edge.kind}${weightStr}`
+}
+
+/**
  * Conversión de GazeNodeV1 a MemoryRecord
  */
 export function gazeNodeToMemory(
@@ -360,17 +394,11 @@ export function gazeNodeToMemory(
   if (node.sourceRef) addTag(`gaze:source_ref:${node.sourceRef}`)
   if (node.until) addTag(`gaze:until:${node.until}`)
 
-  // 3. Aristas de Gaze preservadas como tags
+  // 3. Aristas de Gaze preservadas como tags (respetando el src de cada arista)
   if (Array.isArray(node.edges)) {
     for (const edge of node.edges) {
-      const dst = edge.targetId ?? edge.dst
-      if (dst && isGazeEdgeKind(edge.kind)) {
-        const weightStr =
-          edge.weight !== undefined && Number.isFinite(edge.weight)
-            ? `:${edge.weight}`
-            : ''
-        addTag(`gaze:edge:${dst}:${edge.kind}${weightStr}`)
-      }
+      const tag = gazeEdgeToTag(edge, node.id)
+      if (tag) addTag(tag)
     }
   }
 
@@ -392,9 +420,10 @@ export function gazeNodeToMemory(
 
   const content =
     node.body ?? (node as unknown as { content?: string }).content ?? ''
-  const contentHash =
-    node.contentHash ??
-    crypto.createHash('sha256').update(content).digest('hex')
+  const projectId = node.projectId || node.project || defaultProjectId
+  // Misma fórmula que storeMemory y que gaze: un hash ausente o con otra
+  // fórmula se recalcula para que el emparejamiento por (proyecto, hash) funcione.
+  const contentHash = computeMemoryContentHash(projectId, category, content)
 
   let tokenCount = 1
   if (attrsMap.has('memoseb:token_count')) {
@@ -404,8 +433,6 @@ export function gazeNodeToMemory(
   } else {
     tokenCount = Math.max(1, Math.ceil(content.length / 4))
   }
-
-  const projectId = node.projectId || node.project || defaultProjectId
 
   return {
     id: node.id,
@@ -512,7 +539,7 @@ export function verifyP2PPayload(raw: unknown): P2PSyncPayloadV1 {
   if (!Array.isArray(p.nodes)) {
     throw new Error('Invalid P2P payload: nodes must be an array.')
   }
-  if (p.edges !== undefined && !Array.isArray(p.edges)) {
+  if (p.edges !== undefined && p.edges !== null && !Array.isArray(p.edges)) {
     throw new Error('Invalid P2P payload: edges must be an array when provided.')
   }
   if (!Array.isArray(p.tombstones)) {
@@ -618,9 +645,27 @@ export function p2pPayloadToSnapshot(rawPayload: unknown): VaultSnapshotV1 {
     }
   }
 
+  // Las aristas de nivel superior se fusionan en el nodo src que viaja en el
+  // payload; si el src no viaja, no hay memoria a la cual adjuntarlas.
+  const topLevelEdges = new Map<string, GazeEdgeV1[]>()
+  if (Array.isArray(payload.edges)) {
+    for (const edge of payload.edges) {
+      if (!edge || typeof edge !== 'object') continue
+      const src = edge.sourceId ?? edge.src
+      if (!src) continue
+      const list = topLevelEdges.get(src) ?? []
+      list.push(edge)
+      topLevelEdges.set(src, list)
+    }
+  }
+
   const memories: MemoryRecord[] = []
   for (const n of payload.nodes) {
-    const mem = gazeNodeToMemory(n, defaultProjectId)
+    const extraEdges = topLevelEdges.get(n.id)
+    const nodeWithEdges: GazeNodeV1 = extraEdges
+      ? { ...n, edges: [...(n.edges ?? []), ...extraEdges] }
+      : n
+    const mem = gazeNodeToMemory(nodeWithEdges, defaultProjectId)
     memories.push(mem)
     if (!projectMap.has(mem.projectId)) {
       projectMap.set(mem.projectId, {

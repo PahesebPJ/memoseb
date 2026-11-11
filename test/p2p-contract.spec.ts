@@ -4,6 +4,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { describe, it } from 'node:test'
 import {
+  computeMemoryContentHash,
   computeP2PPayloadChecksum,
   GAZE_EDGE_KINDS,
   GAZE_KINDS,
@@ -126,7 +127,11 @@ describe('P2P Contract & Gaze Compatibility Engine', () => {
         content: `Detailed body content for category ${category}.`,
         tags: ['alpha', 'beta', `tag-${category}`, 'gaze:edge:target-node-99:link:0.8'],
         sourceAgent: 'developer',
-        contentHash: `hash-abc-${category}-${i}`,
+        contentHash: computeMemoryContentHash(
+          'project-test',
+          category,
+          `Detailed body content for category ${category}.`
+        ),
         tokenCount: 42 + i,
         importance,
         accessCount: 15 + i * 3,
@@ -264,7 +269,14 @@ describe('P2P Contract & Gaze Compatibility Engine', () => {
       assert.equal(memRecord.projectId, originalGazeNode.projectId)
       assert.equal(memRecord.title, originalGazeNode.title)
       assert.equal(memRecord.content, originalGazeNode.body)
-      assert.equal(memRecord.contentHash, originalGazeNode.contentHash)
+      assert.equal(
+        memRecord.contentHash,
+        computeMemoryContentHash(
+          'gaze-matrix-proj',
+          memRecord.category,
+          originalGazeNode.body
+        )
+      )
       assert.equal(memRecord.accessCount, originalGazeNode.hits)
       assert.ok(memRecord.tags.includes(`gaze:kind:${kind}`))
       assert.ok(memRecord.tags.includes(`gaze:source:${source}`))
@@ -284,7 +296,7 @@ describe('P2P Contract & Gaze Compatibility Engine', () => {
       assert.equal(reexportedNode.title, originalGazeNode.title)
       assert.equal(reexportedNode.body, originalGazeNode.body)
       assert.equal(reexportedNode.hits, originalGazeNode.hits)
-      assert.equal(reexportedNode.contentHash, originalGazeNode.contentHash)
+      assert.equal(reexportedNode.contentHash, memRecord.contentHash)
 
       // Verify all 4 edges were preserved without loss
       assert.ok(Array.isArray(reexportedNode.edges))
@@ -555,6 +567,163 @@ describe('P2P Contract & Gaze Compatibility Engine', () => {
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true })
     }
+  })
+
+  it('aligns contentHash with the gaze formula (project:category:trimmed body)', () => {
+    assert.equal(
+      computeMemoryContentHash('den', 'convention', 'Usar pnpm en todos los repos'),
+      '4523995540ffa8614f8ae3df8272cc01c84d644dea4d2a3f4891d46743ae3283'
+    )
+    assert.equal(
+      computeMemoryContentHash('den', 'domain', '  Los releases salen de main \n'),
+      'b10a4950ca6f74a54c38eada86d638fbc0198e6ba5576ff0d60a6e7adc6eef1a'
+    )
+
+    const base: GazeNodeV1 = {
+      id: '01k9aaaaaa@a1b2c3d4e5f6',
+      projectId: 'den',
+      kind: 'rule',
+      source: 'user',
+      title: 'Usar pnpm',
+      body: 'Usar pnpm en todos los repos',
+      createdAt: '2026-11-10T03:00:00.000Z',
+      updatedAt: '2026-11-10T03:00:00.000Z'
+    }
+    const expected =
+      '4523995540ffa8614f8ae3df8272cc01c84d644dea4d2a3f4891d46743ae3283'
+    assert.equal(gazeNodeToMemory(base).contentHash, expected)
+    assert.equal(
+      gazeNodeToMemory({ ...base, contentHash: 'sha256-of-body-only' }).contentHash,
+      expected
+    )
+    assert.equal(
+      gazeNodeToMemory({ ...base, contentHash: expected }).contentHash,
+      expected
+    )
+
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'memoseb-p2p-hash-'))
+    const vault = new MemoryVault({ dbPath: path.join(tmpDir, 'vault.db') })
+    try {
+      const stored = vault.storeMemory({
+        projectId: 'den',
+        category: 'convention',
+        content: 'Usar pnpm en todos los repos'
+      })
+      const payloadBase: Omit<P2PSyncPayloadV1, 'checksum'> = {
+        format: 'p2p-memory-contract',
+        version: 1,
+        app: 'gaze',
+        originNodeId: 'gaze-node-1',
+        exportedAt: '2026-11-10T04:00:00.000Z',
+        projectId: 'den',
+        nodes: [{ ...base, contentHash: 'legacy-hash' }],
+        edges: [],
+        tombstones: []
+      }
+      const result = vault.importP2PPayload({
+        ...payloadBase,
+        checksum: computeP2PPayloadChecksum(payloadBase)
+      })
+      assert.equal(result.memoriesCreated, 0)
+      assert.equal(stored.memory.contentHash, expected)
+      assert.equal(vault.getStats().memoryCount, 1)
+    } finally {
+      vault.close()
+      fs.rmSync(tmpDir, { recursive: true, force: true })
+    }
+  })
+
+  it('imports top-level edges[] into the source node gaze:edge tags honoring edge src', () => {
+    const srcId = '01k9src000@a1b2c3d4e5f6'
+    const otherId = '01k9other0@a1b2c3d4e5f6'
+    const payloadBase: Omit<P2PSyncPayloadV1, 'checksum'> = {
+      format: 'p2p-memory-contract',
+      version: 1,
+      app: 'gaze',
+      originNodeId: 'gaze-node-1',
+      exportedAt: '2026-11-10T04:00:00.000Z',
+      projectId: 'den',
+      nodes: [
+        {
+          id: srcId,
+          projectId: 'den',
+          kind: 'decision',
+          source: 'claude',
+          title: 'Source',
+          body: 'Source node body',
+          createdAt: '2026-11-10T03:00:00.000Z',
+          updatedAt: '2026-11-10T03:00:00.000Z',
+          edges: [
+            { kind: 'link', sourceId: srcId, targetId: '01k9dup000@a1b2c3d4e5f6', weight: 1 }
+          ]
+        },
+        {
+          id: otherId,
+          projectId: 'den',
+          kind: 'fact',
+          source: 'claude',
+          title: 'Other',
+          body: 'Other node body',
+          createdAt: '2026-11-10T03:00:00.000Z',
+          updatedAt: '2026-11-10T03:00:00.000Z'
+        }
+      ],
+      edges: [
+        { kind: 'link', sourceId: srcId, targetId: '01k9dup000@a1b2c3d4e5f6', weight: 1 },
+        { kind: 'link', src: srcId, dst: '01k9top000@a1b2c3d4e5f6' },
+        { kind: 'similar', sourceId: otherId, targetId: srcId, weight: 0.5 },
+        { kind: 'link', sourceId: '01k9absent@a1b2c3d4e5f6', targetId: srcId }
+      ],
+      tombstones: []
+    }
+    const snapshot = p2pPayloadToSnapshot({
+      ...payloadBase,
+      checksum: computeP2PPayloadChecksum(payloadBase)
+    })
+    const src = snapshot.memories.find((m) => m.id === srcId)
+    const other = snapshot.memories.find((m) => m.id === otherId)
+    assert.ok(src)
+    assert.ok(other)
+    const srcEdges = src.tags.filter((t) => t.startsWith('gaze:edge:'))
+    assert.deepEqual(srcEdges.sort(), [
+      'gaze:edge:01k9dup000@a1b2c3d4e5f6:link:1',
+      'gaze:edge:01k9top000@a1b2c3d4e5f6:link'
+    ])
+    assert.deepEqual(
+      other.tags.filter((t) => t.startsWith('gaze:edge:')),
+      [`gaze:edge:${srcId}:similar:0.5`]
+    )
+    assert.ok(
+      snapshot.memories.every((m) => !m.tags.some((t) => t.includes('01k9absent')))
+    )
+
+    const reexported = memoryToGazeNode(src)
+    assert.equal(reexported.edges?.length, 2)
+    assert.ok(reexported.edges?.every((e) => e.sourceId === srcId))
+
+    const foreign = gazeNodeToMemory({
+      ...payloadBase.nodes[1]!,
+      edges: [{ kind: 'link', sourceId: srcId, targetId: otherId }]
+    })
+    assert.ok(foreign.tags.includes(`gaze:edge:${srcId}->${otherId}:link`))
+    const foreignBack = memoryToGazeNode(foreign)
+    assert.equal(foreignBack.edges?.[0]?.sourceId, srcId)
+    assert.equal(foreignBack.edges?.[0]?.targetId, otherId)
+  })
+
+  it('accepts p2p payloads with edges: null as gaze may send them', () => {
+    const payloadBase = {
+      format: 'p2p-memory-contract' as const,
+      version: 1 as const,
+      originNodeId: 'gaze-node-1',
+      exportedAt: '2026-11-10T04:00:00.000Z',
+      projectId: 'den',
+      nodes: [],
+      edges: null,
+      tombstones: []
+    }
+    const checksum = computeP2PPayloadChecksum(payloadBase)
+    assert.doesNotThrow(() => verifyP2PPayload({ ...payloadBase, checksum }))
   })
 
   it('handles live HTTP P2P status, handshake and exchange between peer nodes', async () => {
