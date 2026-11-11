@@ -754,7 +754,6 @@ export async function discoverLanNodes(options?: {
 
 export const discoverLanParents = discoverLanNodes
 
-
 /**
  * Sondea por HTTP unicast GET /api/v1/p2p/status en cada host. Solo devuelve
  * nodos que responden ok, anuncian p2p-memory-contract y no son el propio nodo.
