@@ -62,6 +62,7 @@ import {
   startAutoSyncLoop,
   type AutoSyncLoopHandle,
 } from '../core/auto-sync.ts'
+import { probeTailscale, type TailscaleProbeResult } from '../core/tailscale.ts'
 import {
   applyWindowsFirewallRule,
   installNodeService,
@@ -107,6 +108,7 @@ export interface ExecuteMemoCliOptions {
   killProcess?: (pid: number) => void
   readStdin?: () => Promise<string>
   spawnProcess?: typeof spawn
+  probeTailscale?: typeof probeTailscale
 }
 
 /** Argumentos del hijo de `serve --detach`: sin --detach ni el token en la línea de comandos. */
@@ -1997,8 +1999,16 @@ export async function executeMemoCli(
               intervalFlag.minutes !== undefined ? intervalFlag.minutes * 60_000 : undefined,
             token: effectiveToken,
             discover: async () => {
+              const probeFn = options.probeTailscale ?? probeTailscale
+              let cachedProbe: Promise<TailscaleProbeResult> | null = null
+              const probeOnce: typeof probeTailscale = (rt, opts) => {
+                if (!cachedProbe) cachedProbe = probeFn(rt, opts)
+                return cachedProbe
+              }
               if (bindPlan.auto) {
-                const opened = await refreshPeerBindHosts(runtime, vault.getNodeConfig(), handle)
+                const opened = await refreshPeerBindHosts(runtime, vault.getNodeConfig(), handle, {
+                  probeTailscale: probeOnce,
+                })
                 if (opened.length > 0) {
                   activeRecorder?.()
                   process.stderr.write(`memoseb node serve now also listening on ${opened.join(', ')}\n`)
@@ -2008,6 +2018,7 @@ export async function executeMemoCli(
                 port: handle.port,
                 lan: !noLanFlag && vault.getNodeConfig().lanDiscovery,
                 token: effectiveToken,
+                probeTailscale: probeOnce,
               }).then((r) => r.nodes)
             },
             callbackUrl: (peerUrl) =>

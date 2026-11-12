@@ -38,7 +38,7 @@ import {
   type P2PSyncPayloadV1
 } from '../src/core/p2p-contract.ts'
 import { MemoryVault, type VaultStats } from '../src/core/vault.ts'
-import { discoverPeers, startAutoSyncLoop } from '../src/core/auto-sync.ts'
+import { discoverPeers, refreshPeerBindHosts, startAutoSyncLoop } from '../src/core/auto-sync.ts'
 import {
   isTailscaleIpv4,
   locateTailscaleBinary,
@@ -1822,6 +1822,58 @@ describe('Sync Engine: Tailscale Discovery, Callback URL, Token Policy and Auto-
     } finally {
       vault.close()
       vaultB.close()
+      fs.rmSync(tmpDir, { recursive: true, force: true })
+    }
+  })
+
+  it('deduplicates tailscale probing when shared probeOnce is supplied across refreshPeerBindHosts and discoverPeers', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'memoseb-probe-dedup-'))
+    const vault = new MemoryVault({ dbPath: path.join(tmpDir, 'vault.db') })
+    try {
+      vault.enableNodeMode({ role: 'peer', authToken: 'test-token' })
+      let probeCallCount = 0
+      const mockProbe = async () => {
+        probeCallCount++
+        return {
+          state: 'running' as const,
+          binary: '/mock/tailscale',
+          status: parseTailscaleStatus(RUNNING_STATUS)!
+        }
+      }
+
+      let cachedProbe: ReturnType<typeof mockProbe> | null = null
+      const probeOnce = () => {
+        if (!cachedProbe) cachedProbe = mockProbe()
+        return cachedProbe
+      }
+
+      const dummyHandle = {
+        hosts: ['127.0.0.1'],
+        addListenHost: async () => true
+      }
+
+      await refreshPeerBindHosts(
+        { platform: 'linux', env: {}, execProcess: async () => ({ exitCode: 0, stdout: '', stderr: '' }) },
+        vault.getNodeConfig(),
+        dummyHandle,
+        { probeTailscale: probeOnce as any }
+      )
+
+      const discovered = await discoverPeers(
+        vault,
+        { platform: 'linux', env: {}, execProcess: async () => ({ exitCode: 0, stdout: '', stderr: '' }) },
+        {
+          port: 7432,
+          lan: false,
+          token: 'test-token',
+          probeTailscale: probeOnce as any
+        }
+      )
+
+      assert.equal(probeCallCount, 1)
+      assert.equal(discovered.tailscale, 'running')
+    } finally {
+      vault.close()
       fs.rmSync(tmpDir, { recursive: true, force: true })
     }
   })
