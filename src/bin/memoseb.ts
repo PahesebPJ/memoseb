@@ -1975,7 +1975,15 @@ export async function executeMemoCli(
 
         // Rol peer sin --host: IP de Tailscale + loopback, o solo loopback si Tailscale
         // no corre todavía; nunca 0.0.0.0. La discovery reabre la IP al aparecer.
-        const bindPlan = await resolveServeBindPlan(runtime, serveConfig, flags.host)
+        const probeFn = options.probeTailscale ?? probeTailscale
+        let startupProbe: Promise<TailscaleProbeResult> | null = null
+        const probeStartupOnce: typeof probeTailscale = (rt, opts) => {
+          if (!startupProbe) startupProbe = probeFn(rt, opts)
+          return startupProbe
+        }
+        const bindPlan = await resolveServeBindPlan(runtime, serveConfig, flags.host, {
+          probeTailscale: probeStartupOnce,
+        })
         const bindHosts = bindPlan.hosts
 
         let loop: AutoSyncLoopHandle | null = null
@@ -1999,8 +2007,8 @@ export async function executeMemoCli(
               intervalFlag.minutes !== undefined ? intervalFlag.minutes * 60_000 : undefined,
             token: effectiveToken,
             discover: async () => {
-              const probeFn = options.probeTailscale ?? probeTailscale
-              let cachedProbe: Promise<TailscaleProbeResult> | null = null
+              let cachedProbe: Promise<TailscaleProbeResult> | null = startupProbe
+              startupProbe = null
               const probeOnce: typeof probeTailscale = (rt, opts) => {
                 if (!cachedProbe) cachedProbe = probeFn(rt, opts)
                 return cachedProbe

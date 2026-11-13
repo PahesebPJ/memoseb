@@ -236,7 +236,7 @@ memoseb node service uninstall   # también lo quitan `memoseb node disable` y `
 
 El servicio va ligado a la bóveda: su nombre y sus archivos (`node-serve-<hash>.log`, `node-serve-<hash>.pid`, `node-service-<hash>.json`, `node-firewall-<hash>.json`) llevan un sufijo con el hash de la ruta de `--db` (`io.github.pahesebpj.memoseb.node.<hash>`, `memoseb-node-<hash>.service`, tarea `memoseb-node-<hash>`), y `disable`/`uninstall` solo quitan lo de su `--db`. Antes de detener el pid registrado se comprueba que sea un `memoseb node serve`.
 
-En Windows la tarea `memoseb-node-<hash>` corre `memoseb node serve --detach`; si `schtasks` no se deja crear, usa la carpeta Startup del perfil. Para aceptar peers por Tailscale hay que permitir el puerto en el Firewall de Windows (opt-in):
+En Windows la tarea `memoseb-node-<hash>` corre `memoseb node serve --detach`; si `schtasks` no se deja crear, usa la carpeta Startup del perfil. Tras actualizar `memoseb` con `npm install -g memoseb@latest`, reinicia el servicio (`memoseb node service uninstall` y luego `memoseb node service install`) para que el proceso en segundo plano recargue la nueva versión. Para aceptar peers por Tailscale hay que permitir el puerto en el Firewall de Windows (opt-in):
 
 ```powershell
 # Imprime el comando; --apply lo ejecuta pidiendo elevación (UAC)
