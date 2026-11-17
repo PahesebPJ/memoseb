@@ -1,6 +1,6 @@
 {
   "name": "memoseb",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "description": "Multi-project agentic vector and FTS5 hybrid memory vault on SQLite with MCP server and hubseb integration.",
   "license": "MIT",
   "author": "PahesebPJ",
