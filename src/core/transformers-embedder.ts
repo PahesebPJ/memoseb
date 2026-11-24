@@ -168,10 +168,12 @@ function progressCallback(
 
 /**
  * What to hand transformers.js as the model id. Downloads use the repo id and
- * pinned revision. Offline loads use the local directory instead: the file cache
- * keeps pinned revisions under <repo>/<revision>/, and transformers.js 4.3.2
- * looks tokenizer files up without the revision (get_tokenizer_files), so a
- * repo id would fail offline. Older installs kept files directly in <repo>/.
+ * pinned revision. Offline loads use the local directory instead, because
+ * transformers.js 4.3.2 caches a pinned download inconsistently: tokenizer and
+ * ONNX files go under <repo>/<revision>/ but pipeline() may store config.json
+ * in <repo>/, and get_tokenizer_files ignores the revision. A repo id therefore
+ * fails offline ("this.tokenizer is not a function" / "tokenizer_class").
+ * Installs made before revisions were pinned keep every file in <repo>/.
  */
 export function modelSource(
   paths: MlPaths,
@@ -181,8 +183,18 @@ export function modelSource(
   const revision = spec.revision ?? 'main'
   if (allowRemote || !spec.hfModel) return { model: spec.hfModel ?? '', revision }
   const root = modelCacheDir(paths, spec)!
-  for (const dir of [path.join(root, revision), root]) {
-    if (fs.existsSync(path.join(dir, 'config.json')) && fs.existsSync(path.join(dir, 'tokenizer_config.json'))) {
+  const revisionDir = path.join(root, revision)
+  const has = (dir: string, file: string): boolean => fs.existsSync(path.join(dir, file))
+  if (has(revisionDir, 'tokenizer_config.json') && !has(revisionDir, 'config.json') && has(root, 'config.json')) {
+    try {
+      // config.json was fetched at the pinned revision too; only its cache key lacks it.
+      fs.copyFileSync(path.join(root, 'config.json'), path.join(revisionDir, 'config.json'))
+    } catch {
+      // Read-only cache: fall through to the repo id and let transformers.js report it.
+    }
+  }
+  for (const dir of [revisionDir, root]) {
+    if (has(dir, 'config.json') && has(dir, 'tokenizer_config.json')) {
       return { model: dir, revision: undefined }
     }
   }

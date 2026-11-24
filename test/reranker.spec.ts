@@ -358,4 +358,14 @@ describe('Offline model source', () => {
     writeModel(path.join(root, V2.revision))
     assert.deepEqual(modelSource(paths, V2, false), { model: path.join(root, V2.revision), revision: undefined })
   })
+
+  it('repairs a fresh pinned download whose config.json was cached outside the revision directory', () => {
+    const root = path.join(paths.modelsDir, ...V2.hfModel.split('/'))
+    const revisionDir = path.join(root, V2.revision)
+    fs.mkdirSync(revisionDir, { recursive: true })
+    fs.writeFileSync(path.join(root, 'config.json'), '{"model_type":"xlm-roberta"}')
+    fs.writeFileSync(path.join(revisionDir, 'tokenizer_config.json'), '{}')
+    assert.deepEqual(modelSource(paths, V2, false), { model: revisionDir, revision: undefined })
+    assert.equal(fs.readFileSync(path.join(revisionDir, 'config.json'), 'utf8'), '{"model_type":"xlm-roberta"}')
+  })
 })
