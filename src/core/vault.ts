@@ -11,7 +11,15 @@ import {
   serializeVector,
   type EmbeddingProvider
 } from './embedder.ts'
+import { contentTokens } from './text.ts'
+import {
+  findModelSpec,
+  LEXICAL_MODEL_ID,
+  MODEL_CATALOG,
+  type EmbedderModelSpec
+} from './model-catalog.ts'
 import { detectProject, slugifyProjectId } from './project-detector.ts'
+import { resolveMlPaths, type MlPaths } from './transformers-embedder.ts'
 import {
   isGroupPermissionMode,
   isMemoryCategory,
@@ -89,9 +97,38 @@ export interface StoreMemoryInput {
   cwd?: string
 }
 
+export interface SimilarMemory {
+  id: string
+  title: string
+  similarity: number
+}
+
 export interface StoreMemoryResult {
   memory: MemoryRecord
   created: boolean
+  /** Existing memories that look like near-duplicates of a newly created one. */
+  similar?: SimilarMemory[]
+  /** Set when the semantic embedder failed and the lexical fallback was used. */
+  warning?: string
+}
+
+export interface ActiveEmbedderInfo {
+  spec: EmbedderModelSpec
+  source: 'env' | 'config' | 'default'
+  /** Set when MEMOSEB_EMBEDDER or the stored config names a model that is not in the catalog. */
+  invalidValue?: string
+}
+
+export interface EmbeddingWorkItem {
+  id: string
+  projectId: string
+  category: MemoryCategory
+  text: string
+}
+
+export interface VectorModelCount {
+  model: string
+  count: number
 }
 
 export interface RecallOptions {
@@ -102,6 +139,12 @@ export interface RecallOptions {
   limit?: number
   maxTokens?: number
   cwd?: string
+  /** Precomputed query vector (async/semantic embedders). Defaults to the lexical embedder. */
+  queryVector?: Float32Array
+  /** Only vectors produced by this model are compared. Defaults to the lexical model. */
+  vectorModel?: string
+  /** Vector-only candidates below this cosine similarity are dropped as noise. */
+  minSimilarity?: number
 }
 
 export interface RecallResult {
@@ -109,6 +152,8 @@ export interface RecallResult {
   memories: ScoredMemory[]
   totalTokens: number
   truncatedByBudget: boolean
+  /** Set when the semantic embedder failed and the lexical fallback was used. */
+  warning?: string
 }
 
 export interface ProjectSummary {
@@ -126,6 +171,8 @@ export interface VaultStats {
   memoryCount: number
   vectorCount: number
   totalTokens: number
+  activeEmbedder: string
+  vectorModels: VectorModelCount[]
 }
 
 interface RawMemoryRow {
@@ -180,16 +227,30 @@ function mapRowToMemoryRecord(row: RawMemoryRow): MemoryRecord {
   }
 }
 
+/**
+ * Cosine floor for the lexical hash embedder: unrelated texts land at 0.15–0.30
+ * because of shared character trigrams (measured with scripts/recall-eval.ts).
+ */
+export const LEXICAL_MIN_SIMILARITY = 0.35
+
 export function sanitizeFtsQuery(query: string): string {
-  const tokens = query
-    .toLowerCase()
-    .match(/[a-z0-9_]+/g)
-    ?.filter((token) => token.length > 0)
-  if (!tokens || tokens.length === 0) {
+  const unique = Array.from(new Set(contentTokens(query)))
+  if (unique.length === 0) {
     return ''
   }
-  const unique = Array.from(new Set(tokens))
   return unique.map((token) => `"${token.replace(/"/g, '""')}"`).join(' OR ')
+}
+
+export const ACTIVE_EMBEDDER_META_KEY = 'embedder.model'
+
+/** memory_vectors.model prefix shared by every version of the built-in lexical embedder. */
+const LEXICAL_MODEL_FAMILY = 'local-feature-hash-'
+
+const LEXICAL_REINDEX_BATCH = 500
+
+/** Text fed to every embedder for a memory; must stay identical across store and reindex. */
+export function embeddingTextFor(title: string, content: string, tags: readonly string[]): string {
+  return `${title}\n${content}\n${tags.join(' ')}`
 }
 
 function clampImportance(value: number | undefined): number {
@@ -292,6 +353,224 @@ export class MemoryVault {
     this.db = openVaultDatabase(this.dbPath)
     this.embedder = options?.embedder ?? new LocalFeatureHashEmbedder()
     this.migrateContentHashes()
+    if (this.getActiveEmbedder().spec.id === LEXICAL_MODEL_ID) {
+      try {
+        this.reindexLexicalVectors()
+      } catch {
+        // Best effort: a busy or read-only database must not prevent opening the
+        // vault. Stale vectors only lower vector scores; FTS5 still finds them.
+      }
+    }
+  }
+
+  /** Where the optional ML runtime and model weights live for this vault. */
+  get mlPaths(): MlPaths {
+    // runtime.env defaults to process.env; never merge both, or a developer's
+    // MEMOSEB_ML_DIR would leak into isolated runtimes (tests, sandboxes).
+    return resolveMlPaths(this.dbPath, this.runtime.env)
+  }
+
+  /** Model tag of the synchronous lexical embedder (memory_vectors.model). */
+  get lexicalVectorModel(): string {
+    return this.embedder.model
+  }
+
+  /** Precedence: MEMOSEB_EMBEDDER > node_meta "embedder.model" > built-in hash. */
+  getActiveEmbedder(): ActiveEmbedderInfo {
+    const fallback = findModelSpec(LEXICAL_MODEL_ID)!
+    const fromEnv = this.runtime.env.MEMOSEB_EMBEDDER?.trim()
+    if (fromEnv) {
+      const spec = findModelSpec(fromEnv)
+      return spec
+        ? { spec, source: 'env' }
+        : { spec: fallback, source: 'env', invalidValue: fromEnv }
+    }
+    const stored = this.getConfiguredEmbedderId()
+    if (stored) {
+      const spec = findModelSpec(stored)
+      return spec
+        ? { spec, source: 'config' }
+        : { spec: fallback, source: 'config', invalidValue: stored }
+    }
+    return { spec: fallback, source: 'default' }
+  }
+
+  getConfiguredEmbedderId(): string | null {
+    const row = this.db
+      .prepare(`SELECT value FROM node_meta WHERE key = ?`)
+      .get(ACTIVE_EMBEDDER_META_KEY) as { value: string } | undefined
+    return row?.value ?? null
+  }
+
+  setConfiguredEmbedderId(id: string): EmbedderModelSpec {
+    const spec = findModelSpec(id)
+    if (!spec) {
+      throw new Error(
+        `Unknown embedder model "${id}". Available: ${MODEL_CATALOG.map((m) => m.id).join(', ')}`
+      )
+    }
+    this.db
+      .prepare(
+        `INSERT INTO node_meta (key, value, updated_at) VALUES (?, ?, ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`
+      )
+      .run(ACTIVE_EMBEDDER_META_KEY, spec.id, new Date().toISOString())
+    return spec
+  }
+
+  /**
+   * Memories whose vector is missing or was produced by a different model.
+   * With `lexicalOnly`, vectors of semantic models are left alone: they belong
+   * to another process's active model and must not be downgraded.
+   */
+  listMemoriesNeedingVectors(
+    model: string,
+    limit?: number,
+    options?: { lexicalOnly?: boolean }
+  ): EmbeddingWorkItem[] {
+    const staleClause = options?.lexicalOnly
+      ? `(mv.model <> ? AND mv.model LIKE '${LEXICAL_MODEL_FAMILY}%')`
+      : `mv.model <> ?`
+    const rows = this.db
+      .prepare(
+        `SELECT m.id, m.project_id, m.category, m.title, m.content, m.tags
+         FROM memories m
+         LEFT JOIN memory_vectors mv ON mv.memory_id = m.id
+         WHERE mv.memory_id IS NULL OR ${staleClause}
+         ORDER BY m.updated_at DESC
+         LIMIT ?`
+      )
+      .all(model, limit !== undefined ? Math.max(1, Math.floor(limit)) : -1) as Array<{
+      id: string
+      project_id: string
+      category: string
+      title: string
+      content: string
+      tags: string
+    }>
+    return rows.map((row) => ({
+      id: row.id,
+      projectId: row.project_id,
+      category: isMemoryCategory(row.category) ? row.category : 'domain',
+      text: embeddingTextFor(row.title, row.content, parseTags(row.tags))
+    }))
+  }
+
+  countMemoriesNeedingVectors(model: string): number {
+    const row = this.db
+      .prepare(
+        `SELECT COUNT(*) AS cnt
+         FROM memories m
+         LEFT JOIN memory_vectors mv ON mv.memory_id = m.id
+         WHERE mv.memory_id IS NULL OR mv.model <> ?`
+      )
+      .get(model) as { cnt: number }
+    return Number(row.cnt)
+  }
+
+  writeVectors(
+    model: string,
+    items: ReadonlyArray<{ id: string; vector: Float32Array }>
+  ): number {
+    if (items.length === 0) return 0
+    const upsert = this.db.prepare(
+      `INSERT INTO memory_vectors (memory_id, dimensions, embedding, model)
+       SELECT ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM memories WHERE id = ?)
+       ON CONFLICT(memory_id) DO UPDATE SET
+         dimensions = excluded.dimensions,
+         embedding = excluded.embedding,
+         model = excluded.model`
+    )
+    let written = 0
+    this.db.exec('BEGIN IMMEDIATE;')
+    try {
+      for (const item of items) {
+        const res = upsert.run(
+          item.id,
+          item.vector.length,
+          serializeVector(item.vector),
+          model,
+          item.id
+        )
+        written += Number(res.changes)
+      }
+      this.db.exec('COMMIT;')
+    } catch (err) {
+      try {
+        this.db.exec('ROLLBACK;')
+      } catch {
+        // Keep the original error: a failed BEGIN leaves nothing to roll back.
+      }
+      throw err
+    }
+    return written
+  }
+
+  /**
+   * Re-embeds stale vectors with the built-in lexical embedder (fast, no I/O),
+   * in short transactions so other processes are never locked out for long.
+   * By default semantic vectors are kept; `includeSemantic` converts them too
+   * (used when the user explicitly disables semantic search).
+   */
+  reindexLexicalVectors(options?: { includeSemantic?: boolean }): number {
+    const lexicalOnly = !options?.includeSemantic
+    let written = 0
+    for (;;) {
+      const batch = this.listMemoriesNeedingVectors(this.embedder.model, LEXICAL_REINDEX_BATCH, {
+        lexicalOnly
+      })
+      if (batch.length === 0) break
+      const count = this.writeVectors(
+        this.embedder.model,
+        batch.map((item) => ({ id: item.id, vector: this.embedder.embed(item.text) }))
+      )
+      written += count
+      if (count === 0 || batch.length < LEXICAL_REINDEX_BATCH) break
+    }
+    return written
+  }
+
+  /** Existing memories in the same project and category whose vector is close to `vector`. */
+  findSimilarMemories(input: {
+    projectId: string
+    category: MemoryCategory
+    vector: Float32Array
+    model: string
+    threshold: number
+    excludeId?: string
+    limit?: number
+  }): SimilarMemory[] {
+    const rows = this.db
+      .prepare(
+        `SELECT m.id, m.title, mv.embedding
+         FROM memories m
+         JOIN memory_vectors mv ON mv.memory_id = m.id AND mv.model = ?
+         WHERE m.project_id = ? AND m.category = ?`
+      )
+      .all(input.model, input.projectId, input.category) as Array<{
+      id: string
+      title: string
+      embedding: Uint8Array
+    }>
+    const similar: SimilarMemory[] = []
+    for (const row of rows) {
+      if (row.id === input.excludeId) continue
+      const similarity = cosineSimilarity(input.vector, deserializeVector(row.embedding))
+      if (similarity >= input.threshold) {
+        similar.push({ id: row.id, title: row.title, similarity: Number(similarity.toFixed(4)) })
+      }
+    }
+    similar.sort((a, b) => b.similarity - a.similarity)
+    return similar.slice(0, input.limit ?? 3)
+  }
+
+  vectorModelCounts(): VectorModelCount[] {
+    const rows = this.db
+      .prepare(
+        `SELECT model, COUNT(*) AS cnt FROM memory_vectors GROUP BY model ORDER BY cnt DESC`
+      )
+      .all() as Array<{ model: string; cnt: number }>
+    return rows.map((row) => ({ model: row.model, count: Number(row.cnt) }))
   }
 
   /**
@@ -423,7 +702,7 @@ export class MemoryVault {
       )
       .get(project.id, contentHash) as unknown as RawMemoryRow | undefined
 
-    const embeddingText = `${title}\n${trimmedContent}\n${tagsText}`
+    const embeddingText = embeddingTextFor(title, trimmedContent, tags)
     const vector = this.embedder.embed(embeddingText)
     const serializedVector = serializeVector(vector)
     const tokenCount = estimateTokens(`${title}\n${trimmedContent}`)
@@ -444,7 +723,11 @@ export class MemoryVault {
         input.title && input.title.trim().length > 0 ? title : existing.title
       const mergedTagsJson =
         input.tags !== undefined ? tagsJson : existing.tags
-      const mergedTagsText = parseTags(mergedTagsJson).join(' ')
+      const mergedTags = parseTags(mergedTagsJson)
+      const mergedTagsText = mergedTags.join(' ')
+      const mergedVector = serializeVector(
+        this.embedder.embed(embeddingTextFor(mergedTitle, trimmedContent, mergedTags))
+      )
       const mergedSourceAgent =
         sourceAgent !== null ? sourceAgent : existing.source_agent
 
@@ -497,7 +780,7 @@ export class MemoryVault {
         .run(
           existing.id,
           this.embedder.dimensions,
-          serializedVector,
+          mergedVector,
           this.embedder.model
         )
 
@@ -558,9 +841,19 @@ export class MemoryVault {
       .prepare(`SELECT * FROM memories WHERE id = ?`)
       .get(id) as unknown as RawMemoryRow
 
+    const similar = this.findSimilarMemories({
+      projectId: project.id,
+      category,
+      vector,
+      model: this.embedder.model,
+      threshold: findModelSpec(LEXICAL_MODEL_ID)!.duplicateSimilarity,
+      excludeId: id
+    })
+
     return {
       memory: mapRowToMemoryRecord(insertedRow),
-      created: true
+      created: true,
+      ...(similar.length > 0 ? { similar } : {})
     }
   }
 
@@ -581,6 +874,11 @@ export class MemoryVault {
       .map((t) => t.trim().toLowerCase())
       .filter((t) => t.length > 0)
 
+    const vectorModel = options?.vectorModel ?? this.embedder.model
+    const minSimilarity =
+      options?.minSimilarity ??
+      (vectorModel === this.embedder.model ? LEXICAL_MIN_SIMILARITY : 0)
+
     const placeholders = allowedProjects.map(() => '?').join(', ')
     const params: (string | number)[] = [...allowedProjects]
     let categoryClause = ''
@@ -593,10 +891,10 @@ export class MemoryVault {
       .prepare(
         `SELECT m.*, mv.embedding AS vector_blob
          FROM memories m
-         LEFT JOIN memory_vectors mv ON mv.memory_id = m.id
+         LEFT JOIN memory_vectors mv ON mv.memory_id = m.id AND mv.model = ?
          WHERE m.project_id IN (${placeholders})${categoryClause}`
       )
-      .all(...params) as unknown as Array<
+      .all(vectorModel, ...params) as unknown as Array<
       RawMemoryRow & { vector_blob?: Uint8Array | null }
     >
 
@@ -673,43 +971,41 @@ export class MemoryVault {
       }
     }
 
-    // 2. Dense vector cosine ranking
-    const queryVec = this.embedder.embed(query)
-    const vectorScored: Array<{ id: string; similarity: number }> = []
+    // 2. Dense vector cosine ranking (only among candidates above the noise floor)
+    const queryVec = options?.queryVector ?? this.embedder.embed(query)
+    const similarityById = new Map<string, number>()
+    const vectorHits: Array<{ id: string; similarity: number }> = []
     for (const [id, entry] of candidatesById.entries()) {
       let similarity = 0
       if (entry.vectorBlob && entry.vectorBlob.byteLength > 0) {
         const memVec = deserializeVector(entry.vectorBlob)
         similarity = Math.max(0, cosineSimilarity(queryVec, memVec))
       }
-      vectorScored.push({ id, similarity })
+      similarityById.set(id, similarity)
+      if (similarity > 0 && similarity >= minSimilarity) {
+        vectorHits.push({ id, similarity })
+      }
     }
-    vectorScored.sort((a, b) => b.similarity - a.similarity)
-
-    const vecRankById = new Map<string, { rank: number; similarity: number }>()
-    vectorScored.forEach((item, idx) => {
-      vecRankById.set(item.id, {
-        rank: idx + 1,
-        similarity: item.similarity
-      })
-    })
+    vectorHits.sort((a, b) => b.similarity - a.similarity)
+    const vecRankById = new Map<string, number>()
+    vectorHits.forEach((item, idx) => vecRankById.set(item.id, idx + 1))
 
     // 3. Reciprocal Rank Fusion (RRF) + Importance
     const rrfK = 10
+    const hasQuery = query.trim().length > 0
     const scoredCandidates: ScoredMemory[] = []
     for (const [id, entry] of candidatesById.entries()) {
-      const vecInfo = vecRankById.get(id)
+      const vecRank = vecRankById.get(id)
       const ftsInfo = ftsRankById.get(id)
-      const vectorScore = vecInfo?.similarity ?? 0
+      const vectorScore = similarityById.get(id) ?? 0
       const ftsScore = ftsInfo?.rawScore ?? 0
 
-      // Exclude completely unrelated memories when query is non-empty
-      if (query.trim().length > 0 && vectorScore <= 0 && !ftsInfo) {
+      // A candidate must share a meaningful term or clear the similarity floor.
+      if (hasQuery && vecRank === undefined && !ftsInfo) {
         continue
       }
 
-      const vecRrf =
-        vecInfo && vecInfo.similarity > 0 ? 1.0 / (rrfK + vecInfo.rank) : 0
+      const vecRrf = vecRank !== undefined ? 1.0 / (rrfK + vecRank) : 0
       const ftsRrf = ftsInfo ? 1.2 / (rrfK + ftsInfo.rank) : 0
       const rrfScore =
         vecRrf +
@@ -2306,7 +2602,7 @@ export class MemoryVault {
               tagsText
             )
 
-          const embeddingText = `${memory.title}\n${memory.content}\n${tagsText}`
+          const embeddingText = embeddingTextFor(memory.title, memory.content, memory.tags ?? [])
           const vector = this.embedder.embed(embeddingText)
           const serializedVector = serializeVector(vector)
           this.db
@@ -2415,7 +2711,7 @@ export class MemoryVault {
                 tagsText
               )
 
-            const embeddingText = `${memory.title}\n${memory.content}\n${tagsText}`
+            const embeddingText = embeddingTextFor(memory.title, memory.content, memory.tags ?? [])
             const vector = this.embedder.embed(embeddingText)
             const serializedVector = serializeVector(vector)
             this.db
@@ -2513,7 +2809,9 @@ export class MemoryVault {
       projectCount: Number(projectRow.cnt),
       memoryCount: Number(memoryRow.cnt),
       vectorCount: Number(vectorRow.cnt),
-      totalTokens: Number(memoryRow.tokens)
+      totalTokens: Number(memoryRow.tokens),
+      activeEmbedder: this.getActiveEmbedder().spec.id,
+      vectorModels: this.vectorModelCounts()
     }
   }
 

@@ -19,6 +19,12 @@ import {
   triggerAutoSyncIfEnabled,
 } from '../core/sync.ts'
 import type { MemoryVault } from '../core/vault.ts'
+import {
+  cachedActiveEmbedder,
+  recallWithEmbedder,
+  storeMemoryWithEmbedder,
+  type MlBackend
+} from '../core/semantic.ts'
 import { BUNDLE_ID, VERSION } from '../version.ts'
 
 const JSONRPC_VERSION = '2.0'
@@ -324,6 +330,7 @@ function parseCategory(raw: unknown): MemoryCategory | undefined {
 export async function handleMcpRequest(
   vault: MemoryVault,
   req: Record<string, unknown>,
+  mlBackend?: MlBackend,
 ): Promise<Record<string, unknown> | null> {
   const method = typeof req.method === 'string' ? req.method : ''
   const hasId = 'id' in req && req.id !== undefined
@@ -390,15 +397,19 @@ export async function handleMcpRequest(
             },
           }
         }
-        const stored = vault.storeMemory({
-          content,
-          title: typeof args.title === 'string' ? args.title : undefined,
-          category: parseCategory(args.category),
-          tags: parseTags(args.tags),
-          projectId: typeof args.projectId === 'string' ? args.projectId : undefined,
-          sourceAgent: typeof args.sourceAgent === 'string' ? args.sourceAgent : undefined,
-          importance: typeof args.importance === 'number' ? args.importance : undefined,
-        })
+        const stored = await storeMemoryWithEmbedder(
+          vault,
+          {
+            content,
+            title: typeof args.title === 'string' ? args.title : undefined,
+            category: parseCategory(args.category),
+            tags: parseTags(args.tags),
+            projectId: typeof args.projectId === 'string' ? args.projectId : undefined,
+            sourceAgent: typeof args.sourceAgent === 'string' ? args.sourceAgent : undefined,
+            importance: typeof args.importance === 'number' ? args.importance : undefined,
+          },
+          cachedActiveEmbedder(vault, mlBackend).embedder,
+        )
         await triggerAutoSyncIfEnabled(vault, { projectId: stored.memory.projectId })
         return {
           jsonrpc: JSONRPC_VERSION,
@@ -411,12 +422,17 @@ export async function handleMcpRequest(
 
       if (toolName === 'memory_recall') {
         const query = typeof args.query === 'string' ? args.query : ''
-        const res = vault.recallMemories(query, {
-          projectId: typeof args.projectId === 'string' ? args.projectId : undefined,
-          category: parseCategory(args.category),
-          limit: typeof args.limit === 'number' ? args.limit : undefined,
-          maxTokens: typeof args.maxTokens === 'number' ? args.maxTokens : undefined,
-        })
+        const res = await recallWithEmbedder(
+          vault,
+          query,
+          {
+            projectId: typeof args.projectId === 'string' ? args.projectId : undefined,
+            category: parseCategory(args.category),
+            limit: typeof args.limit === 'number' ? args.limit : undefined,
+            maxTokens: typeof args.maxTokens === 'number' ? args.maxTokens : undefined,
+          },
+          cachedActiveEmbedder(vault, mlBackend).embedder,
+        )
         return {
           jsonrpc: JSONRPC_VERSION,
           id,
@@ -427,10 +443,16 @@ export async function handleMcpRequest(
       }
 
       if (toolName === 'memory_briefing') {
-        const res = vault.getProjectBriefing({
+        const briefing = vault.getProjectBriefing({
           projectId: typeof args.projectId === 'string' ? args.projectId : undefined,
           maxTokens: typeof args.maxTokens === 'number' ? args.maxTokens : undefined,
         })
+        // Read-only embedder report; never loads the model (briefing does not embed).
+        const active = vault.getActiveEmbedder()
+        const res = {
+          ...briefing,
+          embedder: { active: active.spec.id, source: active.source },
+        }
         return {
           jsonrpc: JSONRPC_VERSION,
           id,

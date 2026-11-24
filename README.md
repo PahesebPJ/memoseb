@@ -8,15 +8,16 @@ Se conecta y registra automáticamente en [**hubseb**](https://github.com/Pahese
 
 - **Aislamiento Multi-Proyecto + Memoria Global**: Detecta automáticamente el proyecto activo inspeccionando la raíz de `package.json` o `.git` (o recibe `--project <id>`). Permite aislar el conocimiento de cada repositorio mientras comparte convenciones transversales en el proyecto `global`.
 - **Análisis e Indexación Automática de Repositorios (`memoseb analyze`)**: Inspecciona manifiestos (`package.json`, `tsconfig.json`, `Cargo.toml`, `pyproject.toml`, `go.mod`, `Dockerfile`), estructura de directorios (`src/`), scripts, workflows CI y `README.md` para sintetizar y persistir automáticamente los 3 pilares base del proyecto (`architecture`, `convention` y `domain`).
-- **Tokenización y Vectorización Local Zero-Dependency**: Construido íntegramente sobre `node:sqlite` (Node.js `>=22`) en modo WAL. Incluye `LocalFeatureHashEmbedder` (`local-feature-hash-v1`), un motor determinista de *feature hashing* con `FNV-1a` que proyecta palabras, prefijos, bigramas y trigramas de caracteres en vectores `Float32Array` normalizados (384 dimensiones) sin depender de APIs externas ni binarios nativos adicionales.
-- **Búsqueda Híbrida RRF + Presupuesto de Tokens**: Combina similitud coseno densa (`memory_vectors`) y ranking léxico `BM25` (`SQLite FTS5`) mediante **Reciprocal Rank Fusion (RRF)** ponderada por importancia (`0.0` a `1.0`). Trunca automáticamente los resultados para respetar `--max-tokens` (por defecto `1200` tokens) sin saturar la ventana de contexto del agente.
+- **Tokenización y Vectorización Local Zero-Dependency**: Construido íntegramente sobre `node:sqlite` (Node.js `>=22`) en modo WAL. Por defecto usa `LocalFeatureHashEmbedder` (`local-feature-hash-v2`), un motor determinista de *feature hashing* con `FNV-1a` que proyecta palabras, prefijos, bigramas y trigramas de caracteres en vectores `Float32Array` normalizados (384 dimensiones). Es **léxico**: encuentra palabras parecidas, no significados. Consultas y documentos se normalizan igual (minúsculas, sin tildes, sin *stopwords* ES/EN), así que "sincronización" y "sincronizacion" coinciden.
+- **Búsqueda Semántica Opcional (`memoseb model`)**: Puedes activar un modelo de embeddings local (ONNX en CPU vía `transformers.js`) que entiende significado: "replicar datos entre máquinas" encuentra la memoria sobre "sincronización P2P". Se instala bajo demanda junto a la bóveda (no es dependencia del paquete) y, tras la descarga, funciona sin red. Ver [Búsqueda semántica](#búsqueda-semántica-opcional-memoseb-model).
+- **Búsqueda Híbrida RRF + Presupuesto de Tokens**: Combina similitud coseno densa (`memory_vectors`) y ranking léxico `BM25` (`SQLite FTS5`) mediante **Reciprocal Rank Fusion (RRF)** ponderada por importancia (`0.0` a `1.0`). Los candidatos sin coincidencia léxica deben superar el umbral de similitud del modelo activo, de modo que una consulta sin relación devuelve 0 resultados en lugar de ruido. Trunca automáticamente los resultados para respetar `--max-tokens` (por defecto `1200` tokens) sin saturar la ventana de contexto del agente.
 - **Servidor MCP `stdio` + CLI `hubseb/v1`**: Expone un servidor JSON-RPC 2.0 sobre `stdio` (`memoseb mcp`) y una interfaz CLI compatible con el contrato `hubseb/v1` (`--json`), emitiendo señales en tiempo real (`memory.stored`, `memory.forgotten`, `memoseb.deployed`) a la topología de `hubseb`.
 
 ```mermaid
 flowchart LR
     Agent["Agente IA / crewseb"] -->|CLI o MCP stdio| Vault["MemoryVault (node:sqlite)"]
     Vault --> FTS["SQLite FTS5 (BM25)"]
-    Vault --> Vec["LocalFeatureHashEmbedder (Float32Array 384d)"]
+    Vault --> Vec["Embedder activo: hash léxico (defecto) o modelo ONNX opcional"]
     FTS --> RRF["Reciprocal Rank Fusion + Token Budget"]
     Vec --> RRF
     Vault -.->|provides: memory.vault| Hub["hubseb Topology"]
@@ -61,6 +62,7 @@ memoseb import <file> [--replace] [--project <id>] # Importa snapshot nativo o b
 memoseb node status | enable | disable | discover | set-parent | add-child | add-peer | remove | serve | service # Red Jerárquica (Padre/Hijo) o P2P Descentralizada
 memoseb group create | list | add-node | remove-node | delete | default-policy # Control de acceso y grupos de permisos (ACL)
 memoseb sync [--url <peer>] [--project <id>] [--full] [--format memoseb|gaze|p2p] # Sincronización bidireccional (Jerárquica o P2P Gaze)
+memoseb model list | status | enable [id] [--yes] | disable [--purge] | reindex # Activa/desactiva la búsqueda semántica (ML) y elige el modelo
 memoseb mcp                                  # Inicia el servidor MCP JSON-RPC 2.0 por stdio
 memoseb check [--json]                       # Verifica la integridad SHA-256 de las directivas en cada host
 memoseb uninstall [--json]                   # Purga archivos desplegados, desconecta el nodo de hubseb y quita el servicio de nodo si está instalado
@@ -98,6 +100,36 @@ memoseb capabilities [--json]                # Muestra capacidades (provides/con
 | `--permissions <m>` | `group create` | Modo de acceso del grupo: `readwrite` (por defecto), `readonly` o `writeonly` |
 | `--policy <p>` | `group default-policy` | Política para nodos sin grupo asignado: `none` (denegar) o `all` (permitir todo) |
 | `--group <name>` | `node add-child`, `node set-parent`, `node enable` | Asigna o solicita vinculación al grupo de permisos especificado |
+| `--yes` | `model enable` | Confirma la descarga sin preguntar (obligatorio fuera de una terminal interactiva) |
+| `--purge` | `model disable` | Borra también el runtime de ML y los modelos descargados |
+
+## Búsqueda Semántica Opcional (`memoseb model`)
+
+Por defecto memoseb no usa machine learning: el embedder integrado compara ortografía. Con `memoseb model enable` se activa un modelo neuronal local que compara **significado**, combinado con la búsqueda por palabras (FTS5), que sigue siendo la mejor para nombres exactos como `sync_groups`.
+
+```sh
+memoseb model list               # Catálogo: tamaño, RAM, idiomas y estado
+memoseb model enable             # Menú interactivo (Enter = e5-small, recomendado)
+memoseb model enable e5-small --yes   # Sin preguntas (agentes, scripts)
+memoseb model status             # Modelo activo, vectores indexados y disco usado
+memoseb model reindex            # Recalcula vectores pendientes con el modelo activo
+memoseb model disable [--purge]  # Vuelve al hash léxico (--purge borra runtime y modelos)
+```
+
+| id | Modelo | Disco | RAM extra | Idiomas | Nota |
+|---|---|---|---|---|---|
+| `hash` | integrado | 0 | ~0 | cualquiera (léxico) | por defecto, sin ML |
+| `minilm-en` | all-MiniLM-L6-v2 | ~23 MB | ~115 MB | inglés | el más ligero; no entiende memorias en español |
+| `e5-small` | multilingual-e5-small | ~130 MB | ~360 MB | 100+ | **recomendado** |
+| `minilm-multi` | paraphrase-multilingual-MiniLM-L12-v2 | ~130 MB | ~360 MB | 50+ | orientado a paráfrasis |
+| `e5-base` | multilingual-e5-base | ~283 MB | ~510 MB | 100+ | el más preciso y pesado |
+
+- **Instalación bajo demanda:** la primera activación instala `@huggingface/transformers` en `<directorio de la bóveda>/ml/runtime` (~85 MB tras eliminar binarios de otras plataformas y de GPU) y descarga los pesos en `ml/models`. `MEMOSEB_ML_DIR` cambia esa ubicación.
+- **Sin red en el uso normal:** solo `model enable` descarga; después todo se ejecuta en local, en CPU.
+- **Rendimiento medido** (x86-64, CPU, `e5-small`): ~0.9 s para cargar el modelo, ~7 ms por consulta, ~10 ms por memoria al indexar. El servidor MCP mantiene el modelo cargado; cada `memoseb recall` desde la CLI paga la carga (~0.85 s en total frente a ~10 ms en modo léxico). `memoseb context` nunca carga el modelo.
+- **Prioridad de configuración:** `MEMOSEB_EMBEDDER=<id>` (variable de entorno) > lo elegido con `memoseb model enable` > `hash`.
+- **Cambiar de modelo es seguro:** cada vector guarda el modelo que lo generó y solo se comparan vectores del modelo activo. Las memorias que llegan por `import` o `sync` se re-vectorizan solas en las siguientes búsquedas (o con `model reindex`); mientras tanto se encuentran por FTS5.
+- **Medir la precisión:** `node scripts/recall-eval.ts` evalúa el embedder léxico y `MEMOSEB_ML_DIR=<dir> node scripts/bench-embedder.ts <id>` mide RAM, latencia y precisión de un modelo con el mismo conjunto de consultas.
 
 ## Portabilidad entre Máquinas (`export` / `import`)
 

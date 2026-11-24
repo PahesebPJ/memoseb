@@ -276,7 +276,9 @@ class MockSyncVault implements SyncCapableVault {
       projectCount: this.projects.size,
       memoryCount: this.memories.size,
       vectorCount: this.memories.size,
-      totalTokens: 42
+      totalTokens: 42,
+      activeEmbedder: 'hash',
+      vectorModels: []
     }
   }
 }

@@ -31,6 +31,7 @@
   "files": [
     "dist",
     "rules",
+    "resources",
     "skills",
     "docs",
     "README.md",
