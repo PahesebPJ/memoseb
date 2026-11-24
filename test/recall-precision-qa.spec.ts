@@ -485,13 +485,14 @@ describe('recall precision QA matrix', () => {
       embedder.embedQuery = async () => {
         throw new Error('must not embed')
       }
-      const res = recallWithEmbedder(
-        new MemoryVault({ dbPath, runtime }),
-        '  ',
-        { projectId: 'p' },
-        embedder
-      )
-      assert.equal((await res).memories.length, 1)
+      const vault = new MemoryVault({ dbPath, runtime })
+      try {
+        const res = await recallWithEmbedder(vault, '  ', { projectId: 'p' }, embedder)
+        assert.equal(res.memories.length, 1)
+      } finally {
+        // Windows cannot delete an open SQLite file, so afterEach would fail with EBUSY.
+        vault.close()
+      }
     })
 
     it('stale lexical vectors of an old model tag are re-embedded on open when hash is active', async () => {
