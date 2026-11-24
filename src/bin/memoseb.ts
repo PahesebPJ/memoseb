@@ -82,6 +82,14 @@ import {
 } from '../core/service.ts'
 import { startMcpServer } from '../mcp/server.ts'
 import {
+  defaultMlBackend,
+  recallWithEmbedder,
+  resolveActiveEmbedder,
+  storeMemoryWithEmbedder,
+  type MlBackend
+} from '../core/semantic.ts'
+import { runModelCommand, type ModelCommandIo } from './model-command.ts'
+import {
   auditMemosebDirectives,
   BUNDLE_ID,
   CONSUMES,
@@ -109,6 +117,10 @@ export interface ExecuteMemoCliOptions {
   readStdin?: () => Promise<string>
   spawnProcess?: typeof spawn
   probeTailscale?: typeof probeTailscale
+  /** npm/network/ONNX access for semantic embedders; tests inject a fake. */
+  mlBackend?: MlBackend
+  /** Prompts and live progress of "memoseb model". */
+  modelIo?: Omit<ModelCommandIo, 'backend'>
 }
 
 /** Argumentos del hijo de `serve --detach`: sin --detach ni el token en la línea de comandos. */
@@ -250,6 +262,8 @@ const SWITCH_FLAGS = new Set([
   '--no-tailscale',
   '--tailscale',
   '--token-stdin',
+  '--yes',
+  '--purge',
 ])
 
 function extractFlags(argv: readonly string[]): {
@@ -313,6 +327,10 @@ function extractFlags(argv: readonly string[]): {
     }
     if (token === '--no-lan') {
       noLanFlag = true
+      continue
+    }
+    if (token === '--help' || token === '-h') {
+      switches.add('help')
       continue
     }
     if (SWITCH_FLAGS.has(token)) {
@@ -406,7 +424,8 @@ export async function executeMemoCli(
     }
   }
 
-  const command = positional[0] ?? 'help'
+  // "memoseb remember --help" must print help, never store "--help" as a memory.
+  const command = switches.has('help') ? 'help' : (positional[0] ?? 'help')
 
   if (command === 'capabilities') {
     const payload = {
@@ -550,9 +569,20 @@ export async function executeMemoCli(
       : undefined
     const importance = flags.importance !== undefined ? Number(flags.importance) : undefined
 
+    if (content.split(/\s+/).every((token) => /^-{1,2}([a-z][\w-]*)?$/i.test(token))) {
+      const message = `Refusing to store "${content}": it looks like a command-line flag, not a memory.`
+      return jsonMode
+        ? { exitCode: 2, stdout: serializeWire(wireFailure(command, 'INVALID_CONTENT', message)), stderr: '' }
+        : { exitCode: 2, stdout: '', stderr: `${message}\n` }
+    }
+
     const vault = new MemoryVault({ dbPath, runtime })
+    const { embedder, warning: embedderWarning } = resolveActiveEmbedder(
+      vault,
+      options.mlBackend ?? defaultMlBackend,
+    )
     try {
-      const stored = vault.storeMemory({
+      const stored = await storeMemoryWithEmbedder(vault, {
         content,
         title: flags.title,
         category: rawCategory as MemoryCategory | undefined,
@@ -561,7 +591,7 @@ export async function executeMemoCli(
         sourceAgent: flags.agent,
         importance,
         cwd,
-      })
+      }, embedder)
 
       try {
         const topology = new TopologyStore(runtime)
@@ -578,14 +608,25 @@ export async function executeMemoCli(
       await triggerAutoSyncIfEnabled(vault, { projectId: stored.memory.projectId })
 
       if (jsonMode) {
-        return { exitCode: 0, stdout: serializeWire(wireSuccess(command, stored)), stderr: '' }
+        const payload = embedderWarning && !stored.warning ? { ...stored, warning: embedderWarning } : stored
+        return { exitCode: 0, stdout: serializeWire(wireSuccess(command, payload)), stderr: '' }
       }
+      const similarHint = (stored.similar ?? [])
+        .map(
+          (s) =>
+            `  Possible duplicate of [${s.id}] ${s.title} (similarity ${s.similarity.toFixed(2)}). Remove the outdated one with "memoseb forget <id>".\n`,
+        )
+        .join('')
       return {
         exitCode: 0,
-        stdout: `${stored.created ? 'Stored' : 'Updated existing'} memory [${stored.memory.id}] (${stored.memory.category}, ~${stored.memory.tokenCount} tokens) in project ${stored.memory.projectId}: ${stored.memory.title}\n`,
-        stderr: '',
+        stdout: `${stored.created ? 'Stored' : 'Updated existing'} memory [${stored.memory.id}] (${stored.memory.category}, ~${stored.memory.tokenCount} tokens) in project ${stored.memory.projectId}: ${stored.memory.title}\n${similarHint}`,
+        stderr: [embedderWarning, stored.warning]
+          .filter(Boolean)
+          .map((w) => `Warning: ${w}\n`)
+          .join(''),
       }
     } finally {
+      await embedder?.dispose()
       vault.close()
     }
   }
@@ -623,20 +664,34 @@ export async function executeMemoCli(
       : undefined
 
     const vault = new MemoryVault({ dbPath, runtime })
+    const { embedder, warning: embedderWarning } = resolveActiveEmbedder(
+      vault,
+      options.mlBackend ?? defaultMlBackend,
+    )
     try {
-      const res = vault.recallMemories(query, {
-        projectId: flags.project,
-        category,
-        tags,
-        limit,
-        maxTokens,
-        cwd,
-      })
+      const res = await recallWithEmbedder(
+        vault,
+        query,
+        {
+          projectId: flags.project,
+          category,
+          tags,
+          limit,
+          maxTokens,
+          cwd,
+        },
+        embedder,
+      )
       if (jsonMode) {
-        return { exitCode: 0, stdout: serializeWire(wireSuccess(command, res)), stderr: '' }
+        const payload = embedderWarning && !res.warning ? { ...res, warning: embedderWarning } : res
+        return { exitCode: 0, stdout: serializeWire(wireSuccess(command, payload)), stderr: '' }
       }
+      const warningText = [embedderWarning, res.warning]
+        .filter(Boolean)
+        .map((w) => `Warning: ${w}\n`)
+        .join('')
       if (res.memories.length === 0) {
-        return { exitCode: 0, stdout: 'No matching memories found.\n', stderr: '' }
+        return { exitCode: 0, stdout: 'No matching memories found.\n', stderr: warningText }
       }
       const lines = [
         `Found ${res.memories.length} memories for project ${res.projectId} (~${res.totalTokens} tokens):`,
@@ -646,8 +701,9 @@ export async function executeMemoCli(
           `  • [${m.id}] (${m.category} | score=${m.score.toFixed(3)} | ~${m.tokenCount}t) ${m.title}: ${m.content}`,
         )
       }
-      return { exitCode: 0, stdout: `${lines.join('\n')}\n`, stderr: '' }
+      return { exitCode: 0, stdout: `${lines.join('\n')}\n`, stderr: warningText }
     } finally {
+      await embedder?.dispose()
       vault.close()
     }
   }
@@ -768,6 +824,7 @@ export async function executeMemoCli(
         `  Total projects: ${stats.projectCount}`,
         `  Total vectors:  ${stats.vectorCount}`,
         `  Total tokens:   ${stats.totalTokens}`,
+        `  Embedder:       ${stats.activeEmbedder} (see "memoseb model status")`,
       ]
       return { exitCode: 0, stdout: `${lines.join('\n')}\n`, stderr: '' }
     } finally {
@@ -2664,6 +2721,18 @@ export async function executeMemoCli(
     }
   }
 
+  if (command === 'model' || command === 'models') {
+    return runModelCommand({
+      subcommand: positional[1],
+      modelArg: positional[2],
+      jsonMode,
+      yes: switches.has('yes'),
+      purge: switches.has('purge'),
+      openVault: () => new MemoryVault({ dbPath, runtime }),
+      io: { ...options.modelIo, backend: options.mlBackend },
+    })
+  }
+
   if (command === 'help' || command === '--help' || command === '-h') {
     const commands = [
       'setup',
@@ -2681,6 +2750,7 @@ export async function executeMemoCli(
       'node',
       'group',
       'sync',
+      'model',
       'mcp',
       'capabilities',
     ]
@@ -2706,6 +2776,11 @@ export async function executeMemoCli(
       '  memoseb node enable --role peer [--token <t> | --token-stdin] [--interval 1-1440]  Token also via MEMOSEB_SYNC_TOKEN',
       '  memoseb group <list|create|add-node|delete|...> Manage peer permission groups and ACLs',
       '  memoseb sync [--url <peer>] [--full] [--json] Synchronize memories with peers',
+      '  memoseb model list                           Show embedding models (size, RAM, languages, status)',
+      '  memoseb model status                         Active embedder, indexed vectors and ML disk usage',
+      '  memoseb model enable [id] [--yes]            Turn on semantic (ML) search; menu when no id is given',
+      '  memoseb model disable [--purge]              Back to the built-in lexical hash (--purge deletes models)',
+      '  memoseb model reindex                        Re-embed memories with the active model',
       '  memoseb mcp                                  Start stdio JSON-RPC 2.0 MCP server',
       '  memoseb capabilities [--json]                Display provider, consumer and signal metadata',
       '',

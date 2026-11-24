@@ -1,5 +1,8 @@
+import { contentTokens } from './text.ts'
+
 export const DEFAULT_DIMENSIONS = 384
 
+/** Synchronous embedder used inside SQLite transactions (the built-in lexical hash). */
 export interface EmbeddingProvider {
   readonly model: string
   readonly dimensions: number
@@ -55,8 +58,14 @@ function fnv1a32(input: string, seed = 0x811c9dc5): number {
   return hash >>> 0
 }
 
+export const LEXICAL_EMBEDDER_MODEL = 'local-feature-hash-v2'
+
+/**
+ * Lexical "embedding": hashes words, prefixes, bigrams and char trigrams into a
+ * fixed vector. It captures spelling overlap, not meaning.
+ */
 export class LocalFeatureHashEmbedder implements EmbeddingProvider {
-  readonly model = 'local-feature-hash-v1'
+  readonly model = LEXICAL_EMBEDDER_MODEL
   readonly dimensions: number
 
   constructor(dimensions: number = DEFAULT_DIMENSIONS) {
@@ -65,8 +74,7 @@ export class LocalFeatureHashEmbedder implements EmbeddingProvider {
 
   embed(text: string): Float32Array {
     const vec = new Float32Array(this.dimensions)
-    const normalized = text.toLowerCase().normalize('NFKD')
-    const words = normalized.match(/[a-z0-9]+/g) ?? []
+    const words = contentTokens(text)
     if (words.length === 0) {
       return vec
     }
