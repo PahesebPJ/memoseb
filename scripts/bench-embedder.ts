@@ -16,7 +16,7 @@ import {
   LEXICAL_QUERIES,
   runRecallEval,
   seedEvalVault,
-  SEMANTIC_QUERIES,
+  PARAPHRASE_QUERIES,
   UNRELATED_QUERIES
 } from '../test/fixtures/recall-eval.ts'
 
@@ -76,9 +76,9 @@ try {
     return Math.max(...memoryVectors.map((v) => cosineSimilarity(q, v)))
   }
   const relevant = []
-  for (const { query } of [...LEXICAL_QUERIES, ...SEMANTIC_QUERIES]) relevant.push(await best(query))
+  for (const { query } of [...LEXICAL_QUERIES, ...PARAPHRASE_QUERIES]) relevant.push(await best(query))
   const unrelated = []
-  for (const query of UNRELATED_QUERIES) unrelated.push(await best(query))
+  for (const { query } of UNRELATED_QUERIES) unrelated.push(await best(query))
   console.log(`  calibration: relevant top-1 min=${Math.min(...relevant).toFixed(3)} | unrelated top-1 max=${Math.max(...unrelated).toFixed(3)} (current minSimilarity=${spec.minSimilarity})`)
 } finally {
   vault.close()
