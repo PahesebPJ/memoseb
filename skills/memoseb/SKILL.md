@@ -27,8 +27,10 @@ Usa `memoseb` para dotar a los agentes de memoria persistente entre sesiones, ai
      --title "Motor de persistencia híbrido" \
      --category architecture \
      --tags "sqlite,fts5,vectors" \
+     --aliases "¿dónde se guardan los vectores?|why no external vector database?|¿cómo funciona la búsqueda?" \
      --importance 0.9
    ```
+   Añade siempre 2–4 **aliases**: preguntas reales que alguien haría para llegar a esa memoria, con otras palabras que las del contenido y en español e inglés (separadas por `|`; en MCP, `aliases` como array). Mejoran mucho el recall de consultas parafraseadas sin necesidad de modelos ML.
 4. **Portabilidad, Sincronización e Interoperabilidad (`export`, `import`, `node`, `group`, `sync`):**
    - **Snapshots Portables y Bundles Gaze:** Respalda o transfiere memorias con verificación SHA-256 e importación Last-Write-Wins:
      ```bash

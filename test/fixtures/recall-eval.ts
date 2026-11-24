@@ -18,7 +18,7 @@ export interface SeedOptions {
   withAliases?: boolean
 }
 
-export function seedEvalVault(vault: MemoryVault, _options: SeedOptions = {}): Map<string, string> {
+export function seedEvalVault(vault: MemoryVault, options: SeedOptions = {}): Map<string, string> {
   const idByKey = new Map<string, string>()
   for (const memory of EVAL_MEMORIES) {
     const stored = vault.storeMemory({
@@ -27,6 +27,7 @@ export function seedEvalVault(vault: MemoryVault, _options: SeedOptions = {}): M
       title: memory.title,
       content: memory.content,
       tags: memory.tags,
+      ...(options.withAliases ? { aliases: memory.aliases ?? [] } : {}),
       importance: 0.5
     })
     idByKey.set(memory.key, stored.memory.id)

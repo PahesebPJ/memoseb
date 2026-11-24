@@ -89,7 +89,7 @@ export async function storeMemoryWithEmbedder(
   let vector: Float32Array
   try {
     ;[vector] = (await embedder.embedPassages([
-      embeddingTextFor(memory.title, memory.content, memory.tags)
+      embeddingTextFor(memory.title, memory.content, memory.tags, memory.aliases ?? [])
     ])) as [Float32Array]
   } catch (err) {
     // The memory is already stored with a lexical vector; a later recall re-embeds it.

@@ -226,6 +226,7 @@ const VALUE_FLAGS = new Set([
   '--title',
   '--category',
   '--tags',
+  '--aliases',
   '--agent',
   '--importance',
   '--limit',
@@ -567,6 +568,8 @@ export async function executeMemoCli(
           .map((t) => t.trim())
           .filter(Boolean)
       : undefined
+    // "|" separates aliases because the questions themselves often contain commas.
+    const aliases = flags.aliases !== undefined ? flags.aliases.split('|') : undefined
     const importance = flags.importance !== undefined ? Number(flags.importance) : undefined
 
     if (content.split(/\s+/).every((token) => /^-{1,2}([a-z][\w-]*)?$/i.test(token))) {
@@ -587,6 +590,7 @@ export async function executeMemoCli(
         title: flags.title,
         category: rawCategory as MemoryCategory | undefined,
         tags,
+        aliases,
         projectId: flags.project,
         sourceAgent: flags.agent,
         importance,
@@ -2762,7 +2766,7 @@ export async function executeMemoCli(
       '  memoseb check [--json]                       Verify SHA-256 integrity of directives across hosts',
       '  memoseb uninstall [--json]                   Purge lock-tracked files & detach from hubseb',
       '  memoseb analyze [path] [--dry-run] [--json]  Analyze repository and store architecture, convention & domain memories',
-      '  memoseb remember "<text>" [options]          Store a memory (--category, --title, --tags, --importance)',
+      '  memoseb remember "<text>" [options]          Store a memory (--category, --title, --tags, --aliases "q1|q2", --importance)',
       '  memoseb recall "<query>" [options]           Hybrid search (--limit, --max-tokens, --category)',
       '  memoseb context [--max-tokens N]             Project briefing within token budget',
       '  memoseb projects [--json]                    List all indexed projects and memory counts',

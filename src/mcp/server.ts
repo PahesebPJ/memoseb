@@ -56,6 +56,13 @@ export const MCP_TOOLS = [
           items: { type: 'string' },
           description: 'Optional keyword tags for filtering and retrieval.',
         },
+        aliases: {
+          type: 'array',
+          items: { type: 'string' },
+          maxItems: 12,
+          description:
+            'Recommended: 2-4 real questions this memory answers, phrased as someone would ask them (Spanish and English), e.g. "¿cómo se sincronizan los nodos?". They are searched like extra text and greatly improve recall of paraphrased queries. Merged with existing aliases on update.',
+        },
         projectId: {
           type: 'string',
           description: 'Optional project identifier override (defaults to active repository).',
@@ -307,6 +314,13 @@ function parseStringList(raw: unknown): string[] | undefined {
   return undefined
 }
 
+/** Accepts a string array, or a single "q1|q2" string from clients that flatten arrays. */
+function parseAliasesArg(raw: unknown): string[] | undefined {
+  if (Array.isArray(raw)) return raw.filter((item): item is string => typeof item === 'string')
+  if (typeof raw === 'string') return raw.split('|')
+  return undefined
+}
+
 function parseTags(raw: unknown): string[] | undefined {
   if (Array.isArray(raw)) {
     return raw.map((t) => String(t).trim()).filter(Boolean)
@@ -404,6 +418,7 @@ export async function handleMcpRequest(
             title: typeof args.title === 'string' ? args.title : undefined,
             category: parseCategory(args.category),
             tags: parseTags(args.tags),
+            aliases: parseAliasesArg(args.aliases),
             projectId: typeof args.projectId === 'string' ? args.projectId : undefined,
             sourceAgent: typeof args.sourceAgent === 'string' ? args.sourceAgent : undefined,
             importance: typeof args.importance === 'number' ? args.importance : undefined,

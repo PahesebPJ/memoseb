@@ -7,8 +7,9 @@
 
 ## 2. Aprendizaje Continuo y Persistencia
 - Cuando descubras decisiones de arquitectura, convenciones no obvias del repositorio, contratos de dominio o la causa raíz de un bug complejo, persiste el hallazgo de forma concisa y densa en conocimiento:
-  - Por CLI: `memoseb remember "<aprendizaje>" --title "<título corto>" --category <architecture|convention|bugfix|decision|domain>`
-  - Por MCP: herramienta `memory_store` con `content`, `title`, `category` y `tags`.
+  - Por CLI: `memoseb remember "<aprendizaje>" --title "<título corto>" --category <architecture|convention|bugfix|decision|domain> --aliases "<pregunta 1>|<question 2>"`
+  - Por MCP: herramienta `memory_store` con `content`, `title`, `category`, `tags` y `aliases`.
+  - Incluye 2–4 `aliases`: preguntas reales que alguien haría para encontrar ese conocimiento, con palabras distintas a las del contenido, en español e inglés.
 - Evita guardar ruido efímero (logs crudos, diffs temporales o estados de sesión); almacena únicamente conocimiento reutilizable en futuras sesiones.
 
 ## 3. Higiene de Presupuesto de Tokens
