@@ -115,6 +115,41 @@ async function importRuntime(paths: MlPaths): Promise<TransformersModule> {
   return (await import(pathToFileURL(entry).href)) as TransformersModule
 }
 
+/**
+ * What to hand transformers.js as the model id. Downloads use the repo id and
+ * pinned revision. Offline loads use the local directory instead, because
+ * transformers.js 4.3.2 caches a pinned download inconsistently: tokenizer and
+ * ONNX files go under <repo>/<revision>/ but pipeline() may store config.json
+ * in <repo>/, and get_tokenizer_files ignores the revision. A repo id therefore
+ * fails offline ("this.tokenizer is not a function" / "tokenizer_class").
+ * Installs made before revisions were pinned keep every file in <repo>/.
+ */
+export function modelSource(
+  paths: MlPaths,
+  spec: { hfModel: string | null; revision?: string },
+  allowRemote: boolean
+): { model: string; revision: string | undefined } {
+  const revision = spec.revision ?? 'main'
+  if (allowRemote || !spec.hfModel) return { model: spec.hfModel ?? '', revision }
+  const root = path.join(paths.modelsDir, ...spec.hfModel.split('/'))
+  const revisionDir = path.join(root, revision)
+  const has = (dir: string, file: string): boolean => fs.existsSync(path.join(dir, file))
+  if (has(revisionDir, 'tokenizer_config.json') && !has(revisionDir, 'config.json') && has(root, 'config.json')) {
+    try {
+      // config.json was fetched at the pinned revision too; only its cache key lacks it.
+      fs.copyFileSync(path.join(root, 'config.json'), path.join(revisionDir, 'config.json'))
+    } catch {
+      // Read-only cache: fall through to the repo id and let transformers.js report it.
+    }
+  }
+  for (const dir of [revisionDir, root]) {
+    if (has(dir, 'config.json') && has(dir, 'tokenizer_config.json')) {
+      return { model: dir, revision: undefined }
+    }
+  }
+  return { model: spec.hfModel, revision }
+}
+
 export class TransformersEmbedder implements SemanticEmbedder {
   readonly spec: EmbedderModelSpec
   readonly model: string
@@ -153,10 +188,11 @@ export class TransformersEmbedder implements SemanticEmbedder {
         runtime.env.allowLocalModels = true
         runtime.env.allowRemoteModels = this.allowRemote
         const onProgress = this.onProgress
-        const extractor = await runtime.pipeline('feature-extraction', this.spec.hfModel!, {
+        // Pinned commit: a later push to the model repo cannot change what we download.
+        const source = modelSource(this.paths, this.spec, this.allowRemote)
+        const extractor = await runtime.pipeline('feature-extraction', source.model, {
           dtype: 'q8',
-          // Pinned commit: a later push to the model repo cannot change what we download.
-          revision: this.spec.revision ?? 'main',
+          ...(source.revision ? { revision: source.revision } : {}),
           progress_callback: onProgress
             ? (event) => {
                 if (event.status === 'progress' && typeof event.file === 'string') {
