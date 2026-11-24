@@ -129,6 +129,15 @@ describe('Reranking recall results', () => {
     assert.equal(none.memories.length, 0)
   })
 
+  it('keeps a memory containing every query term even when the reranker scores it below the floor', async () => {
+    const exact = store('FTS5 MATCH sanitization quotes every term')
+    store('FTS5 is the SQLite full text engine')
+    const strict = new FakeReranker(V2)
+    ;(strict.spec as { minScore: number }).minScore = 0.95
+    const res = await recallWithEmbedder(vault, 'FTS5 sanitization', { ...opts, limit: 5 }, null, strict)
+    assert.deepEqual(res.memories.map((m) => m.id), [exact.id])
+  })
+
   it('sends at least MIN_RERANK_CANDIDATES candidates but still applies the limit', async () => {
     for (let i = 0; i < MIN_RERANK_CANDIDATES + 10; i++) store(`sync note number ${i} about peers`)
     const reranker = new FakeReranker(V2)

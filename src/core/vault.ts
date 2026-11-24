@@ -2830,11 +2830,12 @@ export class MemoryVault {
             )
             const tagsJson = JSON.stringify(memory.tags ?? [])
             const tagsText = (memory.tags ?? []).join(' ')
-            // A sender that predates aliases sends none: keep the local ones.
-            const aliases =
-              memory.aliases === undefined
-                ? parseTags(localMem.aliases ?? '[]')
-                : normalizeAliases(memory.aliases)
+            // Aliases only ever grow (like storeMemory): union with the local ones, so a
+            // sender that predates aliases, or sends none, never erases them.
+            const aliases = normalizeAliases([
+              ...parseTags(localMem.aliases ?? '[]'),
+              ...(Array.isArray(memory.aliases) ? memory.aliases : [])
+            ])
             const tokenCount =
               memory.tokenCount ||
               estimateTokens(`${memory.title}\n${memory.content}`)

@@ -1,3 +1,4 @@
+import { contentTokens } from './text.ts'
 import { installMlRuntime, type MlRuntimeInstallResult } from './ml-runtime.ts'
 import { isSemanticModel, type EmbedderModelSpec, type RerankerModelSpec } from './model-catalog.ts'
 import {
@@ -17,6 +18,7 @@ import {
   type MemoryVault,
   type RecallOptions,
   type RecallResult,
+  type ScoredMemory,
   type StoreMemoryInput,
   type StoreMemoryResult
 } from './vault.ts'
@@ -177,9 +179,18 @@ export async function recallWithEmbedder(
       query,
       pool.map((m) => embeddingTextFor(m.title, m.content, m.tags, m.aliases ?? []))
     )
+    const queryTokens = new Set(contentTokens(query))
+    // Cross-encoders can score a bare keyword query ("FTS5", an id) very low; a
+    // memory containing every query term is kept regardless of the floor.
+    const coversQuery = (memory: ScoredMemory): boolean => {
+      if (memory.ftsScore <= 0) return false
+      const own = new Set(contentTokens(embeddingTextFor(memory.title, memory.content, memory.tags, memory.aliases ?? [])))
+      for (const token of queryTokens) if (!own.has(token)) return false
+      return true
+    }
     ordered = pool
       .map((memory, i) => ({ ...memory, rerankScore: Number(scores[i]!.toFixed(6)) }))
-      .filter((memory) => memory.rerankScore >= reranker.spec.minScore)
+      .filter((memory) => memory.rerankScore >= reranker.spec.minScore || coversQuery(memory))
       .sort((a, b) => b.rerankScore - a.rerankScore)
   } catch (err) {
     const rerankWarning = `Reranking failed (${describeError(err)}); kept the retrieval order.`
@@ -281,8 +292,7 @@ export async function releaseCachedEmbedder(vault: MemoryVault): Promise<void> {
   resolutionCache.delete(vault)
   const rerankHit = rerankerCache.get(vault)
   rerankerCache.delete(vault)
-  await hit?.resolution.embedder?.dispose()
-  await rerankHit?.resolution.reranker?.dispose()
+  await Promise.allSettled([hit?.resolution.embedder?.dispose(), rerankHit?.resolution.reranker?.dispose()])
 }
 
 const rerankerCache = new WeakMap<

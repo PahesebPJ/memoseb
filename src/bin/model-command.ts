@@ -492,6 +492,9 @@ function downloadProgress(progress: (text: string) => void): (p: DownloadProgres
 function purgeRerankerWeights(paths: MlPaths, spec: RerankerModelSpec): number {
   const dir = modelCacheDir(paths, spec)
   if (!dir || !fs.existsSync(path.join(dir, MODEL_READY_MARKER))) return 0
+  // A symlinked <org> or <model> segment must not redirect the delete outside modelsDir.
+  const realModels = fs.realpathSync(paths.modelsDir)
+  if (!fs.realpathSync(dir).startsWith(realModels + path.sep)) return 0
   const bytes = directorySizeBytes(dir)
   fs.rmSync(dir, { recursive: true, force: true })
   return bytes

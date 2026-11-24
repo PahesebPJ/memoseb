@@ -137,6 +137,16 @@ describe('Memory aliases ("questions this memory answers")', () => {
     assert.deepEqual(res.memories[0]?.aliases, ['pregunta local'])
   })
 
+  it('unions aliases when a newer record from another node carries different ones', () => {
+    vault.storeMemory({ projectId: PROJECT, content: 'Contenido divergente', aliases: ['alias local'] })
+    const snapshot = vault.exportSnapshot({ projectId: PROJECT })
+    const incoming = { ...snapshot.memories[0]!, importance: 0.9, aliases: ['alias remoto'], updatedAt: new Date(Date.now() + 60_000).toISOString() }
+    const { checksum: _old, ...rest } = { ...snapshot, memories: [incoming] }
+    assert.equal(vault.importSnapshot({ ...rest, checksum: computeSnapshotChecksum(rest) }).memoriesUpdated, 1)
+    const res = vault.recallMemories('alias remoto', { projectId: PROJECT, includeGlobal: false })
+    assert.deepEqual(res.memories[0]?.aliases, ['alias local', 'alias remoto'])
+  })
+
   it('round-trips aliases through the P2P/gaze contract as memoseb:alias attrs', () => {
     const { memory } = vault.storeMemory({ projectId: PROJECT, content: 'Gaze contract', aliases: ['q one', 'q two'] })
     const node = memoryToGazeNode(memory)
