@@ -14,9 +14,12 @@ import {
 import { contentTokens } from './text.ts'
 import {
   findModelSpec,
+  findRerankerSpec,
   LEXICAL_MODEL_ID,
   MODEL_CATALOG,
-  type EmbedderModelSpec
+  RERANKER_CATALOG,
+  type EmbedderModelSpec,
+  type RerankerModelSpec
 } from './model-catalog.ts'
 import { detectProject, slugifyProjectId } from './project-detector.ts'
 import { resolveMlPaths, type MlPaths } from './transformers-embedder.ts'
@@ -87,6 +90,8 @@ export interface ScoredMemory extends MemoryRecord {
   score: number
   vectorScore: number
   ftsScore: number
+  /** Relevance probability from the reranker, when one reordered the results. */
+  rerankScore?: number
 }
 
 export interface StoreMemoryInput {
@@ -117,6 +122,14 @@ export interface StoreMemoryResult {
   similar?: SimilarMemory[]
   /** Set when the semantic embedder failed and the lexical fallback was used. */
   warning?: string
+}
+
+export interface ActiveRerankerInfo {
+  /** null when no reranker is configured (the default). */
+  spec: RerankerModelSpec | null
+  source: 'env' | 'config' | 'default'
+  /** Set when MEMOSEB_RERANKER or the stored config names an unknown reranker. */
+  invalidValue?: string
 }
 
 export interface ActiveEmbedderInfo {
@@ -161,6 +174,11 @@ export interface RecallResult {
   truncatedByBudget: boolean
   /** Set when the semantic embedder failed and the lexical fallback was used. */
   warning?: string
+}
+
+export interface RankedMemories {
+  projectId: string
+  candidates: ScoredMemory[]
 }
 
 export interface ProjectSummary {
@@ -251,6 +269,8 @@ export function sanitizeFtsQuery(query: string): string {
 }
 
 export const ACTIVE_EMBEDDER_META_KEY = 'embedder.model'
+export const ACTIVE_RERANKER_META_KEY = 'reranker.model'
+const RERANKER_OFF_VALUES = new Set(['none', 'off', 'false', '0'])
 
 /** memory_vectors.model prefix shared by every version of the built-in lexical embedder. */
 const LEXICAL_MODEL_FAMILY = 'local-feature-hash-'
@@ -447,6 +467,44 @@ export class MemoryVault {
         : { spec: fallback, source: 'config', invalidValue: stored }
     }
     return { spec: fallback, source: 'default' }
+  }
+
+  /** Precedence: MEMOSEB_RERANKER (an id, or "none") > node_meta "reranker.model" > none. */
+  getActiveReranker(): ActiveRerankerInfo {
+    const fromEnv = this.runtime.env.MEMOSEB_RERANKER?.trim()
+    const raw = fromEnv || this.getMetaValue(ACTIVE_RERANKER_META_KEY)
+    const source = fromEnv ? 'env' : raw ? 'config' : 'default'
+    if (!raw || RERANKER_OFF_VALUES.has(raw.toLowerCase())) return { spec: null, source }
+    const spec = findRerankerSpec(raw)
+    return spec ? { spec, source } : { spec: null, source, invalidValue: raw }
+  }
+
+  /** null turns the reranker off. */
+  setConfiguredRerankerId(id: string | null): RerankerModelSpec | null {
+    if (id === null) {
+      this.db.prepare(`DELETE FROM node_meta WHERE key = ?`).run(ACTIVE_RERANKER_META_KEY)
+      return null
+    }
+    const spec = findRerankerSpec(id)
+    if (!spec) {
+      throw new Error(
+        `Unknown reranker "${id}". Available: ${RERANKER_CATALOG.map((m) => m.id).join(', ')}`
+      )
+    }
+    this.db
+      .prepare(
+        `INSERT INTO node_meta (key, value, updated_at) VALUES (?, ?, ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`
+      )
+      .run(ACTIVE_RERANKER_META_KEY, spec.id, new Date().toISOString())
+    return spec
+  }
+
+  private getMetaValue(key: string): string | null {
+    const row = this.db.prepare(`SELECT value FROM node_meta WHERE key = ?`).get(key) as
+      | { value: string }
+      | undefined
+    return row?.value ?? null
   }
 
   getConfiguredEmbedderId(): string | null {
@@ -984,6 +1042,15 @@ export class MemoryVault {
   }
 
   recallMemories(query: string, options?: RecallOptions): RecallResult {
+    const ranked = this.rankMemories(query, options)
+    return this.selectRecalled(ranked.projectId, ranked.candidates, options)
+  }
+
+  /**
+   * Every candidate that matches the query, best first, before the limit and
+   * token budget are applied (rerankers reorder this list).
+   */
+  rankMemories(query: string, options?: RecallOptions): RankedMemories {
     const project = this.resolveProjectContext({
       projectId: options?.projectId,
       cwd: options?.cwd
@@ -993,8 +1060,6 @@ export class MemoryVault {
       includeGlobal && project.id !== 'global'
         ? [project.id, 'global']
         : [project.id]
-    const limit = Math.max(1, options?.limit ?? 5)
-    const maxTokens = Math.max(1, options?.maxTokens ?? 1200)
     const filterCategory = options?.category
     const filterTags = (options?.tags ?? [])
       .map((t) => t.trim().toLowerCase())
@@ -1025,12 +1090,7 @@ export class MemoryVault {
     >
 
     if (candidateRows.length === 0) {
-      return {
-        projectId: project.id,
-        memories: [],
-        totalTokens: 0,
-        truncatedByBudget: false
-      }
+      return { projectId: project.id, candidates: [] }
     }
 
     const candidatesById = new Map<
@@ -1053,12 +1113,7 @@ export class MemoryVault {
     }
 
     if (candidatesById.size === 0) {
-      return {
-        projectId: project.id,
-        memories: [],
-        totalTokens: 0,
-        truncatedByBudget: false
-      }
+      return { projectId: project.id, candidates: [] }
     }
 
     // 1. FTS5 lexical ranking
@@ -1154,12 +1209,22 @@ export class MemoryVault {
       return b.updatedAt.localeCompare(a.updatedAt)
     })
 
-    const topLimited = scoredCandidates.slice(0, limit)
+    return { projectId: project.id, candidates: scoredCandidates }
+  }
+
+  /** Applies limit and token budget to ranked memories and counts the access. */
+  selectRecalled(
+    projectId: string,
+    ranked: readonly ScoredMemory[],
+    options?: Pick<RecallOptions, 'limit' | 'maxTokens'>
+  ): RecallResult {
+    const limit = Math.max(1, options?.limit ?? 5)
+    const maxTokens = Math.max(1, options?.maxTokens ?? 1200)
     const selected: ScoredMemory[] = []
     let totalTokens = 0
     let truncatedByBudget = false
 
-    for (const candidate of topLimited) {
+    for (const candidate of ranked.slice(0, limit)) {
       const cost = Math.max(1, candidate.tokenCount)
       if (totalTokens + cost > maxTokens) {
         truncatedByBudget = true
@@ -1180,7 +1245,7 @@ export class MemoryVault {
     }
 
     return {
-      projectId: project.id,
+      projectId,
       memories: selected,
       totalTokens,
       truncatedByBudget

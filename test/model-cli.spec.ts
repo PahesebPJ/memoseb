@@ -91,6 +91,9 @@ function createFakeBackend(): MlBackend & {
       const embedder = new FakeSemanticEmbedder(spec)
       backend.created.push(embedder)
       return embedder
+    },
+    createReranker: (): never => {
+      throw new Error('rerankers are covered by reranker.spec.ts')
     }
   }
   return backend
@@ -143,7 +146,7 @@ describe('memoseb model: opt-in semantic embedders', () => {
     const { models } = ok<{ models: Array<{ id: string; active: boolean; recommended: boolean; ramMb: number }> }>(res.stdout)
     assert.deepEqual(
       models.map((m) => m.id),
-      ['hash', 'minilm-en', 'e5-small', 'minilm-multi', 'e5-base']
+      ['hash', 'minilm-en', 'e5-small', 'minilm-multi', 'e5-base', 'e5-large', 'bge-m3']
     )
     assert.equal(models.find((m) => m.active)?.id, 'hash')
     assert.equal(models.find((m) => m.recommended)?.id, 'e5-small')

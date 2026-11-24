@@ -85,6 +85,7 @@ import {
   defaultMlBackend,
   recallWithEmbedder,
   resolveActiveEmbedder,
+  resolveActiveReranker,
   storeMemoryWithEmbedder,
   type MlBackend
 } from '../core/semantic.ts'
@@ -668,10 +669,14 @@ export async function executeMemoCli(
       : undefined
 
     const vault = new MemoryVault({ dbPath, runtime })
-    const { embedder, warning: embedderWarning } = resolveActiveEmbedder(
+    const resolved = resolveActiveEmbedder(vault, options.mlBackend ?? defaultMlBackend)
+    const { embedder } = resolved
+    const { reranker, warning: rerankerWarning } = resolveActiveReranker(
       vault,
       options.mlBackend ?? defaultMlBackend,
     )
+    const embedderWarning =
+      [resolved.warning, rerankerWarning].filter(Boolean).join(' ') || undefined
     try {
       const res = await recallWithEmbedder(
         vault,
@@ -685,6 +690,7 @@ export async function executeMemoCli(
           cwd,
         },
         embedder,
+        reranker,
       )
       if (jsonMode) {
         const payload = embedderWarning && !res.warning ? { ...res, warning: embedderWarning } : res
@@ -708,6 +714,7 @@ export async function executeMemoCli(
       return { exitCode: 0, stdout: `${lines.join('\n')}\n`, stderr: warningText }
     } finally {
       await embedder?.dispose()
+      await reranker?.dispose()
       vault.close()
     }
   }
@@ -2729,6 +2736,7 @@ export async function executeMemoCli(
     return runModelCommand({
       subcommand: positional[1],
       modelArg: positional[2],
+      rerankerArg: positional[3],
       jsonMode,
       yes: switches.has('yes'),
       purge: switches.has('purge'),
@@ -2785,6 +2793,9 @@ export async function executeMemoCli(
       '  memoseb model enable [id] [--yes]            Turn on semantic (ML) search; menu when no id is given',
       '  memoseb model disable [--purge]              Back to the built-in lexical hash (--purge deletes models)',
       '  memoseb model reindex                        Re-embed memories with the active model',
+      '  memoseb model reranker list                  Show optional rerankers (rescore results; more RAM, ~0.5 s/query)',
+      '  memoseb model reranker enable [id] [--yes]   Download and turn on a reranker (default bge-reranker-v2-m3)',
+      '  memoseb model reranker disable [--purge]     Turn the reranker off (--purge deletes its weights)',
       '  memoseb mcp                                  Start stdio JSON-RPC 2.0 MCP server',
       '  memoseb capabilities [--json]                Display provider, consumer and signal metadata',
       '',

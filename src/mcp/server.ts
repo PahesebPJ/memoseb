@@ -21,6 +21,7 @@ import {
 import type { MemoryVault } from '../core/vault.ts'
 import {
   cachedActiveEmbedder,
+  cachedActiveReranker,
   recallWithEmbedder,
   storeMemoryWithEmbedder,
   type MlBackend
@@ -447,6 +448,7 @@ export async function handleMcpRequest(
             maxTokens: typeof args.maxTokens === 'number' ? args.maxTokens : undefined,
           },
           cachedActiveEmbedder(vault, mlBackend).embedder,
+          cachedActiveReranker(vault, mlBackend).reranker,
         )
         return {
           jsonrpc: JSONRPC_VERSION,
