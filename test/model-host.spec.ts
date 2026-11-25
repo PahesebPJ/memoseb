@@ -293,7 +293,8 @@ describe('model host + idle releaser integration', () => {
     assert.equal(first?.error, undefined)
     const pid = host.pid!
     assert.ok(alive(pid))
-    for (let i = 0; i < 50 && host.running; i++) await sleep(20)
+    // running flips on detach; the process itself exits a moment later.
+    for (let i = 0; i < 100 && (host.running || alive(pid)); i++) await sleep(20)
     assert.equal(host.running, false)
     assert.equal(alive(pid), false)
     const second = await recall()
