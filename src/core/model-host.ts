@@ -38,6 +38,7 @@ export class ModelHostClient {
   private child: ChildProcess | null = null
   private nextId = 1
   private readonly pending = new Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void }>()
+  private keepAlive: NodeJS.Timeout | null = null
 
   constructor(options: { entry?: string } = {}) {
     this.entry = options.entry ?? defaultModelHostEntry()
@@ -53,11 +54,10 @@ export class ModelHostClient {
 
   request(req: HostRequest): Promise<unknown> {
     const child = this.child ?? this.spawn()
-    // Keep the event loop alive only while a reply is outstanding.
-    child.channel?.ref()
     const id = this.nextId++
     return new Promise((resolve, reject) => {
       this.pending.set(id, { resolve, reject })
+      this.updateKeepAlive()
       try {
         child.send({ id, ...req }, (err) => {
           if (err) this.settle(id, { id, ok: false, error: err.message })
@@ -103,11 +103,25 @@ export class ModelHostClient {
     return child
   }
 
+  /**
+   * The child and its IPC channel are unref'd so an idle host never keeps the
+   * server alive. Re-ref'ing the channel is unreliable on Node 22, so a ref'd
+   * timer holds the event loop open only while replies are outstanding.
+   */
+  private updateKeepAlive(): void {
+    if (this.pending.size > 0 && !this.keepAlive) {
+      this.keepAlive = setInterval(() => {}, 1 << 30)
+    } else if (this.pending.size === 0 && this.keepAlive) {
+      clearInterval(this.keepAlive)
+      this.keepAlive = null
+    }
+  }
+
   private settle(id: number, reply: HostReply): void {
     const entry = this.pending.get(id)
     if (!entry) return
     this.pending.delete(id)
-    if (this.pending.size === 0) this.child?.channel?.unref()
+    this.updateKeepAlive()
     if (reply.ok) entry.resolve(reply.value)
     else entry.reject(new Error(reply.error))
   }
@@ -119,6 +133,7 @@ export class ModelHostClient {
       this.pending.delete(id)
       entry.reject(new Error(reason))
     }
+    this.updateKeepAlive()
   }
 }
 
