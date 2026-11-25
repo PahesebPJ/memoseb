@@ -317,3 +317,88 @@ export function cachedActiveReranker(
   rerankerCache.set(vault, { key, resolution })
   return resolution
 }
+
+/** Default idle time before the MCP server unloads its semantic models. */
+export const DEFAULT_MODEL_IDLE_MINUTES = 5
+
+/** setTimeout overflows above 2^31-1 ms (~24.8 days) and would fire after 1 ms. */
+export const MAX_MODEL_IDLE_MS = 2_147_483_647
+
+/**
+ * Reads MEMOSEB_MODEL_IDLE_MINUTES. 0 keeps models loaded for the whole
+ * session; missing, negative or non-numeric values fall back to the default.
+ * Positive values are clamped to [1 ms, MAX_MODEL_IDLE_MS].
+ */
+export function resolveModelIdleMs(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env.MEMOSEB_MODEL_IDLE_MINUTES?.trim()
+  const minutes = raw ? Number(raw) : Number.NaN
+  const effective = Number.isFinite(minutes) && minutes >= 0 ? minutes : DEFAULT_MODEL_IDLE_MINUTES
+  if (effective === 0) return 0
+  return Math.min(Math.max(1, Math.round(effective * 60_000)), MAX_MODEL_IDLE_MS)
+}
+
+export interface ModelIdleReleaser {
+  /** Runs a model-using call; the idle countdown restarts once no call is in flight. */
+  run<T>(fn: () => Promise<T>): Promise<T>
+  /** Cancels the pending countdown without releasing anything. */
+  stop(): void
+}
+
+export interface ModelIdleReleaserOptions {
+  idleMs?: number
+  release?: (vault: MemoryVault) => Promise<void>
+  onRelease?: () => void
+}
+
+/**
+ * Each MCP client spawns its own server, so with many open sessions the
+ * loaded models (~1.1 GB with e5-small + reranker) add up. Releasing them
+ * after a quiet period keeps only recently used sessions resident; the next
+ * call reloads lazily through cachedActiveEmbedder/cachedActiveReranker.
+ */
+export function createModelIdleReleaser(
+  vault: MemoryVault,
+  options: ModelIdleReleaserOptions = {}
+): ModelIdleReleaser {
+  const idleMs = Math.min(options.idleMs ?? resolveModelIdleMs(), MAX_MODEL_IDLE_MS)
+  const release = options.release ?? releaseCachedEmbedder
+  let inFlight = 0
+  let stopped = false
+  let timer: NodeJS.Timeout | undefined
+
+  const cancel = () => {
+    if (timer) clearTimeout(timer)
+    timer = undefined
+  }
+
+  const arm = () => {
+    cancel()
+    if (stopped || idleMs <= 0) return
+    timer = setTimeout(() => {
+      timer = undefined
+      if (inFlight > 0) return
+      release(vault)
+        .then(() => options.onRelease?.())
+        .catch(() => {})
+    }, idleMs)
+    // Never keep the process alive just to unload models.
+    timer.unref()
+  }
+
+  return {
+    async run<T>(fn: () => Promise<T>): Promise<T> {
+      inFlight += 1
+      cancel()
+      try {
+        return await fn()
+      } finally {
+        inFlight -= 1
+        if (inFlight === 0) arm()
+      }
+    },
+    stop() {
+      stopped = true
+      cancel()
+    }
+  }
+}

@@ -130,7 +130,7 @@ memoseb model disable [--purge]  # Vuelve al hash léxico (--purge borra runtime
 
 - **Instalación bajo demanda:** la primera activación instala `@huggingface/transformers` en `<directorio de la bóveda>/ml/runtime` (~85 MB tras eliminar binarios de otras plataformas y de GPU) y descarga los pesos en `ml/models`. `MEMOSEB_ML_DIR` cambia esa ubicación.
 - **Sin red en el uso normal:** solo `model enable` descarga; después todo se ejecuta en local, en CPU.
-- **Rendimiento medido** (x86-64, CPU, `e5-small`): ~0.9 s para cargar el modelo, ~7 ms por consulta, ~10 ms por memoria al indexar. El servidor MCP mantiene el modelo cargado; cada `memoseb recall` desde la CLI paga la carga (~0.85 s en total frente a ~10 ms en modo léxico). `memoseb context` nunca carga el modelo.
+- **Rendimiento medido** (x86-64, CPU, `e5-small`): ~0.9 s para cargar el modelo, ~7 ms por consulta, ~10 ms por memoria al indexar. El servidor MCP mantiene el modelo cargado (en un proceso hijo) mientras se use y lo libera tras 5 minutos sin uso (ver *Liberación por inactividad*); cada `memoseb recall` desde la CLI paga la carga (~0.85 s en total frente a ~10 ms en modo léxico). `memoseb context` nunca carga el modelo.
 - **Prioridad de configuración:** `MEMOSEB_EMBEDDER=<id>` (variable de entorno) > lo elegido con `memoseb model enable` > `hash`.
 - **Cambiar de modelo es seguro:** cada vector guarda el modelo que lo generó y solo se comparan vectores del modelo activo. Las memorias que llegan por `import` o `sync` se re-vectorizan solas en las siguientes búsquedas (o con `model reindex`); mientras tanto se encuentran por FTS5.
 - **Medir la precisión:** `node scripts/recall-eval.ts [--aliases]` evalúa el embedder léxico y `MEMOSEB_ML_DIR=<dir> node scripts/bench-embedder.ts <id|lexical> [--reranker <id>] [--aliases]` mide RAM, latencia y precisión con el mismo conjunto (108 memorias; 30 consultas léxicas, 50 paráfrasis ES/EN/mixtas y 10 sin relación).
@@ -162,6 +162,21 @@ memoseb model reranker disable [--purge]
 | `bge-reranker-base` | ~279 MB | ~0.6 GB | inglés, chino | MIT |
 
 `MEMOSEB_RERANKER=<id>` (o `none`) tiene prioridad sobre lo configurado. Se excluyó `jina-reranker-v2-multilingual` por su licencia no comercial.
+
+### Liberación por inactividad (servidor MCP)
+
+Cada cliente MCP (cada sesión de Claude Code, Antigravity, etc.) levanta su propio `memoseb mcp`. Para que muchas sesiones abiertas no acumulen RAM, el servidor no carga los modelos en su propio proceso: los ejecuta en un **proceso hijo** que lanza en la primera búsqueda o guardado, y lo **termina tras 5 minutos** sin `memory_recall` ni `memory_store`. Al terminar el hijo, el sistema recupera toda su memoria. Liberar los modelos dentro del mismo proceso de Node no devuelve la RAM: medido, unos 500 MB seguían ocupados.
+
+| Estado (medido con `e5-small`) | RSS total |
+|---|---|
+| Servidor sin modelo (modo `hash` o tras liberar) | ~72–78 MB |
+| Modelo cargado (servidor + hijo) | ~570–585 MB |
+| Recarga tras liberar | ~0.9 s, una vez |
+
+- Nunca libera durante una llamada en curso; cada llamada reinicia la cuenta.
+- `MEMOSEB_MODEL_IDLE_MINUTES=<min>` cambia el plazo (admite decimales, máximo ~24 días); `0` mantiene el hijo vivo toda la sesión.
+- El hijo sale solo si el servidor se cierra o muere, así que no deja procesos huérfanos. Si falla o se cae, la búsqueda sigue con FTS5 y vectores léxicos, con un aviso, y la siguiente llamada lo relanza.
+- En modo `hash` no se lanza ningún hijo. La CLI (`memoseb recall`) sigue cargando el modelo en su propio proceso, que termina al acabar. Por eso los subagentes deben usar las herramientas MCP en lugar de `memoseb recall` por Bash: cada proceso CLI carga su propia copia del modelo.
 
 ### Precisión medida (paráfrasis, recall@3)
 

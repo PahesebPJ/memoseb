@@ -22,10 +22,15 @@ import type { MemoryVault } from '../core/vault.ts'
 import {
   cachedActiveEmbedder,
   cachedActiveReranker,
+  createModelIdleReleaser,
+  defaultMlBackend,
   recallWithEmbedder,
+  releaseCachedEmbedder,
   storeMemoryWithEmbedder,
-  type MlBackend
+  type MlBackend,
+  type ModelIdleReleaser
 } from '../core/semantic.ts'
+import { createModelHostBackend, ModelHostClient } from '../core/model-host.ts'
 import { BUNDLE_ID, VERSION } from '../version.ts'
 
 const JSONRPC_VERSION = '2.0'
@@ -346,7 +351,9 @@ export async function handleMcpRequest(
   vault: MemoryVault,
   req: Record<string, unknown>,
   mlBackend?: MlBackend,
+  idle?: ModelIdleReleaser,
 ): Promise<Record<string, unknown> | null> {
+  const withModels = <T>(fn: () => Promise<T>): Promise<T> => (idle ? idle.run(fn) : fn())
   const method = typeof req.method === 'string' ? req.method : ''
   const hasId = 'id' in req && req.id !== undefined
   const id = req.id ?? null
@@ -412,7 +419,7 @@ export async function handleMcpRequest(
             },
           }
         }
-        const stored = await storeMemoryWithEmbedder(
+        const stored = await withModels(() => storeMemoryWithEmbedder(
           vault,
           {
             content,
@@ -425,7 +432,7 @@ export async function handleMcpRequest(
             importance: typeof args.importance === 'number' ? args.importance : undefined,
           },
           cachedActiveEmbedder(vault, mlBackend).embedder,
-        )
+        ))
         await triggerAutoSyncIfEnabled(vault, { projectId: stored.memory.projectId })
         return {
           jsonrpc: JSONRPC_VERSION,
@@ -438,7 +445,7 @@ export async function handleMcpRequest(
 
       if (toolName === 'memory_recall') {
         const query = typeof args.query === 'string' ? args.query : ''
-        const res = await recallWithEmbedder(
+        const res = await withModels(() => recallWithEmbedder(
           vault,
           query,
           {
@@ -449,7 +456,7 @@ export async function handleMcpRequest(
           },
           cachedActiveEmbedder(vault, mlBackend).embedder,
           cachedActiveReranker(vault, mlBackend).reranker,
-        )
+        ))
         return {
           jsonrpc: JSONRPC_VERSION,
           id,
@@ -992,17 +999,55 @@ export async function handleMcpRequest(
   }
 }
 
+/** Idle releaser that also kills the model host, so the OS reclaims its memory. */
+export function createModelHostReleaser(
+  vault: MemoryVault,
+  host: ModelHostClient | null,
+  options: { idleMs?: number; onRelease?: () => void } = {},
+): ModelIdleReleaser {
+  return createModelIdleReleaser(vault, {
+    ...options,
+    release: async (v) => {
+      // shutdown() detaches the child synchronously, so a call arriving
+      // while the old models dispose already spawns a fresh host.
+      const down = host?.shutdown()
+      await Promise.all([releaseCachedEmbedder(v), down])
+    },
+  })
+}
+
 export function startMcpServer(
   vault: MemoryVault,
   input: NodeJS.ReadableStream = process.stdin,
   output: NodeJS.WritableStream = process.stdout,
+  idle?: ModelIdleReleaser,
+  mlBackend?: MlBackend,
 ): void {
+  // Models run in a child process: killing it is the only way to hand their
+  // memory back to the OS, so the idle releaser shuts the host down too. An
+  // injected releaser or backend opts out (its owner manages model memory).
+  const host = idle || mlBackend ? null : new ModelHostClient()
+  const backend = mlBackend ?? (host ? createModelHostBackend(defaultMlBackend, host) : undefined)
+  const releaser = idle ?? createModelHostReleaser(vault, host)
+  const inFlight = new Set<Promise<void>>()
   const rl = readline.createInterface({
     input,
     crlfDelay: Number.POSITIVE_INFINITY,
   })
+  rl.on('close', () => {
+    // readline closes right after the last line: let piped requests finish first.
+    void Promise.allSettled([...inFlight]).then(() => {
+      releaser.stop()
+      void host?.shutdown()
+    })
+  })
 
-  rl.on('line', async (line) => {
+  rl.on('line', (line) => {
+    const task = handleLine(line).finally(() => inFlight.delete(task))
+    inFlight.add(task)
+  })
+
+  async function handleLine(line: string): Promise<void> {
     const trimmed = line.trim()
     if (!trimmed) return
     let parsed: Record<string, unknown>
@@ -1018,9 +1063,9 @@ export function startMcpServer(
       return
     }
 
-    const response = await handleMcpRequest(vault, parsed)
+    const response = await handleMcpRequest(vault, parsed, backend, releaser)
     if (response) {
       output.write(`${JSON.stringify(response)}\n`)
     }
-  })
+  }
 }
