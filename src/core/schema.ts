@@ -190,6 +190,7 @@ CREATE TABLE IF NOT EXISTS memories (
   title TEXT NOT NULL,
   content TEXT NOT NULL,
   tags TEXT NOT NULL DEFAULT '[]',
+  aliases TEXT NOT NULL DEFAULT '[]',
   source_agent TEXT,
   content_hash TEXT NOT NULL,
   token_count INTEGER NOT NULL DEFAULT 1,
@@ -210,7 +211,8 @@ CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
   project_id UNINDEXED,
   title,
   content,
-  tags
+  tags,
+  aliases
 );
 
 CREATE TABLE IF NOT EXISTS memory_vectors (

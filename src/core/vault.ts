@@ -14,9 +14,12 @@ import {
 import { contentTokens } from './text.ts'
 import {
   findModelSpec,
+  findRerankerSpec,
   LEXICAL_MODEL_ID,
   MODEL_CATALOG,
-  type EmbedderModelSpec
+  RERANKER_CATALOG,
+  type EmbedderModelSpec,
+  type RerankerModelSpec
 } from './model-catalog.ts'
 import { detectProject, slugifyProjectId } from './project-detector.ts'
 import { resolveMlPaths, type MlPaths } from './transformers-embedder.ts'
@@ -69,6 +72,11 @@ export interface MemoryRecord {
   title: string
   content: string
   tags: string[]
+  /**
+   * Questions this memory answers, searched like extra text. Absent on records
+   * from nodes that predate aliases (imports then keep the local ones).
+   */
+  aliases?: string[]
   sourceAgent: string | null
   contentHash: string
   tokenCount: number
@@ -82,6 +90,8 @@ export interface ScoredMemory extends MemoryRecord {
   score: number
   vectorScore: number
   ftsScore: number
+  /** Relevance probability from the reranker, when one reordered the results. */
+  rerankScore?: number
 }
 
 export interface StoreMemoryInput {
@@ -92,6 +102,8 @@ export interface StoreMemoryInput {
   title?: string
   content: string
   tags?: readonly string[]
+  /** Questions the memory answers; merged with existing ones on update. */
+  aliases?: readonly string[]
   sourceAgent?: string
   importance?: number
   cwd?: string
@@ -110,6 +122,14 @@ export interface StoreMemoryResult {
   similar?: SimilarMemory[]
   /** Set when the semantic embedder failed and the lexical fallback was used. */
   warning?: string
+}
+
+export interface ActiveRerankerInfo {
+  /** null when no reranker is configured (the default). */
+  spec: RerankerModelSpec | null
+  source: 'env' | 'config' | 'default'
+  /** Set when MEMOSEB_RERANKER or the stored config names an unknown reranker. */
+  invalidValue?: string
 }
 
 export interface ActiveEmbedderInfo {
@@ -156,6 +176,11 @@ export interface RecallResult {
   warning?: string
 }
 
+export interface RankedMemories {
+  projectId: string
+  candidates: ScoredMemory[]
+}
+
 export interface ProjectSummary {
   id: string
   name: string
@@ -182,6 +207,7 @@ interface RawMemoryRow {
   title: string
   content: string
   tags: string
+  aliases?: string
   source_agent: string | null
   content_hash: string
   token_count: number
@@ -217,6 +243,7 @@ function mapRowToMemoryRecord(row: RawMemoryRow): MemoryRecord {
     title: row.title,
     content: row.content,
     tags: parseTags(row.tags),
+    aliases: parseTags(row.aliases ?? '[]'),
     sourceAgent: row.source_agent ?? null,
     contentHash: row.content_hash,
     tokenCount: Number(row.token_count),
@@ -242,6 +269,8 @@ export function sanitizeFtsQuery(query: string): string {
 }
 
 export const ACTIVE_EMBEDDER_META_KEY = 'embedder.model'
+export const ACTIVE_RERANKER_META_KEY = 'reranker.model'
+const RERANKER_OFF_VALUES = new Set(['none', 'off', 'false', '0'])
 
 /** memory_vectors.model prefix shared by every version of the built-in lexical embedder. */
 const LEXICAL_MODEL_FAMILY = 'local-feature-hash-'
@@ -249,9 +278,53 @@ const LEXICAL_MODEL_FAMILY = 'local-feature-hash-'
 const LEXICAL_REINDEX_BATCH = 500
 
 /** Text fed to every embedder for a memory; must stay identical across store and reindex. */
-export function embeddingTextFor(title: string, content: string, tags: readonly string[]): string {
-  return `${title}\n${content}\n${tags.join(' ')}`
+export function embeddingTextFor(
+  title: string,
+  content: string,
+  tags: readonly string[],
+  aliases: readonly string[] = []
+): string {
+  // Without aliases the text is unchanged, so existing vectors stay valid.
+  const base = `${title}\n${content}\n${tags.join(' ')}`
+  return aliases.length > 0 ? `${base}\n${aliases.join('\n')}` : base
 }
+
+export const MAX_ALIASES = 12
+export const MAX_ALIAS_LENGTH = 200
+
+/** Trims, deduplicates (case-insensitively) and caps aliases. */
+export function normalizeAliases(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return []
+  const seen = new Set<string>()
+  const aliases: string[] = []
+  for (const item of raw as unknown[]) {
+    if (typeof item !== 'string') continue
+    const alias = item.replace(/\s+/g, ' ').trim().slice(0, MAX_ALIAS_LENGTH).trim()
+    const key = alias.toLowerCase()
+    if (alias.length === 0 || seen.has(key)) continue
+    seen.add(key)
+    aliases.push(alias)
+    if (aliases.length >= MAX_ALIASES) break
+  }
+  return aliases
+}
+
+/** Text stored in the memories_fts.aliases column. */
+function aliasesFtsText(aliases: readonly string[]): string {
+  return aliases.join('\n')
+}
+
+/**
+ * BM25 weights per memories_fts column, in declaration order. The two UNINDEXED
+ * id columns never match but still take a weight slot, so they are listed as 0.
+ */
+const FTS_BM25_WEIGHTS = {
+  title: 1.5,
+  content: 1.0,
+  tags: 1.0,
+  aliases: 1.2
+}
+const FTS_BM25_ARGS = `0, 0, ${FTS_BM25_WEIGHTS.title}, ${FTS_BM25_WEIGHTS.content}, ${FTS_BM25_WEIGHTS.tags}, ${FTS_BM25_WEIGHTS.aliases}`
 
 function clampImportance(value: number | undefined): number {
   if (typeof value !== 'number' || Number.isNaN(value)) {
@@ -353,6 +426,7 @@ export class MemoryVault {
     this.db = openVaultDatabase(this.dbPath)
     this.embedder = options?.embedder ?? new LocalFeatureHashEmbedder()
     this.migrateContentHashes()
+    this.migrateAliases()
     if (this.getActiveEmbedder().spec.id === LEXICAL_MODEL_ID) {
       try {
         this.reindexLexicalVectors()
@@ -395,6 +469,44 @@ export class MemoryVault {
     return { spec: fallback, source: 'default' }
   }
 
+  /** Precedence: MEMOSEB_RERANKER (an id, or "none") > node_meta "reranker.model" > none. */
+  getActiveReranker(): ActiveRerankerInfo {
+    const fromEnv = this.runtime.env.MEMOSEB_RERANKER?.trim()
+    const raw = fromEnv || this.getMetaValue(ACTIVE_RERANKER_META_KEY)
+    const source = fromEnv ? 'env' : raw ? 'config' : 'default'
+    if (!raw || RERANKER_OFF_VALUES.has(raw.toLowerCase())) return { spec: null, source }
+    const spec = findRerankerSpec(raw)
+    return spec ? { spec, source } : { spec: null, source, invalidValue: raw }
+  }
+
+  /** null turns the reranker off. */
+  setConfiguredRerankerId(id: string | null): RerankerModelSpec | null {
+    if (id === null) {
+      this.db.prepare(`DELETE FROM node_meta WHERE key = ?`).run(ACTIVE_RERANKER_META_KEY)
+      return null
+    }
+    const spec = findRerankerSpec(id)
+    if (!spec) {
+      throw new Error(
+        `Unknown reranker "${id}". Available: ${RERANKER_CATALOG.map((m) => m.id).join(', ')}`
+      )
+    }
+    this.db
+      .prepare(
+        `INSERT INTO node_meta (key, value, updated_at) VALUES (?, ?, ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`
+      )
+      .run(ACTIVE_RERANKER_META_KEY, spec.id, new Date().toISOString())
+    return spec
+  }
+
+  private getMetaValue(key: string): string | null {
+    const row = this.db.prepare(`SELECT value FROM node_meta WHERE key = ?`).get(key) as
+      | { value: string }
+      | undefined
+    return row?.value ?? null
+  }
+
   getConfiguredEmbedderId(): string | null {
     const row = this.db
       .prepare(`SELECT value FROM node_meta WHERE key = ?`)
@@ -433,7 +545,7 @@ export class MemoryVault {
       : `mv.model <> ?`
     const rows = this.db
       .prepare(
-        `SELECT m.id, m.project_id, m.category, m.title, m.content, m.tags
+        `SELECT m.id, m.project_id, m.category, m.title, m.content, m.tags, m.aliases
          FROM memories m
          LEFT JOIN memory_vectors mv ON mv.memory_id = m.id
          WHERE mv.memory_id IS NULL OR ${staleClause}
@@ -447,12 +559,13 @@ export class MemoryVault {
       title: string
       content: string
       tags: string
+      aliases: string
     }>
     return rows.map((row) => ({
       id: row.id,
       projectId: row.project_id,
       category: isMemoryCategory(row.category) ? row.category : 'domain',
-      text: embeddingTextFor(row.title, row.content, parseTags(row.tags))
+      text: embeddingTextFor(row.title, row.content, parseTags(row.tags), parseTags(row.aliases))
     }))
   }
 
@@ -625,6 +738,71 @@ export class MemoryVault {
     return { updated, skipped }
   }
 
+  /**
+   * Adds memories.aliases and rebuilds memories_fts with an aliases column on
+   * vaults created before aliases existed. Idempotent: checks the live schema.
+   */
+  private migrateAliases(): void {
+    const hasColumn = (table: string, column: string): boolean =>
+      (this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).some(
+        (col) => col.name === column
+      )
+    if (hasColumn('memories', 'aliases') && hasColumn('memories_fts', 'aliases')) return
+    this.db.exec('BEGIN IMMEDIATE;')
+    try {
+      // Re-checked inside the write lock: another process may have migrated meanwhile.
+      if (!hasColumn('memories', 'aliases')) {
+        this.db.exec(`ALTER TABLE memories ADD COLUMN aliases TEXT NOT NULL DEFAULT '[]'`)
+      }
+      if (!hasColumn('memories_fts', 'aliases')) {
+        this.db.exec(`DROP TABLE memories_fts`)
+        this.db.exec(
+          `CREATE VIRTUAL TABLE memories_fts USING fts5(
+             memory_id UNINDEXED, project_id UNINDEXED, title, content, tags, aliases
+           )`
+        )
+        const insert = this.db.prepare(
+          `INSERT INTO memories_fts (memory_id, project_id, title, content, tags, aliases)
+           VALUES (?, ?, ?, ?, ?, ?)`
+        )
+        const rows = this.db
+          .prepare(`SELECT id, project_id, title, content, tags, aliases FROM memories`)
+          .all() as Array<{
+          id: string
+          project_id: string
+          title: string
+          content: string
+          tags: string
+          aliases: string
+        }>
+        for (const row of rows) {
+          insert.run(
+            row.id,
+            row.project_id,
+            row.title,
+            row.content,
+            parseTags(row.tags).join(' '),
+            aliasesFtsText(parseTags(row.aliases))
+          )
+        }
+        this.db
+          .prepare(
+            `INSERT INTO node_meta (key, value, updated_at) VALUES (?, ?, ?)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`
+          )
+          .run('migration.fts_aliases_v1', JSON.stringify({ rows: rows.length }), new Date().toISOString())
+      }
+      this.db.exec('COMMIT;')
+    } catch (err) {
+      try {
+        this.db.exec('ROLLBACK;')
+      } catch {
+        // Keep the original error.
+      }
+      throw err
+    }
+  }
+
   private get runtimeEnvToken(): string | null {
     const token =
       this.runtime.env.MEMOSEB_SYNC_TOKEN?.trim() ||
@@ -678,6 +856,7 @@ export class MemoryVault {
     )
     const tagsJson = JSON.stringify(tags)
     const tagsText = tags.join(' ')
+    const aliases = normalizeAliases(input.aliases)
     const sourceAgent = input.sourceAgent?.trim() ?? null
     const importance = clampImportance(input.importance)
     const now = new Date().toISOString()
@@ -702,7 +881,7 @@ export class MemoryVault {
       )
       .get(project.id, contentHash) as unknown as RawMemoryRow | undefined
 
-    const embeddingText = embeddingTextFor(title, trimmedContent, tags)
+    const embeddingText = embeddingTextFor(title, trimmedContent, tags, aliases)
     const vector = this.embedder.embed(embeddingText)
     const serializedVector = serializeVector(vector)
     const tokenCount = estimateTokens(`${title}\n${trimmedContent}`)
@@ -725,8 +904,9 @@ export class MemoryVault {
         input.tags !== undefined ? tagsJson : existing.tags
       const mergedTags = parseTags(mergedTagsJson)
       const mergedTagsText = mergedTags.join(' ')
+      const mergedAliases = normalizeAliases([...parseTags(existing.aliases ?? '[]'), ...aliases])
       const mergedVector = serializeVector(
-        this.embedder.embed(embeddingTextFor(mergedTitle, trimmedContent, mergedTags))
+        this.embedder.embed(embeddingTextFor(mergedTitle, trimmedContent, mergedTags, mergedAliases))
       )
       const mergedSourceAgent =
         sourceAgent !== null ? sourceAgent : existing.source_agent
@@ -736,6 +916,7 @@ export class MemoryVault {
           `UPDATE memories
            SET title = ?,
                tags = ?,
+               aliases = ?,
                source_agent = ?,
                importance = ?,
                token_count = ?,
@@ -745,6 +926,7 @@ export class MemoryVault {
         .run(
           mergedTitle,
           mergedTagsJson,
+          JSON.stringify(mergedAliases),
           mergedSourceAgent,
           mergedImportance,
           tokenCount,
@@ -757,15 +939,16 @@ export class MemoryVault {
         .run(existing.id)
       this.db
         .prepare(
-          `INSERT INTO memories_fts (memory_id, project_id, title, content, tags)
-           VALUES (?, ?, ?, ?, ?)`
+          `INSERT INTO memories_fts (memory_id, project_id, title, content, tags, aliases)
+           VALUES (?, ?, ?, ?, ?, ?)`
         )
         .run(
           existing.id,
           project.id,
           mergedTitle,
           trimmedContent,
-          mergedTagsText
+          mergedTagsText,
+          aliasesFtsText(mergedAliases)
         )
 
       this.db
@@ -804,9 +987,9 @@ export class MemoryVault {
     this.db
       .prepare(
         `INSERT INTO memories (
-          id, project_id, category, title, content, tags, source_agent,
+          id, project_id, category, title, content, tags, aliases, source_agent,
           content_hash, token_count, importance, access_count, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)`
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)`
       )
       .run(
         id,
@@ -815,6 +998,7 @@ export class MemoryVault {
         title,
         trimmedContent,
         tagsJson,
+        JSON.stringify(aliases),
         sourceAgent,
         contentHash,
         tokenCount,
@@ -825,10 +1009,10 @@ export class MemoryVault {
 
     this.db
       .prepare(
-        `INSERT INTO memories_fts (memory_id, project_id, title, content, tags)
-         VALUES (?, ?, ?, ?, ?)`
+        `INSERT INTO memories_fts (memory_id, project_id, title, content, tags, aliases)
+         VALUES (?, ?, ?, ?, ?, ?)`
       )
-      .run(id, project.id, title, trimmedContent, tagsText)
+      .run(id, project.id, title, trimmedContent, tagsText, aliasesFtsText(aliases))
 
     this.db
       .prepare(
@@ -858,6 +1042,15 @@ export class MemoryVault {
   }
 
   recallMemories(query: string, options?: RecallOptions): RecallResult {
+    const ranked = this.rankMemories(query, options)
+    return this.selectRecalled(ranked.projectId, ranked.candidates, options)
+  }
+
+  /**
+   * Every candidate that matches the query, best first, before the limit and
+   * token budget are applied (rerankers reorder this list).
+   */
+  rankMemories(query: string, options?: RecallOptions): RankedMemories {
     const project = this.resolveProjectContext({
       projectId: options?.projectId,
       cwd: options?.cwd
@@ -867,8 +1060,6 @@ export class MemoryVault {
       includeGlobal && project.id !== 'global'
         ? [project.id, 'global']
         : [project.id]
-    const limit = Math.max(1, options?.limit ?? 5)
-    const maxTokens = Math.max(1, options?.maxTokens ?? 1200)
     const filterCategory = options?.category
     const filterTags = (options?.tags ?? [])
       .map((t) => t.trim().toLowerCase())
@@ -899,12 +1090,7 @@ export class MemoryVault {
     >
 
     if (candidateRows.length === 0) {
-      return {
-        projectId: project.id,
-        memories: [],
-        totalTokens: 0,
-        truncatedByBudget: false
-      }
+      return { projectId: project.id, candidates: [] }
     }
 
     const candidatesById = new Map<
@@ -927,12 +1113,7 @@ export class MemoryVault {
     }
 
     if (candidatesById.size === 0) {
-      return {
-        projectId: project.id,
-        memories: [],
-        totalTokens: 0,
-        truncatedByBudget: false
-      }
+      return { projectId: project.id, candidates: [] }
     }
 
     // 1. FTS5 lexical ranking
@@ -942,7 +1123,7 @@ export class MemoryVault {
       try {
         const ftsRows = this.db
           .prepare(
-            `SELECT memory_id, bm25(memories_fts, 2.0, 1.0, 1.5) AS bm25_score
+            `SELECT memory_id, bm25(memories_fts, ${FTS_BM25_ARGS}) AS bm25_score
              FROM memories_fts
              WHERE memories_fts MATCH ?
                AND project_id IN (${placeholders})
@@ -1028,12 +1209,22 @@ export class MemoryVault {
       return b.updatedAt.localeCompare(a.updatedAt)
     })
 
-    const topLimited = scoredCandidates.slice(0, limit)
+    return { projectId: project.id, candidates: scoredCandidates }
+  }
+
+  /** Applies limit and token budget to ranked memories and counts the access. */
+  selectRecalled(
+    projectId: string,
+    ranked: readonly ScoredMemory[],
+    options?: Pick<RecallOptions, 'limit' | 'maxTokens'>
+  ): RecallResult {
+    const limit = Math.max(1, options?.limit ?? 5)
+    const maxTokens = Math.max(1, options?.maxTokens ?? 1200)
     const selected: ScoredMemory[] = []
     let totalTokens = 0
     let truncatedByBudget = false
 
-    for (const candidate of topLimited) {
+    for (const candidate of ranked.slice(0, limit)) {
       const cost = Math.max(1, candidate.tokenCount)
       if (totalTokens + cost > maxTokens) {
         truncatedByBudget = true
@@ -1054,7 +1245,7 @@ export class MemoryVault {
     }
 
     return {
-      projectId: project.id,
+      projectId,
       memories: selected,
       totalTokens,
       truncatedByBudget
@@ -2562,6 +2753,7 @@ export class MemoryVault {
 
           const tagsJson = JSON.stringify(memory.tags ?? [])
           const tagsText = (memory.tags ?? []).join(' ')
+          const aliases = normalizeAliases(memory.aliases)
           const tokenCount =
             memory.tokenCount ||
             estimateTokens(`${memory.title}\n${memory.content}`)
@@ -2569,9 +2761,9 @@ export class MemoryVault {
           this.db
             .prepare(
               `INSERT INTO memories (
-                 id, project_id, category, title, content, tags, source_agent,
+                 id, project_id, category, title, content, tags, aliases, source_agent,
                  content_hash, token_count, importance, access_count, created_at, updated_at
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
             )
             .run(
               memory.id,
@@ -2580,6 +2772,7 @@ export class MemoryVault {
               memory.title,
               memory.content,
               tagsJson,
+              JSON.stringify(aliases),
               memory.sourceAgent ?? null,
               memory.contentHash,
               tokenCount,
@@ -2591,18 +2784,19 @@ export class MemoryVault {
 
           this.db
             .prepare(
-              `INSERT INTO memories_fts (memory_id, project_id, title, content, tags)
-               VALUES (?, ?, ?, ?, ?)`
+              `INSERT INTO memories_fts (memory_id, project_id, title, content, tags, aliases)
+               VALUES (?, ?, ?, ?, ?, ?)`
             )
             .run(
               memory.id,
               memory.projectId,
               memory.title,
               memory.content,
-              tagsText
+              tagsText,
+              aliasesFtsText(aliases)
             )
 
-          const embeddingText = embeddingTextFor(memory.title, memory.content, memory.tags ?? [])
+          const embeddingText = embeddingTextFor(memory.title, memory.content, memory.tags ?? [], aliases)
           const vector = this.embedder.embed(embeddingText)
           const serializedVector = serializeVector(vector)
           this.db
@@ -2636,6 +2830,12 @@ export class MemoryVault {
             )
             const tagsJson = JSON.stringify(memory.tags ?? [])
             const tagsText = (memory.tags ?? []).join(' ')
+            // Aliases only ever grow (like storeMemory): union with the local ones, so a
+            // sender that predates aliases, or sends none, never erases them.
+            const aliases = normalizeAliases([
+              ...parseTags(localMem.aliases ?? '[]'),
+              ...(Array.isArray(memory.aliases) ? memory.aliases : [])
+            ])
             const tokenCount =
               memory.tokenCount ||
               estimateTokens(`${memory.title}\n${memory.content}`)
@@ -2673,6 +2873,7 @@ export class MemoryVault {
                      category = ?,
                      content = ?,
                      tags = ?,
+                     aliases = ?,
                      source_agent = ?,
                      importance = ?,
                      token_count = ?,
@@ -2687,6 +2888,7 @@ export class MemoryVault {
                 memory.category,
                 memory.content,
                 tagsJson,
+                JSON.stringify(aliases),
                 memory.sourceAgent ?? null,
                 memory.importance,
                 tokenCount,
@@ -2700,18 +2902,19 @@ export class MemoryVault {
               .run(localMem.id)
             this.db
               .prepare(
-                `INSERT INTO memories_fts (memory_id, project_id, title, content, tags)
-                 VALUES (?, ?, ?, ?, ?)`
+                `INSERT INTO memories_fts (memory_id, project_id, title, content, tags, aliases)
+                 VALUES (?, ?, ?, ?, ?, ?)`
               )
               .run(
                 localMem.id,
                 nextProjectId,
                 memory.title,
                 memory.content,
-                tagsText
+                tagsText,
+                aliasesFtsText(aliases)
               )
 
-            const embeddingText = embeddingTextFor(memory.title, memory.content, memory.tags ?? [])
+            const embeddingText = embeddingTextFor(memory.title, memory.content, memory.tags ?? [], aliases)
             const vector = this.embedder.embed(embeddingText)
             const serializedVector = serializeVector(vector)
             this.db

@@ -159,6 +159,9 @@ export interface P2PContractEnvelopeV1<T = unknown> {
   }
 }
 
+/** One attr per alias ("question this memory answers"); gaze keeps unknown attrs. */
+export const P2P_ALIAS_ATTR = 'memoseb:alias'
+
 /**
  * Mapeo lossless de MemoryRecord a GazeNodeV1
  */
@@ -257,6 +260,9 @@ export function memoryToGazeNode(memory: MemoryRecord): GazeNodeV1 {
   for (const ut of userTags) {
     attrs.push({ key: 'tag', value: ut })
   }
+  for (const alias of memory.aliases ?? []) {
+    attrs.push({ key: P2P_ALIAS_ATTR, value: alias })
+  }
 
   attrs.push({ key: 'memoseb:token_count', value: String(memory.tokenCount) })
   attrs.push({ key: 'memoseb:importance', value: String(memory.importance) })
@@ -326,10 +332,13 @@ export function gazeNodeToMemory(
 ): MemoryRecord {
   const attrsMap = new Map<string, string>()
   const tagAttrs: string[] = []
+  const aliasAttrs: string[] = []
   for (const attr of node.attrs ?? []) {
     attrsMap.set(attr.key, attr.value)
     if (attr.key === 'tag' && attr.value.trim().length > 0) {
       tagAttrs.push(attr.value.trim())
+    } else if (attr.key === P2P_ALIAS_ATTR && typeof attr.value === 'string') {
+      aliasAttrs.push(attr.value)
     }
   }
 
@@ -441,6 +450,8 @@ export function gazeNodeToMemory(
     title: node.title || 'Untitled',
     content,
     tags,
+    // No alias attrs (gaze or an older memoseb): leave undefined so import keeps local aliases.
+    ...(aliasAttrs.length > 0 ? { aliases: aliasAttrs } : {}),
     sourceAgent,
     contentHash,
     tokenCount,

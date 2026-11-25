@@ -63,6 +63,7 @@ memoseb node status | enable | disable | discover | set-parent | add-child | add
 memoseb group create | list | add-node | remove-node | delete | default-policy # Control de acceso y grupos de permisos (ACL)
 memoseb sync [--url <peer>] [--project <id>] [--full] [--format memoseb|gaze|p2p] # Sincronización bidireccional (Jerárquica o P2P Gaze)
 memoseb model list | status | enable [id] [--yes] | disable [--purge] | reindex # Activa/desactiva la búsqueda semántica (ML) y elige el modelo
+memoseb model reranker list | enable [id] [--yes] | disable [--purge] # Reranker opcional que reordena los resultados
 memoseb mcp                                  # Inicia el servidor MCP JSON-RPC 2.0 por stdio
 memoseb check [--json]                       # Verifica la integridad SHA-256 de las directivas en cada host
 memoseb uninstall [--json]                   # Purga archivos desplegados, desconecta el nodo de hubseb y quita el servicio de nodo si está instalado
@@ -77,6 +78,7 @@ memoseb capabilities [--json]                # Muestra capacidades (provides/con
 | `--category <cat>` | `remember`, `recall` | Categoría: `architecture`, `convention`, `bugfix`, `decision`, `domain` (por defecto `domain`) |
 | `--title "<título>"` | `remember` | Título resumen (si se omite, se deriva de la primera línea) |
 | `--tags <a,b,c>` | `remember`, `recall` | Etiquetas separadas por comas para filtrado y indexación FTS5 |
+| `--aliases "<p1>\|<p2>"` | `remember` | Preguntas que responde la memoria, separadas por `\|`; se buscan como texto extra y se fusionan al actualizar (ver [Aliases](#aliases-preguntas-que-responde-una-memoria)) |
 | `--importance <0..1>` | `remember` | Peso de relevancia entre `0.0` y `1.0` (por defecto `0.5`) |
 | `--project <id>` | `analyze`, `remember`, `recall`, `context`, `export`, `import`, `sync` | Sobrescribe el identificador del proyecto (usa `global` para memorias compartidas) |
 | `--agent <id>` | `analyze`, `remember` | Identificador del agente o especialista de `crewseb` que origina el recuerdo |
@@ -100,8 +102,8 @@ memoseb capabilities [--json]                # Muestra capacidades (provides/con
 | `--permissions <m>` | `group create` | Modo de acceso del grupo: `readwrite` (por defecto), `readonly` o `writeonly` |
 | `--policy <p>` | `group default-policy` | Política para nodos sin grupo asignado: `none` (denegar) o `all` (permitir todo) |
 | `--group <name>` | `node add-child`, `node set-parent`, `node enable` | Asigna o solicita vinculación al grupo de permisos especificado |
-| `--yes` | `model enable` | Confirma la descarga sin preguntar (obligatorio fuera de una terminal interactiva) |
-| `--purge` | `model disable` | Borra también el runtime de ML y los modelos descargados |
+| `--yes` | `model enable`, `model reranker enable` | Confirma la descarga sin preguntar (obligatorio fuera de una terminal interactiva) |
+| `--purge` | `model disable`, `model reranker disable` | Borra también el runtime de ML y los modelos descargados (en `reranker disable`, solo los pesos de los rerankers) |
 
 ## Búsqueda Semántica Opcional (`memoseb model`)
 
@@ -120,16 +122,59 @@ memoseb model disable [--purge]  # Vuelve al hash léxico (--purge borra runtime
 |---|---|---|---|---|---|
 | `hash` | integrado | 0 | ~0 | cualquiera (léxico) | por defecto, sin ML |
 | `minilm-en` | all-MiniLM-L6-v2 | ~23 MB | ~115 MB | inglés | el más ligero; no entiende memorias en español |
-| `e5-small` | multilingual-e5-small | ~130 MB | ~360 MB | 100+ | **recomendado** |
-| `minilm-multi` | paraphrase-multilingual-MiniLM-L12-v2 | ~130 MB | ~360 MB | 50+ | orientado a paráfrasis |
-| `e5-base` | multilingual-e5-base | ~283 MB | ~510 MB | 100+ | el más preciso y pesado |
+| `e5-small` | multilingual-e5-small | ~130 MB | ~400 MB | 100+ | **recomendado** |
+| `minilm-multi` | paraphrase-multilingual-MiniLM-L12-v2 | ~130 MB | ~390 MB | 50+ | orientado a paráfrasis |
+| `e5-base` | multilingual-e5-base | ~283 MB | ~590 MB | 100+ | algo mejor en paráfrasis en español sin aliases |
+| `e5-large` | multilingual-e5-large | ~562 MB | ~1000 MB | 100+ | no mejora a `e5-small` en nuestra prueba |
+| `bge-m3` | BGE-M3 (denso, pooling CLS) | ~570 MB | ~1050 MB | 100+ | textos largos; no mejora a `e5-small` en nuestra prueba |
 
 - **Instalación bajo demanda:** la primera activación instala `@huggingface/transformers` en `<directorio de la bóveda>/ml/runtime` (~85 MB tras eliminar binarios de otras plataformas y de GPU) y descarga los pesos en `ml/models`. `MEMOSEB_ML_DIR` cambia esa ubicación.
 - **Sin red en el uso normal:** solo `model enable` descarga; después todo se ejecuta en local, en CPU.
 - **Rendimiento medido** (x86-64, CPU, `e5-small`): ~0.9 s para cargar el modelo, ~7 ms por consulta, ~10 ms por memoria al indexar. El servidor MCP mantiene el modelo cargado; cada `memoseb recall` desde la CLI paga la carga (~0.85 s en total frente a ~10 ms en modo léxico). `memoseb context` nunca carga el modelo.
 - **Prioridad de configuración:** `MEMOSEB_EMBEDDER=<id>` (variable de entorno) > lo elegido con `memoseb model enable` > `hash`.
 - **Cambiar de modelo es seguro:** cada vector guarda el modelo que lo generó y solo se comparan vectores del modelo activo. Las memorias que llegan por `import` o `sync` se re-vectorizan solas en las siguientes búsquedas (o con `model reindex`); mientras tanto se encuentran por FTS5.
-- **Medir la precisión:** `node scripts/recall-eval.ts` evalúa el embedder léxico y `MEMOSEB_ML_DIR=<dir> node scripts/bench-embedder.ts <id>` mide RAM, latencia y precisión de un modelo con el mismo conjunto de consultas.
+- **Medir la precisión:** `node scripts/recall-eval.ts [--aliases]` evalúa el embedder léxico y `MEMOSEB_ML_DIR=<dir> node scripts/bench-embedder.ts <id|lexical> [--reranker <id>] [--aliases]` mide RAM, latencia y precisión con el mismo conjunto (108 memorias; 30 consultas léxicas, 50 paráfrasis ES/EN/mixtas y 10 sin relación).
+
+### Aliases: preguntas que responde una memoria
+
+Cada memoria puede llevar 2–4 *aliases*: preguntas reales que alguien haría para llegar a ella, con otras palabras que las del contenido. Se indexan en una columna FTS5 propia y alimentan también los vectores, sin coste de RAM:
+
+```sh
+memoseb remember "El bump toca package.json, package-lock.json y src/version.ts" \
+  --category convention --aliases "¿qué archivos cambio al subir versión?|where is the version number?"
+```
+
+En MCP, `memory_store` acepta `aliases: string[]`. Al guardar de nuevo la misma memoria los aliases se fusionan. Viajan en los snapshots y en el contrato P2P (attrs `memoseb:alias`); un nodo antiguo que no los envía no borra los locales.
+
+### Reranker opcional (`memoseb model reranker`)
+
+Un *cross-encoder* vuelve a puntuar los mejores candidatos (al menos 20) y descarta los irrelevantes. Mejora el orden y elimina el ruido, a cambio de RAM y ~0.3–1 s por consulta en CPU.
+
+```sh
+memoseb model reranker list
+memoseb model reranker enable --yes          # bge-reranker-v2-m3 (recomendado, multilingüe, Apache-2.0)
+memoseb model reranker disable [--purge]
+```
+
+| id | Disco | RAM extra | Idiomas | Licencia |
+|---|---|---|---|---|
+| `bge-reranker-v2-m3` | ~571 MB | ~1.0 GB | 100+ | Apache-2.0 |
+| `bge-reranker-base` | ~279 MB | ~0.6 GB | inglés, chino | MIT |
+
+`MEMOSEB_RERANKER=<id>` (o `none`) tiene prioridad sobre lo configurado. Se excluyó `jina-reranker-v2-multilingual` por su licencia no comercial.
+
+### Precisión medida (paráfrasis, recall@3)
+
+| Configuración | sin aliases | con aliases | RAM extra | Latencia/consulta |
+|---|---|---|---|---|
+| `hash` (por defecto) | 48% | 76% | 0 | ~10 ms |
+| `hash` + `bge-reranker-v2-m3` | 56% | 86% | ~1.0 GB | ~0.3–0.6 s |
+| `e5-small` | 66% | 90% | ~400 MB | ~7 ms |
+| `e5-base` | 74% | 90% | ~590 MB | ~15 ms |
+| `e5-large` / `bge-m3` | 74% / 60% | 92% / 90% | ~1 GB | ~30 ms |
+| `e5-small` + `bge-reranker-v2-m3` | 76% | **94%** (R@1 84%, ruido 0) | ~1.1 GB | ~1 s |
+
+Las consultas léxicas quedan en 97–100% en todas las configuraciones. Lo que más mejora la precisión son los aliases; los modelos grandes no compensan su coste frente a `e5-small`.
 
 ## Portabilidad entre Máquinas (`export` / `import`)
 

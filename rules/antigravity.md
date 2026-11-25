@@ -5,7 +5,7 @@ trigger: always_on
 # Reglas activas de memoseb en Antigravity
 
 - Al iniciar trabajo en un proyecto, consulta el contexto acumulado con `memoseb context` o las herramientas MCP `memory_briefing` y `memory_recall`. Si el proyecto no tiene memorias previas o el usuario pide analizarlo, inicializa su contexto con `memoseb analyze` o `memory_analyze`.
-- Al descubrir decisiones de arquitectura, convenciones del repositorio o causas raíz de bugs, persiste el aprendizaje con `memoseb remember "<aprendizaje>" --category <architecture|convention|bugfix|decision|domain>` o la herramienta MCP `memory_store`.
+- Al descubrir decisiones de arquitectura, convenciones del repositorio o causas raíz de bugs, persiste el aprendizaje con `memoseb remember "<aprendizaje>" --category <architecture|convention|bugfix|decision|domain> --aliases "<pregunta 1>|<question 2>"` o la herramienta MCP `memory_store` (con `aliases`: 2–4 preguntas reales que esa memoria responde, en español e inglés).
 - Mantén los recuerdos concisos y elimina entradas obsoletas con `memoseb forget <id>` o `memory_forget`.
 - Para portabilidad y sincronización multi-máquina, exporta o importa snapshots con `memoseb export` / `memoseb import` (herramientas MCP `memory_export` / `memory_import`) y sincroniza en red Padre ↔ Hijos mediante `memoseb node (enable|disable|discover|serve)` y `memoseb sync` (`memory_sync`).
 - Para gobernar el acceso granular y segmentar qué nodos sincronizan qué proyectos o categorías, administra grupos de permisos y ACL con `memoseb group (create|list|add-node|remove-node|delete|default-policy)` y la herramienta MCP `memory_group`.

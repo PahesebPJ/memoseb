@@ -81,6 +81,9 @@ function createBackend(opts: { failOnLoad?: boolean; installOk?: boolean } = {})
       const e = new FakeEmbedder(spec, opts.failOnLoad)
       backend.created.push(e)
       return e
+    },
+    createReranker: (): never => {
+      throw new Error('reranker is not used in this suite')
     }
   }
   return backend satisfies MlBackend
